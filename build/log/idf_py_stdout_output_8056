@@ -1,0 +1,19 @@
+[1/11] Performing build step for 'bootloader'
+[1/1] C:\Windows\system32\cmd.exe /C "cd /D C:\Users\Nagarjun\Documents\PlatformIO\Projects\alds-gg-vvm701-fw\build\bootloader\esp-idf\esptool_py && C:\Espressif\python_env\idf5.1_py3.11_env\Scripts\python.exe C:/Espressif/frameworks/esp-idf-v5.1.7/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 C:/Users/Nagarjun/Documents/PlatformIO/Projects/alds-gg-vvm701-fw/build/bootloader/bootloader.bin"
+Bootloader binary size 0x52e0 bytes. 0x2d20 bytes (35%) free.
+[2/11] No install step for 'bootloader'
+[3/11] Completed 'bootloader'
+[4/11] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/__/src/nvs_config.c.obj
+[5/11] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/__/src/mqtt.c.obj
+[6/11] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/__/src/main.c.obj
+[7/11] Linking C static library esp-idf\main\libmain.a
+[8/11] Generating ld/sections.ld
+[9/11] Linking CXX executable alds-gg-vvm701-fw.elf
+[10/11] Generating binary image from built executable
+esptool.py v4.11.0
+Creating esp32s3 image...
+Merged 2 ELF sections
+Successfully created esp32s3 image.
+Generated C:/Users/Nagarjun/Documents/PlatformIO/Projects/alds-gg-vvm701-fw/build/alds-gg-vvm701-fw.bin
+[11/11] C:\Windows\system32\cmd.exe /C "cd /D C:\Users\Nagarjun\Documents\PlatformIO\Projects\alds-gg-vvm701-fw\build\esp-idf\esptool_py && C:\Espressif\python_env\idf5.1_py3.11_env\Scripts\python.exe C:/Espressif/frameworks/esp-idf-v5.1.7/components/partition_table/check_sizes.py --offset 0x8000 partition --type app C:/Users/Nagarjun/Documents/PlatformIO/Projects/alds-gg-vvm701-fw/build/partition_table/partition-table.bin C:/Users/Nagarjun/Documents/PlatformIO/Projects/alds-gg-vvm701-fw/build/alds-gg-vvm701-fw.bin"
+alds-gg-vvm701-fw.bin binary size 0x4ae80 bytes. Smallest app partition is 0x700000 bytes. 0x6b5180 bytes (96%) free.

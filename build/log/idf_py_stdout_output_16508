@@ -1,0 +1,288 @@
+[0;32mI (98) boot:  4 spiffs           Unknown data     01 82 0ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x15 (USB_UART_CHIP_RESET),boot:0xb (SPI_FAST_FLASH_BOOT)
+Saved PC:0x4037922a
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce3818,len:0x180c
+load:0x403c9700,len:0x4
+load:0x403c9704,len:0xc14
+load:0x403cc700,len:0x2e5c
+entry 0x403c990c
+[0;32mI (26) boot: ESP-IDF v5.1.7 2nd stage bootloader[0m
+[0;32mI (27) boot: compile time Jul  2 2026 12:57:16[0m
+[0;32mI (27) boot: Multicore bootloader[0m
+[0;32mI (30) boot: chip revision: v0.2[0m
+[0;32mI (33) boot: efuse block revision: v1.3[0m
+[0;32mI (38) boot.esp32s3: Boot SPI Speed : 80MHz[0m
+[0;32mI (43) boot.esp32s3: SPI Mode       : DIO[0m
+[0;32mI (48) boot.esp32s3: SPI Flash Size : 16MB[0m
+[0;32mI (52) boot: Enabling RNG early entropy source...[0m
+[0;32mI (58) boot: Partition Table:[0m
+[0;32mI (61) boot: ## Label            Usage          Type ST Offset   Length[0m
+[0;32mI (69) boot:  0 nvs              WiFi data        01 02 00009000 00005000[0m
+[0;32mI (76) boot:  1 otadata          OTA data         01 00 0000e000 00002000[0m
+[0;32mI (84) boot:  2 app0             OTA app          00 10 00010000 00700000[0m
+[0;32mI (91) boot:  3 app1             OTA app          00 11 00710000 00700000[0m
+[0;32mI (98) boot:  4 spiffs           Unknown data     01 82 00e10000 001f0000[0m
+[0;32mI (106) boot: End of partition table[0m
+[0;32mI (110) esp_image: segment 0: paddr=00010020 vaddr=3c030020 size=0f7cch ( 63436) map[0m
+[0;32mI (130) esp_image: segment 1: paddr=0001f7f4 vaddr=3fc93600 size=00824h (  2084) load[0m
+[0;32mI (131) esp_image: segment 2: paddr=00020020 vaddr=42000020 size=29cbch (171196) map[0m
+[0;32mI (167) esp_image: segment 3: paddr=00049ce4 vaddr=3fc93e24 size=02050h (  8272) load[0m
+[0;32mI (170) esp_image: segment 4: paddr=0004bd3c vaddr=40374000 size=0f5a0h ( 62880) load[0m
+[0;32mI (194) boot: Loaded app from partition at offset 0x10000[0m
+[0;32mI (194) boot: Disabling RNG early entropy source...[0m
+[0;32mI (194) cpu_start: Multicore app[0m
+[0;32mI (198) cpu_start: Pro cpu up.[0m
+[0;32mI (202) cpu_start: Starting app cpu, entry point is 0x403754cc[0m
+[0;32mI (0) cpu_start: App cpu up.[0m
+[0;32mI (217) cpu_start: Pro cpu start user code[0m
+[0;32mI (217) cpu_start: cpu freq: 160000000 Hz[0m
+[0;32mI (217) cpu_start: Application information:[0m
+[0;32mI (217) cpu_start: Project name:     alds-gg-vvm701-fw[0m
+[0;32mI (218) cpu_start: App version:      1[0m
+[0;32mI (218) cpu_start: Compile time:     Jul  2 2026 12:56:00[0m
+[0;32mI (218) cpu_start: ELF file SHA256:  d17555b46f597657...[0m
+[0;32mI (219) cpu_start: ESP-IDF:          v5.1.7[0m
+[0;32mI (219) cpu_start: Min chip rev:     v0.0[0m
+[0;32mI (219) cpu_start: Max chip rev:     v0.99 [0m
+[0;32mI (219) cpu_start: Chip rev:         v0.2[0m
+[0;32mI (219) heap_init: Initializing. RAM available for dynamic allocation:[0m
+[0;32mI (220) heap_init: At 3FCA35D8 len 00046138 (280 KiB): DRAM[0m
+[0;32mI (220) heap_init: At 3FCE9710 len 00005724 (21 KiB): STACK/DRAM[0m
+[0;32mI (220) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM[0m
+[0;32mI (221) heap_init: At 600FE010 len 00001FD8 (7 KiB): RTCRAM[0m
+[0;32mI (222) spi_flash: detected chip: generic[0m
+[0;32mI (222) spi_flash: flash io: dio[0m
+[0;32mI (222) sleep: Configure to isolate all GPIO pins in sleep state[0m
+[0;32mI (223) sleep: Enable automatic switching of GPIO sleep configuration[0m
+[0;32mI (224) app_start: Starting scheduler on CPU0[0m
+[0;32mI (224) app_start: Starting scheduler on CPU1[0m
+[0;32mI (224) main_task: Started on CPU0[0m
+[0;32mI (234) main_task: Calling app_main()[0m
+[0;32mI (244) gpio: GPIO[18]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0 [0m
+[0;32mI (244) gpio: GPIO[42]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0 [0m
+[0;32mI (244) temperature_sensor: Range [-10°C ~ 80°C], error < 1°C[0m
+[0;32mI (244) pm: Frequency switching config: CPU_MAX: 240, APB_MAX: 160, APB_MIN: 160, Light sleep: DISABLED[0m
+[0;33mW (244) nvs_cfg: No config in NVS, using defaults[0m
+[0;32mI (244) main: FW 1.0.0 — powering modem...[0m
+[0;32mI (274) modem: >> AT[0m
+[0;32mI (344) modem: << 
+OK
+[0m
+[0;32mI (344) modem: Modem already on[0m
+[0;32mI (374) modem: >> ATE0[0m
+[0;32mI (444) modem: << 
+OK
+[0m
+[0;32mI (474) modem: >> ATE0[0m
+[0;32mI (544) modem: << 
+OK
+[0m
+[0;32mI (574) modem: >> AT+CMEE=2[0m
+[0;32mI (644) modem: << 
+OK
+[0m
+[0;32mI (674) modem: >> AT+CPIN?[0m
+[0;32mI (744) modem: << 
++CPIN: READY
+
+OK
+[0m
+[0;32mI (744) network: SIM: READY[0m
+[0;32mI (774) modem: >> AT+CSQ[0m
+[0;32mI (844) modem: << 
++CSQ: 25,99
+
+OK
+[0m
+[0;32mI (844) network: Signal: -63 dBm (rssi=25)[0m
+[0;32mI (874) modem: >> AT+CFUN=0[0m
+[0;32mI (4184) modem: << 
+OK
+
++QIURC: "pdpdeact",1
+
++QMTSTAT: 0,1
+[0m
+[0;32mI (5214) modem: >> AT+QCFG="nwscanmode",0,1[0m
+[0;32mI (5284) modem: << 
+OK
+[0m
+[0;32mI (5284) network: nwscanmode=auto: OK[0m
+[0;32mI (5314) modem: >> AT+CGDCONT=1,"IP","AIRTELMETERV4"[0m
+[0;32mI (5394) modem: << 
+OK
+[0m
+[0;32mI (5394) network: CGDCONT: OK[0m
+[0;32mI (5424) modem: >> AT+CFUN=1[0m
+[0;32mI (6114) modem: << 
+OK
+[0m
+[0;32mI (6114) network: CFUN=1: OK[0m
+[0;32mI (9114) network: Waiting for network registration...[0m
+[0;32mI (9144) modem: >> AT+CEREG=2[0m
+[0;32mI (9214) modem: << 
+OK
+[0m
+[0;32mI (9244) modem: >> AT+CEREG?[0m
+[0;32mI (9314) modem: << 
++CEREG: 2,1,"0470","004CF01",7
+
+OK
+[0m
+[0;32mI (9344) modem: >> AT+CGREG?[0m
+[0;32mI (9414) modem: << 
++CGREG: 0,1
+
+OK
+[0m
+[0;32mI (9414) network: CEREG=1 CGREG=1 (0s)[0m
+[0;32mI (9414) network: Registered[0m
+[0;32mI (9444) modem: >> AT+QNWINFO[0m
+[0;32mI (9524) modem: << 
++QNWINFO: "TDD LTE","40445","LTE BAND 40",39125
+
+OK
+[0m
+[0;32mI (9524) network: Network: 
++QNWINFO: "TDD LTE","40445","LTE BAND 40",39125
+
+OK
+[0m
+[0;32mI (9554) modem: >> AT+QIACT?[0m
+[0;32mI (9624) modem: << 
+OK
+[0m
+[0;32mI (9654) modem: >> AT+QICSGP=1,1,"AIRTELMETERV4","","",0[0m
+[0;32mI (9734) modem: << 
+OK
+[0m
+[0;32mI (9764) modem: >> AT+QIACT=1[0m
+[0;32mI (9844) modem: << 
+OK
+[0m
+[0;32mI (9844) network: QIACT=1: OK[0m
+[0;32mI (9874) modem: >> AT+CGPADDR=1[0m
+[0;32mI (9944) modem: << 
++CGPADDR: 1,"10.41.38.213"
+
+OK
+[0m
+[0;32mI (9944) network: IP: 
++CGPADDR: 1,"10.41.38.213"
+
+OK
+[0m
+[0;32mI (9974) modem: >> AT+CGSN[0m
+[0;32mI (10044) modem: << 
+860710081332507
+
+OK
+[0m
+[0;32mI (10044) main: IMEI: 860710081332507[0m
+[0;32mI (10074) modem: >> AT+QMTCLOSE=0[0m
+[0;33mW (10074) modem: << 
+ERROR[0m
+[0;32mI (11134) modem: >> AT+QSSLCFG="sslversion",2,4[0m
+[0;32mI (11204) modem: << 
+OK
+[0m
+[0;32mI (11234) modem: >> AT+QSSLCFG="ciphersuite",2,0XFFFF[0m
+[0;32mI (11304) modem: << 
+OK
+[0m
+[0;32mI (11334) modem: >> AT+QSSLCFG="seclevel",2,0[0m
+[0;32mI (11404) modem: << 
+OK
+[0m
+[0;32mI (11434) modem: >> AT+QMTCFG="ssl",0,1,2[0m
+[0;32mI (11504) modem: << 
+OK
+[0m
+[0;32mI (11534) modem: >> AT+QMTCFG="keepalive",0,60[0m
+[0;32mI (11604) modem: << 
+OK
+[0m
+[0;32mI (11634) modem: >> AT+QMTCFG="session",0,0[0m
+[0;32mI (11704) modem: << 
+OK
+[0m
+[0;32mI (11734) modem: >> AT+QMTOPEN=0,"dev-fuelsense.iotronsys.com",8777[0m
+[0;32mI (13434) modem: << 
+OK
+
++QMTOPEN: 0,0
+[0m
+[0;32mI (13464) modem: >> AT+QMTCONN=0,"iotronics-860710081332507","iotrondev","iotrondev@1234"[0m
+[0;32mI (14604) modem: << 
+OK
+
++QMTCONN: 0,0,0
+[0m
+[0;32mI (14604) mqtt: MQTT connected, client=iotronics-860710081332507[0m
+[0;32mI (14634) modem: >> AT+QMTSUB=0,1,"fuelsense/860710081332507/update",1[0m
+[0;32mI (15244) modem: << 
+OK
+
++QMTSUB: 0,1,0,1
+[0m
+[0;32mI (15244) mqtt: Subscribed: fuelsense/860710081332507/update[0m
+[0;32mI (15274) modem: >> AT+QMTSUB=0,2,"fuelsense/update",1[0m
+[0;32mI (15884) modem: << 
+OK
+
++QMTSUB: 0,2,0,1
+[0m
+[0;32mI (15884) mqtt: Subscribed: fuelsense/update[0m
+[0;32mI (15914) modem: >> AT+QMTSUB=0,3,"fuelsense/860710081332507/setconfig",1[0m
+[0;32mI (16534) modem: << 
+OK
+
++QMTSUB: 0,3,0,1
+[0m
+[0;32mI (16534) mqtt: Subscribed: fuelsense/860710081332507/setconfig[0m
+[0;32mI (17094) main: Poll loop start — cycle 30000 ms[0m
+[0;32mI (17124) modem: >> AT+QLTS=2[0m
+[0;32mI (17194) modem: << 
++QLTS: "2026/07/02,14:50:52+22,0"
+
+OK
+[0m
+[0;32mI (50234) modem: >> AT+QLTS=2[0m
+[0;32mI (50304) modem: << 
++QLTS: "2026/07/02,14:51:25+22,0"
+
+OK
+[0m
+[0;32mI (83344) modem: >> AT+QLTS=2[0m
+[0;32mI (83414) modem: << 
++QLTS: "2026/07/02,14:51:58+22,0"
+
+OK
+[0m
+[0;32mI (116454) modem: >> AT+QLTS=2[0m
+[0;32mI (116524) modem: << 
++QLTS: "2026/07/02,14:52:31+22,0"
+
+OK
+[0m
+[0;32mI (149564) modem: >> AT+QLTS=2[0m
+[0;32mI (149634) modem: << 
++QLTS: "2026/07/02,14:53:04+22,0"
+
+OK
+[0m
+[0;32mI (182674) modem: >> AT+QLTS=2[0m
+[0;32mI (182744) modem: << 
++QLTS: "2026/07/02,14:53:37+22,0"
+
+OK
+[0m
+[0;32mI (215784) modem: >> AT+QLTS=2[0m
+[0;32mI (215854) modem: << 
++QLTS: "2026/07/02,14:54:10+22,0"
+
+OK
+[0m
