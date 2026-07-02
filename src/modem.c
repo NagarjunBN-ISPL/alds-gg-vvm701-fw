@@ -4,6 +4,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -56,6 +57,7 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
 
     while (esp_timer_get_time() < deadline) {
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
             if (total < (int)sizeof(buf) - 1) {
@@ -110,6 +112,7 @@ bool modem_read_until(const char *expect, int timeout_ms,
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
 
     while (esp_timer_get_time() < deadline) {
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
             if (total < (int)sizeof(buf) - 1) {

@@ -3,6 +3,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -112,6 +113,7 @@ static void poll_one_bluesky(uint8_t addr, DuNozzle_t *nz) {
     for (int retry = 0; retry < 3; retry++) {
         bluesky_frame(addr, BS_CMD_STATUS, cmd);
         nz->status_len = rs485_xfer(cmd, 5, nz->status, DU_RESP_MAX);
+        esp_task_wdt_reset();
         if (nz->status_len > 0) {
             nz->present = true;
             if (nz->status_len >= 4 && nz->status[3] == 0x80) {
@@ -129,21 +131,25 @@ static void poll_one_bluesky(uint8_t addr, DuNozzle_t *nz) {
     /* Totalizer */
     bluesky_frame(addr, BS_CMD_TOTAL, cmd);
     nz->total_len = rs485_xfer(cmd, 5, nz->total, DU_RESP_MAX);
+    esp_task_wdt_reset();
     vTaskDelay(pdMS_TO_TICKS(30));
 
     /* RSP */
     bluesky_frame(addr, BS_CMD_RSP, cmd);
     nz->rsp_len = rs485_xfer(cmd, 5, nz->rsp, DU_RESP_MAX);
+    esp_task_wdt_reset();
     vTaskDelay(pdMS_TO_TICKS(30));
 
     /* K-Factor */
     bluesky_frame(addr, BS_CMD_KFACT, cmd);
     nz->kfact_len = rs485_xfer(cmd, 5, nz->kfact, DU_RESP_MAX);
+    esp_task_wdt_reset();
     vTaskDelay(pdMS_TO_TICKS(30));
 
     /* RFID */
     bluesky_frame(addr, BS_CMD_RFID, cmd);
     nz->rfid_len = rs485_xfer(cmd, 5, nz->rfid, DU_RESP_MAX);
+    esp_task_wdt_reset();
 }
 
 void du_poll_bluesky_unit(int unit_idx, DuNozzle_t *out_a, DuNozzle_t *out_b) {
@@ -159,6 +165,7 @@ static void poll_one_yenen(int du_addr, bool nozzle_b, DuNozzle_t *nz) {
     uint8_t cmd[10];
     yenen_frame(du_addr, nozzle_b, cmd);
     nz->total_len = rs485_xfer(cmd, 10, nz->total, DU_RESP_MAX);
+    esp_task_wdt_reset();
     nz->present   = (nz->total_len > 0);
     nz->idle      = nz->present; /* Yenen has no status check */
 }

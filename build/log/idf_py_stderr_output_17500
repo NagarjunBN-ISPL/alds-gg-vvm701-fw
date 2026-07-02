@@ -1,3 +1,0 @@
-warning: user value 120 on the int symbol ESP_TASK_WDT_TIMEOUT_S (defined at C:/Espressif/frameworks/esp-idf-v5.1.7/components/esp_system/Kconfig:446) ignored due to being outside the active range ([1, 60]) -- falling back on defaults
-Compiler supported targets: xtensa-esp32s3-elf
-

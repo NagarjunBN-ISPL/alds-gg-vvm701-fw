@@ -495,11 +495,15 @@ static void run_poll_cycle(void) {
     sysmon_pm_acquire();
 
     if (g_cfg.du_bluesky_count > 0 || g_cfg.du_yenen_count > 0) poll_dispensers(ts);
+    esp_task_wdt_reset();
     if (g_cfg.ztech_count > 0 || g_cfg.pantech_count > 0)       poll_radar(ts);
+    esp_task_wdt_reset();
     if (g_cfg.genset_type == GENSET_SEDEMAC)                    poll_genset(ts);
+    esp_task_wdt_reset();
     execute_pending();
     if (g_cfg.di_enable)
         di_publish_buffer(t_data, g_hw_di, ts, g_cfg.di_enable);
+    esp_task_wdt_reset();
 
     diag_record_loop_time(esp_timer_get_time() - loop_start);
 
@@ -522,7 +526,7 @@ static void sleep_with_poll(int seconds) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_task_wdt_reset();
         mqtt_reconnect_if_needed();     /* heal broken connection before polling */
-        if (mqtt_poll(s_topic, sizeof(s_topic), s_payload, sizeof(s_payload)))
+        while (mqtt_poll(s_topic, sizeof(s_topic), s_payload, sizeof(s_payload)))
             handle_msg(s_topic, s_payload);
     }
 }

@@ -4,6 +4,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -46,9 +47,12 @@ static const char *qmtrecv_payload_start(const char *buf,
     p++;
     if (*p != ',') return NULL;
     p++;
-    while (*p >= '0' && *p <= '9') p++;           /* skip msgid */
-    if (*p != ',') return NULL;
-    p++;
+    while (*p == ' ') p++;
+    while (*p >= '0' && *p <= '9') p++;           /* optional msgid digits */
+    if (*p == ',') {                              /* msgid field present (even if empty) */
+        p++;
+        while (*p == ' ') p++;
+    }
     if (*p != '"') return NULL;
     p++;
     const char *topic_start = p;
@@ -58,6 +62,7 @@ static const char *qmtrecv_payload_start(const char *buf,
     p++;
     if (*p != ',') return NULL;
     p++;
+    while (*p == ' ') p++;
     if (topic_start_out) *topic_start_out = topic_start;
     if (topic_len_out)   *topic_len_out   = topic_len;
     return p;
@@ -268,6 +273,7 @@ bool mqtt_publish(const char *topic, const char *payload) {
     int64_t dl = esp_timer_get_time() + 10000000LL;
 
     while (esp_timer_get_time() < dl) {
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(20)) > 0) {
             if (bi < (int)sizeof(buf) - 1) { buf[bi++] = (char)ch; buf[bi] = '\0'; }
@@ -291,6 +297,7 @@ bool mqtt_publish(const char *topic, const char *payload) {
     bool pub_ok = false;
     dl = esp_timer_get_time() + 15000000LL;
     while (esp_timer_get_time() < dl) {
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(20)) > 0) {
             if (bi < (int)sizeof(buf) - 1) { buf[bi++] = (char)ch; buf[bi] = '\0'; }
