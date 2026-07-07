@@ -19,7 +19,9 @@ void di_uart_init(void);
 void di_set_enable(uint8_t mask);  /* call before starting di_task */
 void di_task(void *param);         /* pin to Core 1 */
 
-/* Drain buffered DI payloads and publish each; ts_latest used for TS field. */
-void di_publish_buffer(const char *topic, const char *hw_id,
+/* Drain buffered DI payloads and publish each; ts_latest used for TS field.
+ * Returns true if all publishes succeeded (or nothing was buffered), false if
+ * any publish failed — used to feed g_diag.di_ok. */
+bool di_publish_buffer(const char *topic, const char *hw_id,
                        const char *ts_latest,
                        uint8_t di_enable);

@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static const char *TAG = "di";
+
 TaskHandle_t  g_di_task_handle = NULL;
 DIEntry_t     di_fifo[DI_FIFO_SIZE];
 volatile int  di_head  = 0;
@@ -56,11 +58,26 @@ static int parse_int_field(const char *json, const char *key) {
 void di_task(void *param) {
     (void)param;
     g_di_task_handle = xTaskGetCurrentTaskHandle();
+
+    /* di_mutex is created in di_uart_init(); if that xSemaphoreCreateMutex()
+     * failed (heap exhaustion at boot), di_mutex is still NULL here. Every
+     * other user of it (di_publish_buffer) already guards with `if
+     * (!di_mutex)`, but this task calls xSemaphoreTake(di_mutex, ...)
+     * unconditionally below — passing NULL to a FreeRTOS semaphore call is
+     * undefined behaviour, typically an abort/hard fault. Fail loudly and
+     * exit the task cleanly instead. */
+    if (!di_mutex) {
+        ESP_LOGE(TAG, "di_mutex is NULL (heap OOM at boot?) — di_task exiting, DI monitoring disabled");
+        vTaskDelete(NULL);
+        return;
+    }
+
     esp_task_wdt_add(NULL);
     di_enable_mask = s_di_enable;
 
     static char req[]  = "GETDATA\n";
     static char resp[NUVOTON_BUF];
+    static char last_payload[256] = "";  /* dedup: only enqueue on change */
 
     for (;;) {
         /* Refresh enable mask in case config was updated */
@@ -98,19 +115,37 @@ void di_task(void *param) {
         }
         pos += snprintf(payload + pos, sizeof(payload) - pos, "}");
 
-        /* Push to FIFO */
-        if (xSemaphoreTake(di_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            int slot = di_tail;
-            strncpy(di_fifo[slot].payload, payload, sizeof(di_fifo[slot].payload) - 1);
-            di_fifo[slot].payload[sizeof(di_fifo[slot].payload) - 1] = '\0';
-            di_tail = (di_tail + 1) % DI_FIFO_SIZE;
-            if (di_count < DI_FIFO_SIZE) {
-                di_count++;
-            } else {
-                /* Overwrite oldest */
-                di_head = (di_head + 1) % DI_FIFO_SIZE;
+        /* Digital inputs are event-driven: only enqueue when the reading
+         * actually changes from the last one queued. This captures every
+         * transition (e.g. a pulse between 30s publish cycles) without
+         * flooding the cloud with dozens of identical steady-state messages
+         * — which was also starving the modem UART of time to receive
+         * inbound commands like setconfig. */
+        if (strcmp(payload, last_payload) != 0) {
+            /* last_payload is the dedup key — it must only advance once the
+             * transition is ACTUALLY enqueued. Updating it unconditionally
+             * here (as this used to) meant a mutex-take timeout silently
+             * dropped the transition AND marked it "already seen", so an
+             * identical next reading would never retry it — the change was
+             * gone for good. Only commit last_payload inside the success
+             * branch below, so a timeout leaves dedup state untouched and
+             * the very next poll (2s later) naturally retries the enqueue. */
+            if (xSemaphoreTake(di_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                int slot = di_tail;
+                strncpy(di_fifo[slot].payload, payload, sizeof(di_fifo[slot].payload) - 1);
+                di_fifo[slot].payload[sizeof(di_fifo[slot].payload) - 1] = '\0';
+                di_tail = (di_tail + 1) % DI_FIFO_SIZE;
+                if (di_count < DI_FIFO_SIZE) {
+                    di_count++;
+                } else {
+                    /* Overwrite oldest */
+                    di_head = (di_head + 1) % DI_FIFO_SIZE;
+                }
+                xSemaphoreGive(di_mutex);
+
+                strncpy(last_payload, payload, sizeof(last_payload) - 1);
+                last_payload[sizeof(last_payload) - 1] = '\0';
             }
-            xSemaphoreGive(di_mutex);
         }
 
         esp_task_wdt_reset();
@@ -118,21 +153,25 @@ void di_task(void *param) {
     }
 }
 
-void di_publish_buffer(const char *topic, const char *hw_id,
+bool di_publish_buffer(const char *topic, const char *hw_id,
                        const char *ts_latest, uint8_t di_enable) {
-    if (!di_enable || !di_mutex) return;
+    if (!di_enable || !di_mutex) return false;
 
+    bool all_ok = true;  /* stays true if nothing to drain (DI healthy, idle) */
     for (;;) {
         char entry_payload[256];
         bool got = false;
 
+        /* Peek the head entry WITHOUT removing it — it's only popped after a
+         * confirmed successful publish below. Popping first (as this used to)
+         * meant a failed publish permanently lost that DI transition: the
+         * entry was already gone from the FIFO by the time mqtt_publish()
+         * told us it didn't make it to the broker. */
         if (xSemaphoreTake(di_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (di_count > 0) {
                 strncpy(entry_payload, di_fifo[di_head].payload,
                         sizeof(entry_payload) - 1);
                 entry_payload[sizeof(entry_payload) - 1] = '\0';
-                di_head = (di_head + 1) % DI_FIFO_SIZE;
-                di_count--;
                 got = true;
             }
             xSemaphoreGive(di_mutex);
@@ -145,6 +184,21 @@ void di_publish_buffer(const char *topic, const char *hw_id,
         snprintf(msg, sizeof(msg),
                  "{\"HW_ID\":\"%s\",\"di\":%s,\"TS\":\"%s\"}",
                  hw_id, entry_payload, ts_latest);
-        mqtt_publish(topic, msg);
+
+        if (!mqtt_publish(topic, msg)) {
+            /* Leave the entry in the FIFO for the next poll cycle to retry —
+             * and stop draining now rather than hammering a link that just
+             * failed once, which would just fail the whole backlog too. */
+            all_ok = false;
+            break;
+        }
+
+        /* Publish confirmed — now it's safe to actually pop the entry. */
+        if (xSemaphoreTake(di_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            di_head = (di_head + 1) % DI_FIFO_SIZE;
+            if (di_count > 0) di_count--;
+            xSemaphoreGive(di_mutex);
+        }
     }
+    return all_ok;
 }

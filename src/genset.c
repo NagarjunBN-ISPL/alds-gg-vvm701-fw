@@ -10,18 +10,25 @@
 
 static const char *TAG = "genset";
 
-/* ── Alarm name table (10 registers × 4 nibbles) ─────────────────────── */
+/* ── Alarm name table (10 registers × 4 nibbles, MSN→LSN) ──────────────
+ * Order verified against a live GC1211 wire capture (SEDMAC decode doc):
+ * register 57 = 0x1110 decodes MSN→LSN as RadiatorWaterLevel, LowFuelLevel,
+ * HighEngTemp, LOP — cross-checked against the GC1201/02/03/902 register
+ * map, which independently agrees. (A previous revision of this table had
+ * every row's nibble order mirrored — MSN/LSN swapped — which misattributed
+ * every alarm to the wrong parameter; e.g. a real LOP shutdown would have
+ * reported as "RadiatorWaterLevel: Shutdown".) */
 static const char * const g_alarm_names[10][4] = {
-    {"LOP","HighEngTemp","LowFuelLevel","RadiatorWaterLevel"},
-    {"UnderSpeed","OverSpeed","FailToStart","FailToStop"},
-    {"GensetLowVolt","GensetHighVolt","GensetLowFreq","GensetHighFreq"},
-    {"HighCurrent","Overload","UnbalancedLoad","EmergencyStop"},
-    {"ChargingAltFail","OilFilterMaint","FuelFilterMaint","AirFilterMaint"},
-    {"BattLowVolt","BattHighVolt","OilPressOpenCkt","EngTempOpenCkt"},
-    {"FuelTheft","MPULoss","ExtendedOverloadTrip","Reserved"},
-    {"AuxInputA","AuxInputB","AuxInputC","AuxInputD"},
-    {"AuxInputE","AuxInputF","AuxInputG","AuxInputH"},
-    {"AuxInputI","Reserved","Reserved","Reserved"}
+    {"RadiatorWaterLevel","LowFuelLevel","HighEngTemp","LOP"},
+    {"FailToStop","FailToStart","OverSpeed","UnderSpeed"},
+    {"GensetHighFreq","GensetLowFreq","GensetHighVolt","GensetLowVolt"},
+    {"EmergencyStop","UnbalancedLoad","Overload","HighCurrent"},
+    {"AirFilterMaint","FuelFilterMaint","OilFilterMaint","ChargingAltFail"},
+    {"EngTempOpenCkt","OilPressOpenCkt","BattHighVolt","BattLowVolt"},
+    {"Reserved","Reserved","MPULoss","FuelTheft"},
+    {"AuxInputD","AuxInputC","AuxInputB","AuxInputA"},
+    {"AuxInputH","AuxInputG","AuxInputF","AuxInputE"},
+    {"Reserved","Reserved","Reserved","AuxInputI"}
 };
 
 /* ── CRC-16/IBM (Modbus) ──────────────────────────────────────────────── */
@@ -81,8 +88,22 @@ static bool modbus_request(uint8_t slave, uint8_t fc,
         ESP_LOGW(TAG, "CRC mismatch: calc=0x%04x recv=0x%04x", calc, recv);
         return false;
     }
+    /* Verify the response echoes OUR slave address and function code.
+     * CRC alone is NOT enough on this bus: the radars share the same
+     * RS485 line (Ztech slaves 4.., Pantech 7..), and a late radar reply
+     * has a perfectly valid CRC — without this check it could be accepted
+     * as genset register data. */
+    if (rx[0] != slave) {
+        ESP_LOGW(TAG, "Wrong slave echo: got 0x%02x want 0x%02x (bus crosstalk?)",
+                 rx[0], slave);
+        return false;
+    }
     /* Check FC (bit 7 set = exception) */
     if (rx[1] & 0x80) { ESP_LOGW(TAG, "Modbus exception 0x%02x", rx[2]); return false; }
+    if (rx[1] != fc) {
+        ESP_LOGW(TAG, "Wrong FC echo: got 0x%02x want 0x%02x", rx[1], fc);
+        return false;
+    }
     return true;
 }
 
@@ -96,34 +117,63 @@ static bool parse_regs(const uint8_t *rx, int rx_len, uint16_t *regs, int count)
 }
 
 /* ── Public API ───────────────────────────────────────────────────────── */
-bool genset_poll(uint8_t slave, GensetData_t *out) {
+bool genset_poll(uint8_t slave, uint8_t model, GensetData_t *out) {
     memset(out, 0, sizeof(*out));
 
     uint8_t rx[64]; int rlen;
 
-    /* Batch 1: FC04, addr 0, count 23 */
-    if (!modbus_request(slave, 0x04, 0, 23, rx, sizeof(rx), &rlen)
+    /* Measurement/alarm/status reads use FC04 on the GC1211 family (Read
+     * Input Registers) and FC03 on the GC1111 family (Read Holding Registers)
+     * — same register addresses, verified byte-for-byte against live wire
+     * captures of both models (only the function code differs). */
+    uint8_t data_fc = (model == GENSET_MODEL_GC1111) ? 0x03 : 0x04;
+
+    /* Batch 1: addr 0, count 23 (protocol rev + measurements reg 0..22) */
+    if (!modbus_request(slave, data_fc, 0, 23, rx, sizeof(rx), &rlen)
         || !parse_regs(rx, rlen, out->batch1, 23)) {
         ESP_LOGW(TAG, "Batch1 failed");
         return false;
     }
 
-    /* Batch 2: FC04, addr 57, count 12 */
-    if (!modbus_request(slave, 0x04, 57, 12, rx, sizeof(rx), &rlen)
+    /* Batch 2: addr 57, count 12 → regs 57..68:
+     *   b2[0..9] = reg 57..66 = Alarm 1..10
+     *   b2[10]   = reg 67     = Genset Status word
+     *   b2[11]   = reg 68     = Genset Command Status
+     * NOTE: the GC1201/02/03/902 offset table lists these one register higher,
+     * but the GC1211/GC1111 hardware we deploy uses the addresses above — do
+     * not "correct" this to 58 without a fresh wire capture. */
+    if (!modbus_request(slave, data_fc, 57, 12, rx, sizeof(rx), &rlen)
         || !parse_regs(rx, rlen, out->batch2, 12)) {
         ESP_LOGW(TAG, "Batch2 failed");
         return false;
     }
 
-    /* Batch 3: FC03, addr 0, count 2 */
-    if (!modbus_request(slave, 0x03, 0, 2, rx, sizeof(rx), &rlen)
-        || !parse_regs(rx, rlen, out->batch3, 2)) {
-        ESP_LOGW(TAG, "Batch3 failed");
-        return false;
+    /* Batch 3: FC03 holding regs 0..1 (command register + operating mode).
+     * Only meaningful on the GC1211 family, where the FC03 space is separate
+     * from measurements. On the GC1111 family the FC03 space IS the
+     * measurement map (reg 0 = protocol rev, reg 1 = oil pressure), so reading
+     * addr 0..1 there would return measurements mislabelled as command/mode —
+     * skip it and leave holdingRegs unread. */
+    if (model == GENSET_MODEL_GC1211) {
+        if (!modbus_request(slave, 0x03, 0, 2, rx, sizeof(rx), &rlen)
+            || !parse_regs(rx, rlen, out->batch3, 2)) {
+            ESP_LOGW(TAG, "Batch3 failed");
+            return false;
+        }
+        out->has_holding = true;
     }
 
     out->valid = true;
     return true;
+}
+
+/* snprintf returns the length it WANTED to write, not what actually fit.
+ * If a section truncates, `pos` sails past buf_size and the next call's
+ * (buf_size - pos) wraps to a huge size_t → out-of-bounds write. Clamp
+ * after every append so truncation degrades to a cut-off payload instead
+ * of memory corruption. */
+static inline int clamp_pos(int pos, size_t buf_size) {
+    return (pos > (int)buf_size - 1) ? (int)buf_size - 1 : pos;
 }
 
 void genset_build_payload(const GensetData_t *d,
@@ -170,8 +220,11 @@ void genset_build_payload(const GensetData_t *d,
         b1[10] / 10.0f, b1[11] / 10.0f, b1[12] / 10.0f,
         b1[16] / 100.0f, b1[17] / 100.0f, b1[18] / 100.0f,
         b1[19] / 10.0f, b1[20] / 10.0f, b1[21] / 10.0f, b1[22] / 10.0f);
+    pos = clamp_pos(pos, buf_size);
 
-    /* Alarms: regs 57–66 (batch2[0..9]), nibble MSN→LSN, object format, string states */
+    /* Alarms: regs 57–66 = Alarm 1..10 (batch2[0..9]), nibble MSN→LSN,
+     * object format, string states. Verified against the GC1211 decode:
+     * Alarm 1 @ reg 57, MSN→LSN = RadiatorWaterLevel/LowFuelLevel/HighEngTemp/LOP. */
     static const char * const alarm_state_names[] =
         {"Disabled","Inactive","Warning","Shutdown","ElecTrip","Notification"};
 
@@ -190,9 +243,12 @@ void genset_build_payload(const GensetData_t *d,
             }
         }
     }
+    pos = clamp_pos(pos, buf_size);
     pos += snprintf(buf + pos, buf_size - pos, "},");
+    pos = clamp_pos(pos, buf_size);
 
-    /* Status word (batch2[10] = reg67): bits 15,14,13,12,11 per SEDEMAC spec */
+    /* Status word (batch2[10] = reg67, "Genset Status"): bits 15,14,13,12,11 per SEDEMAC spec.
+     * Verified vs GC1211: C000 = available+running; 2000 = stoppedNormally. */
     uint16_t sw = b2[10];
     pos += snprintf(buf + pos, buf_size - pos,
         "\"status\":{"
@@ -206,6 +262,7 @@ void genset_build_payload(const GensetData_t *d,
         ((sw >> 13) & 1) ? "true" : "false",
         ((sw >> 12) & 1) ? "true" : "false",
         ((sw >> 11) & 1) ? "Auto" : "Manual");
+    pos = clamp_pos(pos, buf_size);
 
     /* Command status (batch2[11] = reg68): 1-based index, 0 = Unknown */
     static const char * const cs_labels[] =
@@ -213,13 +270,35 @@ void genset_build_payload(const GensetData_t *d,
     uint16_t cs = b2[11];
     const char *cs_str = (cs >= 1 && cs <= 6) ? cs_labels[cs] : cs_labels[0];
     pos += snprintf(buf + pos, buf_size - pos,
-                    "\"commandStatus\":\"%s\",", cs_str);
+                    "\"commandStatus\":\"%s\"", cs_str);
+    pos = clamp_pos(pos, buf_size);
 
-    /* Holding regs (batch3) — nested object */
-    pos += snprintf(buf + pos, buf_size - pos,
-                    "\"holdingRegs\":{\"command\":%u,\"operatingMode\":%u}",
-                    b3[0], b3[1]);
+    /* Holding regs (batch3) — command/operating-mode readback, only read on
+     * the GC1211 family (see genset_poll). Omitted entirely on GC1111 rather
+     * than reported as zeros, matching the reference firmware's conditional
+     * "if (holdingOk)" behaviour. */
+    if (d->has_holding) {
+        pos += snprintf(buf + pos, buf_size - pos,
+                        ",\"holdingRegs\":{\"command\":%u,\"operatingMode\":%u}",
+                        b3[0], b3[1]);
+        pos = clamp_pos(pos, buf_size);
+    }
 
     pos += snprintf(buf + pos, buf_size - pos,
                     "},\"TS\":\"%s\"}", ts);
+    pos = clamp_pos(pos, buf_size);
+
+    /* clamp_pos stops truncation from corrupting memory, but a truncated
+     * payload is still syntactically broken JSON (missing closing braces,
+     * possibly mid-string) — a cloud parser would silently reject the whole
+     * message. Landing within 2 bytes of the ceiling on a 4096-byte buffer
+     * sized for a ~2.2KB worst case is itself a strong signal something is
+     * wrong, so fall back to the same guaranteed-valid "404" shape used for
+     * a failed poll rather than publish something unparsable. */
+    if (pos >= (int)buf_size - 2) {
+        ESP_LOGW(TAG, "genset payload truncated at %d/%zu bytes — publishing 404 instead", pos, buf_size);
+        snprintf(buf, buf_size,
+                 "{\"HW_ID\":\"%s\",\"genset\":{\"data\":\"404\"},\"TS\":\"%s\"}",
+                 hw_id, ts);
+    }
 }

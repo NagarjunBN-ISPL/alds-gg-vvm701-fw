@@ -11,6 +11,31 @@
 
 static const char *TAG = "network";
 
+/* Live APN — defaults to the compiled-in config.h value so network_init()
+ * still works if network_set_apn() is never called. app_main() overrides
+ * these from DeviceConfig right after loading NVS. */
+static char s_apn[48]      = MODEM_APN;
+static char s_apn_user[32] = MODEM_APN_USER;
+static char s_apn_pass[32] = MODEM_APN_PASS;
+
+void network_set_apn(const char *apn, const char *user, const char *pass) {
+    strncpy(s_apn, apn, sizeof(s_apn) - 1);
+    s_apn[sizeof(s_apn) - 1] = '\0';
+    strncpy(s_apn_user, user ? user : "", sizeof(s_apn_user) - 1);
+    s_apn_user[sizeof(s_apn_user) - 1] = '\0';
+    strncpy(s_apn_pass, pass ? pass : "", sizeof(s_apn_pass) - 1);
+    s_apn_pass[sizeof(s_apn_pass) - 1] = '\0';
+}
+
+void network_build_qicsgp(char *out, size_t out_size) {
+    /* auth type: 0=none, 3=PAP or CHAP (modem negotiates). Only send auth
+     * when a username is actually set — an empty-user context with auth=3
+     * is rejected by some networks. */
+    int auth = (s_apn_user[0] != '\0') ? 3 : 0;
+    snprintf(out, out_size, "AT+QICSGP=1,1,\"%s\",\"%s\",\"%s\",%d",
+             s_apn, s_apn_user, s_apn_pass, auth);
+}
+
 static int parse_reg_stat(const char *resp, const char *prefix) {
     const char *p = strstr(resp, prefix);
     if (!p) return -1;
@@ -45,17 +70,38 @@ static bool wait_registered(int timeout_ms) {
 }
 
 bool network_init(void) {
-    char cmd[128], resp[256];
+    /* cmd must hold the QICSGP command, whose APN+user+pass can total ~110
+     * chars — keep it comfortably above 128. */
+    char cmd[200], resp[256];
     bool ok;
 
     modem_at("ATE0",      "OK", 2000, NULL, 0);
     modem_at("AT+CMEE=2", "OK", 2000, NULL, 0);
 
-    /* SIM ready check */
-    memset(resp, 0, sizeof(resp));
-    modem_at("AT+CPIN?", "READY", 5000, resp, sizeof(resp));
-    if (!strstr(resp, "READY")) {
-        ESP_LOGE(TAG, "SIM not ready: %s", resp);
+    /* SIM ready check. The modem stays powered across esp_restart() (never
+     * re-pulsed), so a wedged SIM subsystem — e.g. left in a bad state by a
+     * FOTA attempt's QIDEACT/reactivate — will keep answering CPIN? with
+     * +CME ERROR forever, and an ESP reboot alone won't clear it. So: poll
+     * for readiness, and if it stays stuck, PWRKEY power-cycle the modem
+     * (which DOES reset the baseband/SIM) and try once more before failing. */
+    bool sim_ready = false;
+    for (int cycle = 0; cycle < 2 && !sim_ready; cycle++) {
+        if (cycle > 0) {
+            ESP_LOGW(TAG, "SIM stuck — power-cycling modem to reset SIM subsystem");
+            modem_hard_reset();
+            modem_at("ATE0",      "OK", 2000, NULL, 0);
+            modem_at("AT+CMEE=2", "OK", 2000, NULL, 0);
+        }
+        for (int i = 0; i < 10; i++) {
+            memset(resp, 0, sizeof(resp));
+            modem_at("AT+CPIN?", "READY", 5000, resp, sizeof(resp));
+            if (strstr(resp, "READY")) { sim_ready = true; break; }
+            ESP_LOGW(TAG, "SIM not ready (cycle %d try %d/10)", cycle + 1, i + 1);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+    if (!sim_ready) {
+        ESP_LOGE(TAG, "SIM not ready after power-cycle — rebooting");
         return false;
     }
     ESP_LOGI(TAG, "SIM: READY");
@@ -79,7 +125,7 @@ bool network_init(void) {
     ESP_LOGI(TAG, "nwscanmode=auto: %s", ok ? "OK" : "FAIL");
 
     /* PDP context */
-    snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", MODEM_APN);
+    snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", s_apn);
     ok = modem_at(cmd, "OK", 5000, NULL, 0);
     ESP_LOGI(TAG, "CGDCONT: %s", ok ? "OK" : "FAIL");
 
@@ -107,7 +153,7 @@ bool network_init(void) {
     if (strstr(resp, "+QIACT: 1,1")) {
         ESP_LOGI(TAG, "PDP already active");
     } else {
-        snprintf(cmd, sizeof(cmd), "AT+QICSGP=1,1,\"%s\",\"\",\"\",0", MODEM_APN);
+        network_build_qicsgp(cmd, sizeof(cmd));
         modem_at(cmd, "OK", 5000, NULL, 0);
         ok = modem_at("AT+QIACT=1", "OK", 60000, NULL, 0);
         ESP_LOGI(TAG, "QIACT=1: %s", ok ? "OK" : "FAIL");

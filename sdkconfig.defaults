@@ -8,10 +8,15 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_ESPTOOLPY_AFTER_RESET=y
 
-# Task WDT: 120 s timeout, auto-init, no panic (log only)
+# Task WDT: Kconfig hard-caps this at 60s (range 1-60 in esp_system/Kconfig) —
+# 120 here would be silently clamped to the built-in default of 5s instead,
+# which is what was actually happening. main.c calls esp_task_wdt_reconfigure()
+# at boot to set the real 120s timeout (WDT_TIMEOUT_MS in config.h), which
+# isn't subject to this Kconfig range. This value just covers the brief
+# window before that call runs.
 CONFIG_ESP_TASK_WDT_EN=y
 CONFIG_ESP_TASK_WDT_INIT=y
-CONFIG_ESP_TASK_WDT_TIMEOUT_S=120
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 # CONFIG_ESP_TASK_WDT_PANIC is not set
 
 # Dynamic Frequency Scaling: 160 MHz idle → 240 MHz active
@@ -22,8 +27,23 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
+# OTA rollback: a freshly-FOTA'd image boots as PENDING_VERIFY and is only
+# confirmed once check_post_ota() calls esp_ota_mark_app_valid_cancel_rollback()
+# — which runs after the modem, network AND MQTT all come up. If a bad image
+# boots but can't get online, it reboots and the bootloader reverts to the
+# last-known-good app instead of boot-looping a bricked, unreachable device.
+# (Rollback-on-failure only — NOT anti-rollback, which burns efuses.)
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # Stack sizes
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# 16384 (was 8192): the deepest call chain — app_main -> run_poll_cycle ->
+# poll_incoming_mqtt -> handle_msg -> parse_setconfig -> validate_suffixes —
+# stacks several hundred bytes of locals per frame on top of validate_suffixes'
+# own ~770 bytes (now static, but the rest of the chain's frames still add up).
+# Doubling gives a comfortable margin; RAM has ample headroom (~72KB/320KB
+# used) to spend on stack safety over a class of bug (silent stack corruption)
+# that's brutal to diagnose in the field.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
 # Stack overflow detection (canary)

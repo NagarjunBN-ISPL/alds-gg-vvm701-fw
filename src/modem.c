@@ -1,5 +1,6 @@
 #include "modem.h"
 #include "config.h"
+#include "mqtt.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -37,18 +38,77 @@ void modem_uart_init(void) {
     gpio_set_level(MODEM_PWRKEY, 0);
 }
 
+static void (*s_flush_rescue)(const char *data) = NULL;
+
+void modem_set_flush_rescue(void (*cb)(const char *data)) {
+    s_flush_rescue = cb;
+}
+
 void modem_flush(void) {
+    /* Bound the drain: "read until silent" never terminates if the modem
+     * streams continuously (URC storm / firmware fault) — cap total bytes
+     * so flush can never wedge the calling task. */
     uint8_t tmp[64];
-    while (uart_read_bytes(MODEM_UART, tmp, sizeof(tmp), pdMS_TO_TICKS(30)) > 0);
+    int drained = 0;
+    const int drain_cap = 8192;
+
+    if (!s_flush_rescue) {
+        int n;
+        while ((n = uart_read_bytes(MODEM_UART, tmp, sizeof(tmp), pdMS_TO_TICKS(30))) > 0) {
+            drained += n;
+            if (drained > drain_cap) break;
+        }
+        return;
+    }
+
+    /* A +QMTRECV: URC can land on the wire between unrelated AT commands.
+     * Accumulate what would otherwise be silently discarded and let the
+     * rescue callback pull any complete message out of it before we
+     * actually throw the rest away. */
+    static char acc[600];
+    int total = 0;
+    int n;
+    while ((n = uart_read_bytes(MODEM_UART, tmp, sizeof(tmp), pdMS_TO_TICKS(30))) > 0) {
+        if (total + n < (int)sizeof(acc) - 1) {
+            memcpy(acc + total, tmp, n);
+            total += n;
+        }
+        drained += n;
+        if (drained > drain_cap) break;
+    }
+    if (total > 0) {
+        acc[total] = '\0';
+        if (strstr(acc, "+QMTRECV:")) s_flush_rescue(acc);
+    }
+}
+
+/* QMTCONN is the only AT command in this codebase carrying a plaintext
+ * secret (the MQTT username/password — compiled into config.h by default,
+ * but overridable at runtime via mqtt_set_credentials() from a remote
+ * setconfig). Logging it verbatim at INFO level would put broker credentials
+ * on the serial console for anyone with a USB-UART adapter or JTAG probe on
+ * the board. Detect it by the literal password substring (the live one, via
+ * mqtt_get_pass(), not the compile-time default) rather than by command
+ * name, so this stays correct even if the QMTCONN call site changes shape. */
+static void log_at_cmd(const char *cmd) {
+    const char *pass = mqtt_get_pass();
+    /* An empty needle makes strstr() "match" every command at position 0,
+     * which would blank all AT-command logging — guard it explicitly rather
+     * than rely on the password field always being non-empty. */
+    if (pass[0] != '\0' && strstr(cmd, pass)) {
+        ESP_LOGI(TAG, ">> AT+QMTCONN=... (credentials redacted)");
+    } else {
+        ESP_LOGI(TAG, ">> %s", cmd);
+    }
 }
 
 bool modem_at(const char *cmd, const char *expect, int timeout_ms,
               char *resp, size_t resp_size) {
     modem_flush();
 
-    static char line[512];
+    static char line[520];
     int n = snprintf(line, sizeof(line), "%s\r\n", cmd);
-    ESP_LOGI(TAG, ">> %s", cmd);
+    log_at_cmd(cmd);
     uart_write_bytes(MODEM_UART, line, n);
 
     static char buf[2048];
@@ -70,7 +130,16 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
                  * before returning so callers don't see a truncated field. */
                 vTaskDelay(pdMS_TO_TICKS(30));
                 int space = (int)sizeof(buf) - 1 - total;
-                while (space > 0) {
+                /* Hard cap on top of the "exit on silence" condition — a
+                 * modem trickling single bytes continuously (RF noise, a
+                 * chatty URC stream) would otherwise keep this loop alive
+                 * for ~(space/20ms), tens of seconds, and callers chaining
+                 * many modem_at() calls (e.g. network_init()) could
+                 * accumulate well past what's reasonable across a single
+                 * bring-up attempt. */
+                int64_t drain_deadline = esp_timer_get_time() + 500000LL;
+                while (space > 0 && esp_timer_get_time() < drain_deadline) {
+                    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
                     int n2 = uart_read_bytes(MODEM_UART, (uint8_t *)buf + total,
                                               space, pdMS_TO_TICKS(20));
                     if (n2 <= 0) break;
@@ -120,6 +189,26 @@ bool modem_read_until(const char *expect, int timeout_ms,
                 buf[total]   = '\0';
             }
             if (expect && strstr(buf, expect)) {
+                /* The value for URCs like +QHTTPGET/+QHTTPREADFILE follows
+                 * the marker (e.g. "+QHTTPGET: 0,200,309120") and may not
+                 * have arrived yet — drain the rest of the line before
+                 * returning so callers can parse the fields. Same class of
+                 * fix as modem_at(). */
+                vTaskDelay(pdMS_TO_TICKS(30));
+                int space = (int)sizeof(buf) - 1 - total;
+                /* Same unbounded-trickle risk as modem_at()'s trailing
+                 * drain, and the same hard cap on top of "exit on silence". */
+                int64_t drain_deadline = esp_timer_get_time() + 500000LL;
+                while (space > 0 && esp_timer_get_time() < drain_deadline) {
+                    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+                    int n2 = uart_read_bytes(MODEM_UART, (uint8_t *)buf + total,
+                                              space, pdMS_TO_TICKS(20));
+                    if (n2 <= 0) break;
+                    total += n2;
+                    buf[total] = '\0';
+                    space = (int)sizeof(buf) - 1 - total;
+                    if (strchr(strstr(buf, expect), '\n')) break;
+                }
                 if (resp && resp_size > 0) {
                     strncpy(resp, buf, resp_size - 1);
                     resp[resp_size - 1] = '\0';
@@ -236,6 +325,23 @@ bool modem_get_vbat(int *vbat_mv) {
     return true;
 }
 
+bool modem_get_operator(char *out, size_t out_size) {
+    if (out_size > 0) out[0] = '\0';
+    char resp[128] = {0};
+    if (!modem_at("AT+COPS?", "+COPS:", 5000, resp, sizeof(resp))) return false;
+    /* +COPS: <mode>,<format>,"<operator>",<AcT> */
+    char *q1 = strchr(resp, '"');
+    if (!q1) return false;
+    q1++;
+    char *q2 = strchr(q1, '"');
+    if (!q2) return false;
+    size_t len = (size_t)(q2 - q1);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, q1, len);
+    out[len] = '\0';
+    return true;
+}
+
 bool modem_get_timestamp(char *buf, size_t size) {
     char resp[128] = {0};
 
@@ -246,6 +352,11 @@ bool modem_get_timestamp(char *buf, size_t size) {
             q++;
             int Y, Mo, D, h, m, s;
             if (sscanf(q, "%d/%d/%d,%d:%d:%d", &Y, &Mo, &D, &h, &m, &s) == 6) {
+                /* QLTS=2 is documented as 4-digit year, but some Quectel
+                 * firmware variants have been seen returning 2-digit — apply
+                 * the same normalization already used for the CCLK fallback
+                 * below rather than assume the modem always complies. */
+                if (Y < 100) Y += 2000;
                 snprintf(buf, size, "%04d-%02d-%02d %02d:%02d:%02d",
                          Y, Mo, D, h, m, s);
                 return true;

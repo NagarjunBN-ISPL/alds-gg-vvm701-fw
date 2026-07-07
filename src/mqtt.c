@@ -27,11 +27,58 @@ static int       g_stash_cnt  = 0;
 static int       g_msgid      = 1;
 static bool      g_connected  = false;
 static char      g_client_id[80];
+static int       s_pub_fail_streak = 0;   /* consecutive failed publishes */
+
+/* Broker credentials — default to the compiled-in config.h values so the
+ * device still connects if mqtt_set_credentials() is never called (e.g.
+ * before nvs_config_load() exists). app_main() overrides these from
+ * DeviceConfig right after loading NVS. */
+static char     s_mqtt_host[64] = MQTT_HOST;
+static uint16_t s_mqtt_port     = MQTT_PORT;
+static char     s_mqtt_user[32] = MQTT_USER;
+static char     s_mqtt_pass[64] = MQTT_PASS;
+static bool     s_mqtt_tls      = true;
+
+void mqtt_set_credentials(const char *host, uint16_t port,
+                           const char *user, const char *pass, bool tls) {
+    strncpy(s_mqtt_host, host, sizeof(s_mqtt_host) - 1);
+    s_mqtt_host[sizeof(s_mqtt_host) - 1] = '\0';
+    s_mqtt_port = port;
+    strncpy(s_mqtt_user, user, sizeof(s_mqtt_user) - 1);
+    s_mqtt_user[sizeof(s_mqtt_user) - 1] = '\0';
+    strncpy(s_mqtt_pass, pass, sizeof(s_mqtt_pass) - 1);
+    s_mqtt_pass[sizeof(s_mqtt_pass) - 1] = '\0';
+    s_mqtt_tls = tls;
+}
+
+const char *mqtt_get_pass(void) { return s_mqtt_pass; }
 
 static int next_msgid(void) {
     int id = g_msgid++;
     if (g_msgid > 65535) g_msgid = 1;
     return id;
+}
+
+/* ── Detect +QMTSTAT URCs (connection-lost notification) ─────────────────
+ * Quectel sends "+QMTSTAT: 0,<code>" (code != 0) when the MQTT link drops
+ * (broker gone, keepalive timeout, network loss). If we don't notice, we
+ * keep thinking we're connected — so mqtt_reconnect_if_needed() never fires,
+ * and any setconfig/FOTA the broker has queued for our persistent session
+ * is never delivered. Scan every buffer read from the modem so it's caught
+ * even mid-publish/subscribe. This was the missing piece vs. the known-good
+ * build: a silently-dropped link left setconfig stuck in the broker queue. */
+static void check_qmtstat(const char *buf) {
+    const char *p = strstr(buf, "+QMTSTAT:");
+    if (!p) return;
+    p += 9;
+    while (*p == ' ') p++;
+    p = strchr(p, ',');
+    if (p && atoi(p + 1) != 0) {
+        if (g_connected) {
+            ESP_LOGW(TAG, "QMTSTAT: connection lost — marking link down");
+            g_connected = false;
+        }
+    }
 }
 
 /* Skip past '+QMTRECV: <id>,<msgid>,"<topic>",' to the payload field.
@@ -98,6 +145,11 @@ static const char *qmtrecv_payload_end(const char *p) {
         }
         if (depth != 0) return NULL;              /* braces never balanced yet */
         if (quoted) {
+            /* A pretty-printed JSON payload ends with "}\r\n" before the
+             * modem's closing wrapper quote — skip that trailing whitespace,
+             * otherwise the quote check fails and the whole message (e.g.
+             * a multi-line setconfig) is silently dropped. */
+            while (*q == ' ' || *q == '\r' || *q == '\n' || *q == '\t') q++;
             if (*q != '"') return NULL;            /* closing wrapper quote pending */
             q++;
         }
@@ -117,6 +169,9 @@ static const char *qmtrecv_payload_end(const char *p) {
 
 /* ── Parse +QMTRECV URCs from a buffer, push into stash ──────────────── */
 static void parse_qmtrecv(const char *buf) {
+    if (!buf) return;
+    check_qmtstat(buf);   /* also scan for connection-lost notifications */
+
     const char *search_from = buf;
     for (;;) {
         if (g_stash_cnt >= STASH_MAX) break;
@@ -137,6 +192,7 @@ static void parse_qmtrecv(const char *buf) {
         size_t pl = (pl_len   < PAYLOAD_MAX - 1)  ? pl_len   : PAYLOAD_MAX - 1;
         memcpy(m->topic,   topic_start,   tl); m->topic[tl]   = '\0';
         memcpy(m->payload, content_start, pl); m->payload[pl] = '\0';
+        ESP_LOGI(TAG, "RX stashed: topic=[%s] payload=[%s]", m->topic, m->payload);
 
         search_from = content_stop;
     }
@@ -144,7 +200,15 @@ static void parse_qmtrecv(const char *buf) {
 
 static void drain_recv(int timeout_ms) {
     static char buf[PAYLOAD_MAX + 300];
-    int total = 0;
+    /* Persists across calls — see the resume-point logic at the end of this
+     * function. Resetting this to 0 on every call (as it used to be) meant a
+     * "+QMTRECV:" header split across two drain_recv() calls by unlucky UART
+     * timing (e.g. the 9-byte marker starts arriving right as the soft
+     * deadline below fires) had its already-read prefix silently overwritten
+     * by the next call's fresh reads, permanently losing that remote command —
+     * uart_read_bytes() consumes bytes from the driver's ring buffer, so
+     * there's no way to "re-read" them once dropped here. */
+    static int total = 0;
     int64_t dl      = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     int64_t hard_dl = esp_timer_get_time() + 2000000LL;  /* absolute safety cap */
 
@@ -165,6 +229,34 @@ static void drain_recv(int timeout_ms) {
         }
     }
     if (total > 0) parse_qmtrecv(buf);
+
+    /* Determine the resume point exactly the way parse_qmtrecv() itself walks
+     * the buffer: skip over every COMPLETE URC it already consumed, and if
+     * what's left is a URC whose header arrived but payload hasn't finished,
+     * shift that partial tail down to offset 0 and keep accumulating onto it
+     * next call. If nothing resembles a URC start at all, the buffer is just
+     * stale AT chatter — safe to discard. */
+    const char *search_from = buf;
+    const char *incomplete_start = NULL;
+    for (;;) {
+        const char *hdr = strstr(search_from, "+QMTRECV:");
+        if (!hdr) break;
+        const char *pstart = qmtrecv_payload_start(search_from, NULL, NULL);
+        if (!pstart) break;
+        const char *pend = qmtrecv_payload_end(pstart);
+        if (!pend) { incomplete_start = hdr; break; }
+        search_from = pend;
+    }
+
+    size_t keep = incomplete_start ? strlen(incomplete_start) : 0;
+    if (incomplete_start && keep < sizeof(buf) - 100) {
+        /* Genuinely incomplete and still comfortably within capacity —
+         * preserve it so the next call resumes accumulating from here. */
+        memmove(buf, incomplete_start, keep + 1);
+        total = (int)keep;
+    } else {
+        total = 0;
+    }
 }
 
 /* ── Public API ───────────────────────────────────────────────────────── */
@@ -174,6 +266,9 @@ bool mqtt_init(const char *imei) {
     g_stash_cnt = 0;
     g_connected = false;
     g_msgid     = 1;
+    /* Rescue +QMTRECV: URCs that would otherwise be silently discarded by
+     * modem_flush() at the start of any unrelated AT command. */
+    modem_set_flush_rescue(parse_qmtrecv);
     return true;
 }
 
@@ -184,13 +279,23 @@ bool mqtt_connect(void) {
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     /* TLS + persistent session — both must be set before QMTOPEN, since
-     * Quectel rejects QMTCFG/QSSLCFG changes once the link is already open.
-     * seclevel=0: no cert verification (no CA cert provisioned on-device yet).
-     * Encrypts the transport so credentials aren't sent in the clear. */
-    modem_at("AT+QSSLCFG=\"sslversion\",2,4",       "OK", 3000, NULL, 0);
-    modem_at("AT+QSSLCFG=\"ciphersuite\",2,0XFFFF", "OK", 3000, NULL, 0);
-    modem_at("AT+QSSLCFG=\"seclevel\",2,0",         "OK", 3000, NULL, 0);
-    modem_at("AT+QMTCFG=\"ssl\",0,1,2",             "OK", 3000, NULL, 0);
+     * Quectel rejects QMTCFG/QSSLCFG changes once the link is already open. */
+    if (s_mqtt_tls) {
+        /* seclevel=0: no cert verification (no CA cert provisioned on-device
+         * yet). Still encrypts the transport so credentials aren't sent in
+         * the clear. QMTCFG "ssl",0,1,2 = client 0, SSL on, SSL context 2. */
+        modem_at("AT+QSSLCFG=\"sslversion\",2,4",       "OK", 3000, NULL, 0);
+        modem_at("AT+QSSLCFG=\"ciphersuite\",2,0XFFFF", "OK", 3000, NULL, 0);
+        modem_at("AT+QSSLCFG=\"seclevel\",2,0",         "OK", 3000, NULL, 0);
+        modem_at("AT+QMTCFG=\"ssl\",0,1,2",             "OK", 3000, NULL, 0);
+    } else {
+        /* Plaintext MQTT — credentials and telemetry travel unencrypted.
+         * Only for brokers that don't offer TLS; guarded remotely by the
+         * connectivity rollback (a wrong toggle can't reach a session and
+         * self-reverts). QMTCFG "ssl",0,0 = SSL off on client 0. */
+        ESP_LOGW(TAG, "MQTT TLS disabled — connecting in plaintext");
+        modem_at("AT+QMTCFG=\"ssl\",0,0", "OK", 3000, NULL, 0);
+    }
     modem_at("AT+QMTCFG=\"keepalive\",0,60",        "OK", 3000, NULL, 0);
 
     /* Persistent session: broker queues QoS-1 messages while device is offline.
@@ -198,7 +303,7 @@ bool mqtt_connect(void) {
     modem_at("AT+QMTCFG=\"session\",0,0", "OK", 5000, NULL, 0);
 
     /* Open TCP/TLS connection to broker */
-    snprintf(cmd, sizeof(cmd), "AT+QMTOPEN=0,\"%s\",%d", MQTT_HOST, MQTT_PORT);
+    snprintf(cmd, sizeof(cmd), "AT+QMTOPEN=0,\"%s\",%d", s_mqtt_host, s_mqtt_port);
     if (!modem_at(cmd, "+QMTOPEN:", 30000, resp, sizeof(resp))) {
         ESP_LOGE(TAG, "QMTOPEN failed: %s", resp);
         return false;
@@ -216,7 +321,7 @@ bool mqtt_connect(void) {
 
     /* MQTT CONNECT */
     snprintf(cmd, sizeof(cmd), "AT+QMTCONN=0,\"%s\",\"%s\",\"%s\"",
-             g_client_id, MQTT_USER, MQTT_PASS);
+             g_client_id, s_mqtt_user, s_mqtt_pass);
     if (!modem_at(cmd, "+QMTCONN:", 30000, resp, sizeof(resp))) {
         ESP_LOGE(TAG, "QMTCONN failed: %s", resp);
         return false;
@@ -236,6 +341,7 @@ bool mqtt_connect(void) {
     }
 
     g_connected = true;
+    s_pub_fail_streak = 0;
     ESP_LOGI(TAG, "MQTT connected, client=%s", g_client_id);
     return true;
 }
@@ -257,8 +363,15 @@ bool mqtt_publish(const char *topic, const char *payload) {
 
     int  mid = next_msgid();
     int  len = strlen(payload);
+    /* Log topic + size at INFO (the useful "what/how-big" for field debug);
+     * the full JSON body only at DEBUG. Every 30 s the old INFO line dumped
+     * ~10-15 KB of dispenser/radar/genset/sysmon JSON to UART0 — tens of MB
+     * of console traffic a day plus the string-format cost on the main loop,
+     * all for data the cloud already has. */
+    ESP_LOGI(TAG, "PUBLISH %s (%d bytes)", topic, len);
+    ESP_LOGD(TAG, "  payload: %s", payload);
     static char cmd[512];
-    snprintf(cmd, sizeof(cmd), "AT+QMTPUBEX=0,%d,1,0,\"%s\",%d", mid, topic, len);
+    snprintf(cmd, sizeof(cmd), "AT+QMTPUBEX=0,%d,%d,0,\"%s\",%d", mid, MQTT_QOS, topic, len);
 
     /* Send command, wait for '>' prompt, rescue any +QMTRECV URCs */
     modem_flush();
@@ -316,10 +429,28 @@ bool mqtt_publish(const char *topic, const char *payload) {
                 parse_qmtrecv(buf);
                 /* continue waiting for QMTPUBEX */
             }
+            check_qmtstat(buf);          /* link dropped mid-publish? */
+            if (!g_connected) break;
         }
     }
 
-    if (!pub_ok) ESP_LOGW(TAG, "No PUBEX ack for %s", topic);
+    /* Detect a silently-dead link: the modem can keep accepting QMTPUBEX
+     * (returning OK/'>') while the broker TCP session is actually gone, so
+     * mqtt_is_connected() alone never trips. Count consecutive missing
+     * PUBEX acks; past the threshold, mark the link down so the next
+     * mqtt_reconnect_if_needed() rebuilds it (L1→L4). */
+    if (pub_ok) {
+        s_pub_fail_streak = 0;
+    } else {
+        ESP_LOGW(TAG, "No PUBEX ack for %s (streak %d/%d)",
+                 topic, s_pub_fail_streak + 1, MQTT_PUB_FAIL_MAX);
+        if (++s_pub_fail_streak >= MQTT_PUB_FAIL_MAX) {
+            ESP_LOGE(TAG, "%d consecutive publish failures — marking link DOWN",
+                     s_pub_fail_streak);
+            g_connected = false;
+            s_pub_fail_streak = 0;
+        }
+    }
     return pub_ok;
 }
 

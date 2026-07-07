@@ -4,36 +4,66 @@
 #include "modem.h"
 #include "mqtt.h"
 #include "config.h"
+#include "nvs_config.h"
+#include "esp_log.h"
 #include "driver/temperature_sensor.h"
 #include "esp_pm.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_ota_ops.h"
-#include "esp_private/esp_clk.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
 
+static const char *TAG = "sysmon";
+
 static temperature_sensor_handle_t s_temp_hdl    = NULL;
 static esp_pm_lock_handle_t        s_pm_lock      = NULL;
 static int                         s_reset_reason = 0;
+static uint32_t                    s_boot_count   = 0;
+/* The CPU frequency held while the ESP_PM_CPU_FREQ_MAX lock is taken (i.e.
+ * during every poll cycle, which is exactly when sysmon samples). Set from the
+ * PM config below; left at the compiled default if DFS fails to engage. */
+static uint32_t                    s_cpu_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
 
 void sysmon_init(void) {
     s_reset_reason = (int)esp_reset_reason();
+    /* One bump per boot — sysmon_init() is called exactly once from app_main,
+     * after nvs_flash_init(). */
+    s_boot_count   = nvs_boot_count_bump();
 
     temperature_sensor_config_t tcfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
     if (temperature_sensor_install(&tcfg, &s_temp_hdl) == ESP_OK)
         temperature_sensor_enable(s_temp_hdl);
 
+    /* Dynamic frequency scaling: 240 MHz while the ESP_PM_CPU_FREQ_MAX lock is
+     * held (taken around every poll cycle), dropping to 160 MHz when idle.
+     * The 160 MHz floor is a HARD requirement, not a tunable: on the ESP32-S3
+     * both 160 and 240 MHz are derived from the same PLL, so the 80 MHz APB
+     * clock that feeds the modem / RS485 / DI UARTs stays constant across the
+     * switch. Any floor below 160 would fall to an XTAL-derived CPU clock,
+     * which also drops APB and skews every UART baud rate mid-operation —
+     * corrupting modem AT traffic and RS485 frames. Hence min == 160.
+     * light_sleep stays off: three UARTs are always live and light sleep
+     * would gate their clocks. */
     esp_pm_config_t pm_cfg = {
         .max_freq_mhz       = 240,
         .min_freq_mhz       = 160,
         .light_sleep_enable = false,
     };
-    if (esp_pm_configure(&pm_cfg) == ESP_OK)
+    esp_err_t pm_err = esp_pm_configure(&pm_cfg);
+    if (pm_err == ESP_OK) {
+        s_cpu_freq_mhz = pm_cfg.max_freq_mhz;   /* 240 under load */
         esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "cpu_max", &s_pm_lock);
+    } else {
+        /* DFS didn't engage (e.g. CONFIG_PM_ENABLE off) — CPU stays pinned at
+         * the compiled default, which is still >= 160. Surface it rather than
+         * silently losing the 240 MHz boost during polling. */
+        ESP_LOGW(TAG, "esp_pm_configure failed (%s) — DFS off, CPU fixed at %d MHz",
+                 esp_err_to_name(pm_err), CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+    }
 }
 
 void sysmon_pm_acquire(void) { if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock); }
@@ -45,6 +75,13 @@ float sysmon_get_temp_c(void) {
     return t;
 }
 
+const char *sysmon_thermal_zone(float temp_c) {
+    if (temp_c >= THERMAL_CRITICAL_MIN_C) return "critical";
+    if (temp_c >= THERMAL_WARM_MAX_C)     return "hot";
+    if (temp_c >= THERMAL_NORMAL_MAX_C)   return "warm";
+    return "normal";
+}
+
 void sysmon_sample(SysmonSnapshot_t *out) {
     memset(out, 0, sizeof(*out));
 
@@ -54,12 +91,21 @@ void sysmon_sample(SysmonSnapshot_t *out) {
     out->heap_free          = esp_get_free_heap_size();
     out->heap_min_ever      = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
     out->heap_largest_block = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-    out->cpu_freq_mhz       = (uint32_t)(esp_clk_cpu_freq() / 1000000);
+    /* The DFS max lock is held for the whole poll cycle, and sysmon samples
+     * from inside that cycle — so the CPU is genuinely at s_cpu_freq_mhz
+     * (240 with DFS on) at sample time. Reporting the configured max here is
+     * therefore the accurate live value, without touching the live-frequency
+     * API esp_clk_cpu_freq() (which lives in an unsupported private header).
+     * The old code reported CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, which is 160 —
+     * misleadingly low, since the chip is at 240 whenever this runs. */
+    out->cpu_freq_mhz       = s_cpu_freq_mhz;
     out->uptime_s           = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     out->reset_reason       = s_reset_reason;
+    out->boot_count         = s_boot_count;
 
     out->rssi_csq = modem_get_csq();
     modem_get_vbat(&out->vbat_mv);
+    modem_get_operator(out->operator_name, sizeof(out->operator_name));
 
     const esp_partition_t *part = esp_ota_get_running_partition();
     if (part)
@@ -84,19 +130,22 @@ void sysmon_publish(const char *hw_id, const char *ts, const char *topic) {
     sysmon_sample(&s);
 
     char buf[768];
-    snprintf(buf, sizeof(buf),
+    int written = snprintf(buf, sizeof(buf),
         "{"
         "\"HW_ID\":\"%s\","
         "\"fw\":\"%s\","
         "\"cpu_temp_c\":%.1f,"
+        "\"thermal_zone\":\"%s\","
         "\"cpu_freq_mhz\":%lu,"
         "\"heap_free\":%lu,"
         "\"heap_min_ever\":%lu,"
         "\"heap_largest_block\":%lu,"
         "\"uptime_s\":%lu,"
         "\"reset_reason\":%d,"
+        "\"boot_count\":%lu,"
         "\"rssi\":%d,"
         "\"vbat_mv\":%d,"
+        "\"operator\":\"%s\","
         "\"ota_partition\":\"%s\","
         "\"main_stack_hwm\":%lu,"
         "\"di_stack_hwm\":%lu,"
@@ -111,13 +160,16 @@ void sysmon_publish(const char *hw_id, const char *ts, const char *topic) {
         "}",
         hw_id, FW_VERSION,
         s.cpu_temp_c,
+        sysmon_thermal_zone(s.cpu_temp_c),
         (unsigned long)s.cpu_freq_mhz,
         (unsigned long)s.heap_free,
         (unsigned long)s.heap_min_ever,
         (unsigned long)s.heap_largest_block,
         (unsigned long)s.uptime_s,
         s.reset_reason,
+        (unsigned long)s.boot_count,
         s.rssi_csq, s.vbat_mv,
+        s.operator_name,
         s.ota_label,
         (unsigned long)s.main_stack_hwm,
         (unsigned long)s.di_stack_hwm,
@@ -129,6 +181,19 @@ void sysmon_publish(const char *hw_id, const char *ts, const char *topic) {
         s.genset_ok ? "true" : "false",
         s.di_ok     ? "true" : "false",
         ts);
+
+    /* snprintf's return value is the length it WOULD have written, not what
+     * actually fit — a single call like this can never overflow buf (unlike
+     * the chained snprintf+clamp_pos pattern in genset.c/dispenser.c), but it
+     * can still silently truncate into invalid JSON if some field (e.g. an
+     * unexpectedly long operator name) pushes the total over 768 bytes. */
+    if (written >= (int)sizeof(buf)) {
+        ESP_LOGW(TAG, "payload truncated at %d/%zu bytes — publishing minimal report instead",
+                 written, sizeof(buf));
+        snprintf(buf, sizeof(buf),
+                 "{\"HW_ID\":\"%s\",\"fw\":\"%s\",\"error\":\"payload_truncated\",\"TS\":\"%s\"}",
+                 hw_id, FW_VERSION, ts);
+    }
 
     mqtt_publish(topic, buf);
 }

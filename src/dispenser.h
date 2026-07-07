@@ -15,21 +15,16 @@ typedef struct {
     uint8_t rfid[DU_RESP_MAX];   int rfid_len;
 } DuNozzle_t;
 
-/* RS485 UART must already be installed before calling these. */
+/* RS485 UART must already be installed before calling this. */
 void du_rs485_set_bluesky_mode(void);   /* 8E1 9600 */
-void du_rs485_set_yenen_mode(void);     /* 8N1 9600 */
 
-/* unit_idx is 0-based (0 = first BlueSky/Yenen unit). Each BlueSky unit
- * occupies 2 RS485 addresses (unit_idx*2+1, unit_idx*2+2); each Yenen unit
- * occupies its own protocol address (unit_idx+1), with both its nozzles
- * addressed within that unit. */
+/* unit_idx is 0-based (0 = first BlueSky unit). Each BlueSky unit occupies 2
+ * RS485 addresses (unit_idx*2+1, unit_idx*2+2). */
 void du_poll_bluesky_unit(int unit_idx, DuNozzle_t *out_a, DuNozzle_t *out_b);
-void du_poll_yenen_unit(int unit_idx, DuNozzle_t *out_a, DuNozzle_t *out_b);
 
 /* Build JSON payload for one DU into buf (caller provides HW_ID and TS). */
 void du_build_payload(const DuNozzle_t *nz_a, const DuNozzle_t *nz_b,
                       int label_a, int label_b,   /* global nozzle numbers */
-                      bool is_yenen,
                       const char *hw_id, const char *ts,
                       char *buf, size_t buf_size);
 

@@ -8,9 +8,15 @@ void modem_hard_reset(void);
 bool modem_at(const char *cmd, const char *expect, int timeout_ms,
               char *resp, size_t resp_size);
 void modem_flush(void);
+/* Called with any bytes modem_flush() is about to discard, before it
+ * discards them, so a subscriber (e.g. MQTT) can rescue a +QMTRECV: URC
+ * that arrived on the wire between AT commands instead of losing it. */
+void modem_set_flush_rescue(void (*cb)(const char *data));
 bool modem_get_imei(char *imei, size_t size);
 int  modem_get_csq(void);
 bool modem_get_vbat(int *vbat_mv);
+/* Network operator name (e.g. "Airtel"), via AT+COPS?. */
+bool modem_get_operator(char *out, size_t out_size);
 bool modem_get_timestamp(char *buf, size_t size);
 /* Read UART (no command sent) until expect is found or timeout elapses. */
 bool modem_read_until(const char *expect, int timeout_ms,

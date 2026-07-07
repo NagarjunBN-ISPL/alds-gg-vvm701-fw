@@ -10,8 +10,10 @@ typedef struct {
     uint32_t cpu_freq_mhz;
     uint32_t uptime_s;
     int      reset_reason;
+    uint32_t boot_count;
     int      rssi_csq;
     int      vbat_mv;
+    char     operator_name[24];
     char     ota_label[16];
     uint32_t main_stack_hwm;
     uint32_t di_stack_hwm;
@@ -25,5 +27,7 @@ void  sysmon_init(void);
 void  sysmon_pm_acquire(void);
 void  sysmon_pm_release(void);
 float sysmon_get_temp_c(void);
+/* "normal" / "warm" / "hot" / "critical" — see THERMAL_*_C in config.h */
+const char *sysmon_thermal_zone(float temp_c);
 void  sysmon_sample(SysmonSnapshot_t *out);
 void  sysmon_publish(const char *hw_id, const char *ts, const char *topic);
