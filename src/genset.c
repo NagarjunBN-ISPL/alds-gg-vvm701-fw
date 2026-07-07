@@ -155,12 +155,19 @@ bool genset_poll(uint8_t slave, uint8_t model, GensetData_t *out) {
      * addr 0..1 there would return measurements mislabelled as command/mode —
      * skip it and leave holdingRegs unread. */
     if (model == GENSET_MODEL_GC1211) {
-        if (!modbus_request(slave, 0x03, 0, 2, rx, sizeof(rx), &rlen)
-            || !parse_regs(rx, rlen, out->batch3, 2)) {
-            ESP_LOGW(TAG, "Batch3 failed");
-            return false;
+        /* Command/operating-mode readback (FC03 holding regs 0..1) is OPTIONAL
+         * — some GC1211-family variants don't expose the FC03 holding space at
+         * all. A failure here must NOT 404 the whole genset: the measurements
+         * (batch1) and alarms/status (batch2) already succeeded and are the
+         * data that matters, and the Auto/Manual mode is also in the status
+         * word (bit 11). Leave has_holding=false so the payload simply omits
+         * holdingRegs, matching the build side's conditional handling. */
+        if (modbus_request(slave, 0x03, 0, 2, rx, sizeof(rx), &rlen)
+            && parse_regs(rx, rlen, out->batch3, 2)) {
+            out->has_holding = true;
+        } else {
+            ESP_LOGW(TAG, "Batch3 (holding regs) unavailable — reporting measurements/alarms/status only");
         }
-        out->has_holding = true;
     }
 
     out->valid = true;
