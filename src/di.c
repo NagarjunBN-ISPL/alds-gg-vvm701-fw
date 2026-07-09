@@ -87,11 +87,33 @@ void di_task(void *param) {
         uart_write_bytes(NUVOTON_UART, req, strlen(req));
         vTaskDelay(pdMS_TO_TICKS(50));
 
-        /* Read response */
-        int got = uart_read_bytes(NUVOTON_UART, (uint8_t *)resp,
-                                  NUVOTON_BUF - 1, pdMS_TO_TICKS(NUVOTON_TIMEOUT_MS));
-        if (got > 0) resp[got] = '\0';
-        else         resp[0]   = '\0';
+        /* Read response — byte-by-byte with an idle-gap cutoff, not one
+         * uart_read_bytes(..., NUVOTON_BUF-1, timeout) call as this used to
+         * be. That single-call form requests up to 255 bytes for a ~105-byte
+         * reply; esp-idf's uart_read_bytes() re-issues the FULL timeout on
+         * every partial ring-buffer fetch (see uart.c's while(length) loop),
+         * so once the real bytes were drained it kept blocking the entire
+         * remaining NUVOTON_TIMEOUT_MS waiting for bytes that would never
+         * arrive — turning every ~2s poll into a ~5.1s one (confirmed against
+         * a field log: 7 consecutive di_task iterations at exactly 5140ms).
+         * Here the "wait for a response to start at all" timeout stays the
+         * full NUVOTON_TIMEOUT_MS (a genuinely offline Nuvoton still gets a
+         * fair wait), but once the first byte lands, a 100ms gap with no
+         * further byte (~96 byte-times at 9600 baud) is treated as end of
+         * message. */
+        int got = 0;
+        int64_t dl_first = esp_timer_get_time() + (int64_t)NUVOTON_TIMEOUT_MS * 1000;
+        int64_t dl_gap    = 0;
+        for (;;) {
+            int64_t dl = (got == 0) ? dl_first : dl_gap;
+            if (esp_timer_get_time() >= dl || got >= NUVOTON_BUF - 1) break;
+            uint8_t ch;
+            if (uart_read_bytes(NUVOTON_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
+                resp[got++] = ch;
+                dl_gap = esp_timer_get_time() + 100000LL;   /* 100 ms idle → done */
+            }
+        }
+        resp[got] = '\0';
 
         /* Raw Nuvoton response for field debugging — shows exactly what the
          * MS51 sent every read (every 2s), before parsing. */

@@ -252,9 +252,11 @@ void genset_build_payload(const GensetData_t *d,
             uint8_t state = (word >> (12 - n * 4)) & 0x0F;
             if (state >= 2 && state <= 5) {
                 if (!first_alarm) buf[pos++] = ',';
+                pos = clamp_pos(pos, buf_size);
                 pos += snprintf(buf + pos, buf_size - pos,
                                 "\"%s\":\"%s\"",
                                 g_alarm_names[r][n], alarm_state_names[state]);
+                pos = clamp_pos(pos, buf_size);
                 first_alarm = false;
             }
         }
