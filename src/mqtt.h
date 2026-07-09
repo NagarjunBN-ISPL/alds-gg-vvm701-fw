@@ -14,6 +14,11 @@ void mqtt_set_credentials(const char *host, uint16_t port,
  * any other use — it's the live, possibly-runtime-overridden secret. */
 const char *mqtt_get_pass(void);
 
+/* Registered once at boot; called exactly once inside mqtt_publish() for
+ * every publish attempt (while connected), so the caller can flash an
+ * activity LED on each push. NULL = no-op. */
+void mqtt_set_activity_cb(void (*cb)(void));
+
 bool mqtt_init(const char *imei);
 bool mqtt_connect(void);
 bool mqtt_subscribe(const char *topic);

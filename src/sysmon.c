@@ -38,24 +38,27 @@ void sysmon_init(void) {
     if (temperature_sensor_install(&tcfg, &s_temp_hdl) == ESP_OK)
         temperature_sensor_enable(s_temp_hdl);
 
-    /* Dynamic frequency scaling: 240 MHz while the ESP_PM_CPU_FREQ_MAX lock is
-     * held (taken around every poll cycle), dropping to 160 MHz when idle.
-     * The 160 MHz floor is a HARD requirement, not a tunable: on the ESP32-S3
-     * both 160 and 240 MHz are derived from the same PLL, so the 80 MHz APB
-     * clock that feeds the modem / RS485 / DI UARTs stays constant across the
-     * switch. Any floor below 160 would fall to an XTAL-derived CPU clock,
-     * which also drops APB and skews every UART baud rate mid-operation —
-     * corrupting modem AT traffic and RS485 frames. Hence min == 160.
-     * light_sleep stays off: three UARTs are always live and light sleep
-     * would gate their clocks. */
+    /* FIXED 160 MHz — no dynamic frequency switching. max == min pins the CPU:
+     * there is no range to scale across, so no DFS transitions ever occur.
+     * 160 is a valid PLL-derived frequency (480/3) on the ESP32-S3, so the
+     * 80 MHz APB clock that feeds the modem / RS485 / DI UARTs is unchanged —
+     * every UART baud rate stays exact. (180 MHz is not selectable: the PLL
+     * only divides to 240/160/80. Below 160 would fall to an XTAL-derived CPU
+     * clock, which drops APB and corrupts UART timing — hence never below 160.)
+     * This workload is I/O-bound (the cores spend their life blocked on UART
+     * reads), so flat 160 costs only a marginally slower TLS handshake per
+     * reconnect while running cooler, at lower peak current, with no DFS
+     * transition events. light_sleep stays off: three UARTs are always live. */
     esp_pm_config_t pm_cfg = {
-        .max_freq_mhz       = 240,
+        .max_freq_mhz       = 160,
         .min_freq_mhz       = 160,
         .light_sleep_enable = false,
     };
     esp_err_t pm_err = esp_pm_configure(&pm_cfg);
     if (pm_err == ESP_OK) {
-        s_cpu_freq_mhz = pm_cfg.max_freq_mhz;   /* 240 under load */
+        s_cpu_freq_mhz = pm_cfg.max_freq_mhz;   /* fixed 160 */
+        /* Lock is now inert (max == min → acquiring it changes nothing), but
+         * kept so sysmon_pm_acquire/release remain valid no-ops. */
         esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "cpu_max", &s_pm_lock);
     } else {
         /* DFS didn't engage (e.g. CONFIG_PM_ENABLE off) — CPU stays pinned at

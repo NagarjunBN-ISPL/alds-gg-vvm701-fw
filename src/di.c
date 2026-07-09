@@ -93,6 +93,11 @@ void di_task(void *param) {
         if (got > 0) resp[got] = '\0';
         else         resp[0]   = '\0';
 
+        /* Raw Nuvoton response for field debugging — shows exactly what the
+         * MS51 sent every read (every 2s), before parsing. */
+        if (got > 0) ESP_LOGI(TAG, "Nuvoton RAW (%d bytes): %s", got, resp);
+        else         ESP_LOGI(TAG, "Nuvoton RAW: no response");
+
         /* Build payload JSON */
         char payload[256];
         int  pos = 0;

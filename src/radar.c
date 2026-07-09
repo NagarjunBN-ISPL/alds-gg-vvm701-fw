@@ -6,8 +6,27 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
+#include <stdio.h>
 
 static const char *TAG = "radar";
+
+/* Unconditional raw-bytes log for field debugging — prints exactly what came
+ * back over RS485, before any CRC/echo validation, so a station visit can see
+ * real wire data without a logic analyzer. */
+static void log_raw(const char *type, int tank_idx, const uint8_t *rx, int len) {
+    if (len <= 0) {
+        ESP_LOGI(TAG, "%s tank%d RAW: no response", type, tank_idx + 1);
+        return;
+    }
+    char hex[64 * 3 + 1];
+    int pos = 0;
+    for (int i = 0; i < len && pos + 4 < (int)sizeof(hex); i++) {
+        if (i > 0) hex[pos++] = ',';
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", rx[i]);
+    }
+    hex[pos] = '\0';
+    ESP_LOGI(TAG, "%s tank%d RAW (%d bytes): [%s]", type, tank_idx + 1, len, hex);
+}
 
 /* Standard Modbus RTU CRC16 (poly 0xA001, init 0xFFFF). Frames are built
  * on demand per tank_idx instead of a fixed table, so tank count can scale
@@ -100,6 +119,7 @@ bool radar_ztech_read(int tank_idx, uint8_t *rx_buf, int *rx_len) {
     uint8_t slave = (uint8_t)(ZTECH_SLAVE_BASE + tank_idx);
     radar_frame(slave, 0x03, cmd);
     *rx_len = radar_xfer(cmd, 8, rx_buf, 64, RADAR_RESP_LEN);
+    log_raw("Ztech", tank_idx, rx_buf, *rx_len);
     if (*rx_len == 0) {
         ESP_LOGW(TAG, "Ztech tank%d no response", tank_idx + 1);
         return false;
@@ -117,6 +137,7 @@ bool radar_pantech_read(int tank_idx, uint8_t *rx_buf, int *rx_len) {
     uint8_t slave = (uint8_t)(PANTECH_SLAVE_BASE + tank_idx);
     radar_frame(slave, 0x04, cmd);
     *rx_len = radar_xfer(cmd, 8, rx_buf, 64, RADAR_RESP_LEN);
+    log_raw("Pantech", tank_idx, rx_buf, *rx_len);
     if (*rx_len == 0) {
         ESP_LOGW(TAG, "Pantech tank%d no response", tank_idx + 1);
         return false;

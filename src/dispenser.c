@@ -78,14 +78,17 @@ static int rs485_xfer(const uint8_t *cmd, size_t cmd_len,
 
 /* ── BlueSky response validation ──────────────────────────────────────────
  * Every confirmed BlueSky frame starts 0xF5 followed by the nozzle address,
- * so both are enforced strictly: a response must echo the header AND the
- * address we polled, or it is treated as line noise / crosstalk and dropped.
+ * so both are enforced: a response must echo the header AND the address we
+ * polled, or it is treated as line noise / crosstalk and dropped.
  *
- * The documented checksum rule (XOR of all frame bytes == 0x80, which our
- * generated command frames satisfy by construction) is COMPUTED and logged
- * on mismatch, but not yet enforced: captured bench frames don't all
- * satisfy it, so rejecting on XOR could 404 valid data. Once verified
- * against a real dispenser, promote the warning below to a rejection. */
+ * A prior XOR-of-all-bytes-==-0x80 checksum check was removed here: field
+ * data from a real dispenser (2026-07-08) showed every single response
+ * frame — both nozzles, every command type — computing XOR=0x00, never
+ * 0x80. That rule was written for our own OUTGOING command frames (where
+ * 0xF5^0xA2^0xD7 does equal 0x80 by construction) and had only ever been
+ * assumed, not confirmed, to also hold for the device's responses. The
+ * field data disproves that assumption, so the check is gone rather than
+ * left in as permanent log noise around a formula that doesn't apply here. */
 static bool bluesky_resp_valid(const uint8_t *buf, int len, uint8_t addr,
                                 const char *what) {
     if (len < 4) {
@@ -98,12 +101,21 @@ static bool bluesky_resp_valid(const uint8_t *buf, int len, uint8_t addr,
                  addr, what, buf[0], buf[1]);
         return false;
     }
-    uint8_t x = 0;
-    for (int i = 0; i < len; i++) x ^= buf[i];
-    if (x != 0x80)
-        ESP_LOGW(TAG, "BlueSky nz%u %s: XOR=0x%02x (want 0x80) — accepted, flagged",
-                 addr, what, x);
     return true;
+}
+
+/* Unconditional raw-bytes log for field debugging — prints exactly what came
+ * back over RS485 for this command, regardless of whether it passed
+ * validation, so a station visit can see real wire data without needing a
+ * logic analyzer. */
+static void log_raw_frame(uint8_t addr, const char *what, const uint8_t *buf, int len) {
+    if (len <= 0) {
+        ESP_LOGI(TAG, "BlueSky nz%u %s: no response", addr, what);
+        return;
+    }
+    char hex[DU_RESP_MAX * 3 + 1];
+    du_bytes_to_hex(buf, len, hex, sizeof(hex));
+    ESP_LOGI(TAG, "BlueSky nz%u %s: [%s]", addr, what, hex);
 }
 
 /* ── BlueSky polling ──────────────────────────────────────────────────── */
@@ -122,6 +134,7 @@ static void poll_one_bluesky(uint8_t addr, DuNozzle_t *nz) {
     bluesky_frame(addr, BS_CMD_STATUS, cmd);
     nz->status_len = rs485_xfer(cmd, 5, nz->status, DU_RESP_MAX);
     esp_task_wdt_reset();
+    log_raw_frame(addr, "status", nz->status, nz->status_len);
     if (nz->status_len > 0 &&
         !bluesky_resp_valid(nz->status, nz->status_len, addr, "status"))
         nz->status_len = 0;
@@ -143,6 +156,7 @@ static void poll_one_bluesky(uint8_t addr, DuNozzle_t *nz) {
     bluesky_frame(addr, BS_CMD_TOTAL, cmd);
     nz->total_len = rs485_xfer(cmd, 5, nz->total, DU_RESP_MAX);
     esp_task_wdt_reset();
+    log_raw_frame(addr, "total", nz->total, nz->total_len);
     if (nz->total_len > 0 &&
         !bluesky_resp_valid(nz->total, nz->total_len, addr, "total"))
         nz->total_len = 0;
@@ -152,6 +166,7 @@ static void poll_one_bluesky(uint8_t addr, DuNozzle_t *nz) {
     bluesky_frame(addr, BS_CMD_RSP, cmd);
     nz->rsp_len = rs485_xfer(cmd, 5, nz->rsp, DU_RESP_MAX);
     esp_task_wdt_reset();
+    log_raw_frame(addr, "rsp", nz->rsp, nz->rsp_len);
     if (nz->rsp_len > 0 &&
         !bluesky_resp_valid(nz->rsp, nz->rsp_len, addr, "rsp"))
         nz->rsp_len = 0;
@@ -161,6 +176,7 @@ static void poll_one_bluesky(uint8_t addr, DuNozzle_t *nz) {
     bluesky_frame(addr, BS_CMD_KFACT, cmd);
     nz->kfact_len = rs485_xfer(cmd, 5, nz->kfact, DU_RESP_MAX);
     esp_task_wdt_reset();
+    log_raw_frame(addr, "kfact", nz->kfact, nz->kfact_len);
     if (nz->kfact_len > 0 &&
         !bluesky_resp_valid(nz->kfact, nz->kfact_len, addr, "kfact"))
         nz->kfact_len = 0;
@@ -170,6 +186,7 @@ static void poll_one_bluesky(uint8_t addr, DuNozzle_t *nz) {
     bluesky_frame(addr, BS_CMD_RFID, cmd);
     nz->rfid_len = rs485_xfer(cmd, 5, nz->rfid, DU_RESP_MAX);
     esp_task_wdt_reset();
+    log_raw_frame(addr, "rfid", nz->rfid, nz->rfid_len);
     if (nz->rfid_len > 0 &&
         !bluesky_resp_valid(nz->rfid, nz->rfid_len, addr, "rfid"))
         nz->rfid_len = 0;

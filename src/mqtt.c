@@ -53,6 +53,9 @@ void mqtt_set_credentials(const char *host, uint16_t port,
 
 const char *mqtt_get_pass(void) { return s_mqtt_pass; }
 
+static void (*s_activity_cb)(void) = NULL;
+void mqtt_set_activity_cb(void (*cb)(void)) { s_activity_cb = cb; }
+
 static int next_msgid(void) {
     int id = g_msgid++;
     if (g_msgid > 65535) g_msgid = 1;
@@ -360,6 +363,8 @@ bool mqtt_subscribe(const char *topic) {
 
 bool mqtt_publish(const char *topic, const char *payload) {
     if (!g_connected) return false;
+
+    if (s_activity_cb) s_activity_cb();   /* one LED blink per push */
 
     int  mid = next_msgid();
     int  len = strlen(payload);

@@ -62,6 +62,54 @@ static int g_diag_cycle = 0;
 static void led_on(void)  { gpio_set_level(LED_PIN, 1); }
 static void led_off(void) { gpio_set_level(LED_PIN, 0); }
 
+/* Blocking status blink. Used only at milestone events (MQTT connect, boot
+ * complete, FOTA start) as fast bursts, plus one short pulse per cloud push
+ * (led_activity_pulse, wired into mqtt_publish). No idle heartbeat: the LED
+ * is quiet unless something is actually happening. */
+static void led_blink(int count, int on_ms, int off_ms) {
+    for (int i = 0; i < count; i++) {
+        led_on();
+        vTaskDelay(pdMS_TO_TICKS(on_ms));
+        led_off();
+        if (i < count - 1) vTaskDelay(pdMS_TO_TICKS(off_ms));
+    }
+}
+
+/* One short flash — registered with mqtt_set_activity_cb() so it fires on
+ * every publish. This is the steady-state indicator: a blink = data pushed. */
+static void led_activity_pulse(void) { led_blink(1, 40, 0); }
+
+/* ── Continuous background blink (boot + FOTA) ────────────────────────────
+ * A periodic esp_timer toggles the LED on its own task, so the LED keeps
+ * blinking fast even while the main task is blocked inside a long modem /
+ * network / FOTA-download call. Started at power-on and during FOTA; stopped
+ * once the device is connected / FOTA is done, after which the per-publish
+ * pulse takes over. These two never overlap: the timer is always stopped
+ * before any publish that would fire led_activity_pulse. */
+static esp_timer_handle_t s_blink_timer = NULL;
+
+static void blink_timer_cb(void *arg) {
+    (void)arg;
+    static int s = 0;
+    s = !s;
+    gpio_set_level(LED_PIN, s);
+}
+
+static void led_blink_start(void) {
+    if (!s_blink_timer) {
+        const esp_timer_create_args_t args = { .callback = blink_timer_cb,
+                                                .name     = "led_blink" };
+        if (esp_timer_create(&args, &s_blink_timer) != ESP_OK) return;
+    }
+    esp_timer_stop(s_blink_timer);                 /* no-op if not running   */
+    esp_timer_start_periodic(s_blink_timer, 60000); /* toggle every 60 ms ~8 Hz */
+}
+
+static void led_blink_stop(void) {
+    if (s_blink_timer) esp_timer_stop(s_blink_timer);
+    led_off();
+}
+
 /* ── RS485 helpers ────────────────────────────────────────────────────── */
 static void rs485_init(void) {
     uart_config_t cfg = {
@@ -643,6 +691,10 @@ static void handle_msg(const char *topic, const char *payload) {
         mqtt_publish(t_data, fota_msg);
         vTaskDelay(pdMS_TO_TICKS(500));
 
+        /* FOTA start — keep blinking continuously through the whole download
+         * + flash (MQTT is down, so there are no per-push blinks meanwhile). */
+        led_blink_start();
+
         /* Free the modem's data session for HTTP — MQTT and QHTTP can't
          * share it cleanly. Reconnect afterwards if the download fails. */
         mqtt_disconnect();
@@ -652,6 +704,8 @@ static void handle_msg(const char *topic, const char *payload) {
         esp_task_wdt_delete(NULL);
         bool fota_ok = fota_perform(payload, t_data, fota_reason, sizeof(fota_reason));
         esp_task_wdt_add(NULL);
+
+        led_blink_stop();   /* FOTA end — back to per-push blinks / reboot */
 
         if (fota_ok) {
             /* Boot partition already set — reconnect just to notify, then
@@ -771,9 +825,7 @@ static void poll_dispensers(const char *ts) {
         rs485_set_8n1(9600);
         du_build_payload(&nz_a, &nz_b, i * 2 + 1, i * 2 + 2,
                          g_hw_bs[i], ts, payload, sizeof(payload));
-        led_on();
         bool ok = mqtt_publish(t_data, payload);
-        led_off();
         if (ok) g_diag.pub_ok++; else g_diag.pub_fail++;
         all_ok &= ok;
         poll_incoming_mqtt();  /* stay responsive to setconfig/FOTA mid-poll */
@@ -814,9 +866,7 @@ static bool poll_one_tank(int tank_idx, bool is_ztech, const char *ts) {
                  "{\"HW_ID\":\"%s\",\"tanks\":{\"%d\":{\"data\":\"%s\"}},\"TS\":\"%s\"}",
                  hw, tank_idx + 1, hex, ts);
     }
-    led_on();
     bool pub = mqtt_publish(t_data, payload);
-    led_off();
     if (pub) g_diag.pub_ok++; else g_diag.pub_fail++;
     return ok && pub;
 }
@@ -840,9 +890,7 @@ static void poll_genset(const char *ts) {
     bool ok = genset_poll(g_cfg.genset_slave, g_cfg.genset_model, &gd);
     genset_build_payload(&gd, g_hw_genset, ts, payload, sizeof(payload));
     rs485_set_8e1_9600();
-    led_on();
     bool pub = mqtt_publish(t_data, payload);
-    led_off();
     if (pub) g_diag.pub_ok++; else g_diag.pub_fail++;
     g_diag.genset_ok = ok && pub;
 }
@@ -1030,6 +1078,7 @@ void app_main(void) {
     };
     gpio_config(&led_io);
     led_off();
+    led_blink_start();   /* fast blink from power-on through the whole boot */
 
     modem_uart_init();
     rs485_init();
@@ -1117,6 +1166,7 @@ void app_main(void) {
     build_hw_ids();
     build_topics();
     mqtt_init(g_imei);
+    mqtt_set_activity_cb(led_activity_pulse);   /* blink on every cloud push */
 
     /* Initial MQTT: try a few times; if the broker/session won't come up,
      * rebuild the whole network (PDP may be stale) before giving up. */
@@ -1157,6 +1207,8 @@ void app_main(void) {
 
     esp_task_wdt_add(NULL);
     esp_task_wdt_reset();
+
+    led_blink_stop();   /* boot done (MQTT up) — stop the boot blink */
 
     subscribe_all();
     /* check_post_ota() is deliberately NOT called here. Calling it this early
