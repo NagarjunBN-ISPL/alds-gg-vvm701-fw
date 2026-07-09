@@ -94,13 +94,10 @@ void sysmon_sample(SysmonSnapshot_t *out) {
     out->heap_free          = esp_get_free_heap_size();
     out->heap_min_ever      = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
     out->heap_largest_block = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-    /* The DFS max lock is held for the whole poll cycle, and sysmon samples
-     * from inside that cycle — so the CPU is genuinely at s_cpu_freq_mhz
-     * (240 with DFS on) at sample time. Reporting the configured max here is
-     * therefore the accurate live value, without touching the live-frequency
-     * API esp_clk_cpu_freq() (which lives in an unsupported private header).
-     * The old code reported CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, which is 160 —
-     * misleadingly low, since the chip is at 240 whenever this runs. */
+    /* CPU is pinned at a fixed 160 MHz (no DFS — see sysmon_init()), so
+     * s_cpu_freq_mhz is simply that configured value, always accurate.
+     * Deliberately not using the live-frequency API esp_clk_cpu_freq(),
+     * which lives in an unsupported private header. */
     out->cpu_freq_mhz       = s_cpu_freq_mhz;
     out->uptime_s           = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     out->reset_reason       = s_reset_reason;

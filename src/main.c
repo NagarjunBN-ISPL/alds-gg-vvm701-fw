@@ -126,6 +126,14 @@ static void rs485_init(void) {
 }
 
 static void rs485_set_8n1(uint32_t baud) {
+    /* uart_write_bytes() returns once bytes are queued to the TX ring
+     * buffer, not once they've physically left the pin. Switching parity/
+     * baud while the last byte of a prior command is still shifting out
+     * would corrupt it on the wire. Every call site here follows a
+     * completed (or timed-out) read, so in practice the TX finished long
+     * ago — this is a correctness guarantee regardless of call order, not
+     * a fix for an observed failure. */
+    uart_wait_tx_idle_polling(RS485_UART);
     uart_config_t cfg = {
         .baud_rate = (int)baud,
         .data_bits = UART_DATA_8_BITS,
@@ -137,6 +145,7 @@ static void rs485_set_8n1(uint32_t baud) {
 }
 
 static void rs485_set_8e1_9600(void) {
+    uart_wait_tx_idle_polling(RS485_UART);
     du_rs485_set_bluesky_mode();
 }
 
@@ -971,12 +980,21 @@ static void mqtt_reconnect_if_needed(void) {
  * commands) without blocking on a reconnect attempt — used to interleave
  * responsiveness checks into run_poll_cycle(), which can otherwise block
  * for 30+ seconds (BlueSky busy-retry waits, RS485 timeouts) with no
- * chance to notice an incoming publish until the cycle fully completes. */
+ * chance to notice an incoming publish until the cycle fully completes.
+ *
+ * Also executes any rsp/kfactor command handle_msg() just marked pending,
+ * right here — not just once per 30s cycle. This runs every ~1s (via
+ * sleep_with_poll) as well as between every poll-cycle step, so a remote
+ * command now gets serviced within about a second of arriving instead of
+ * waiting up to a full poll cycle. execute_pending() sets its own RS485
+ * mode before each transaction, so it's safe to call from any point in the
+ * poll cycle regardless of which device's mode is currently active. */
 static void poll_incoming_mqtt(void) {
     static char s_topic[TOPIC_MAX];
     static char s_payload[2048];
     while (mqtt_poll(s_topic, sizeof(s_topic), s_payload, sizeof(s_payload)))
         handle_msg(s_topic, s_payload);
+    execute_pending();
 }
 
 /* ── Main poll cycle ──────────────────────────────────────────────────── */
@@ -1231,8 +1249,14 @@ void app_main(void) {
     }
 
     if (g_cfg.di_enable) {
+        /* 6144, not the original 4096: di_task's payload[256]/resp[NUVOTON_BUF]
+         * locals plus FreeRTOS task overhead plus the internal stack frames
+         * of uart_write_bytes/uart_read_bytes/esp_task_wdt_add left only a
+         * thin margin. RAM is abundant (~22% used of 320 KB) — spend it on
+         * stack safety over a bug class (silent overflow/corruption) that's
+         * brutal to diagnose in the field. */
         BaseType_t di_task_created =
-            xTaskCreatePinnedToCore(di_task, "di_task", 4096, NULL, 5, NULL, 1);
+            xTaskCreatePinnedToCore(di_task, "di_task", 6144, NULL, 5, NULL, 1);
         if (di_task_created != pdPASS)
             ESP_LOGE(TAG, "di_task creation failed (heap OOM?) — DI monitoring will not run");
     }

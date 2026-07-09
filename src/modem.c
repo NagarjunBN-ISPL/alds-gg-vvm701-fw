@@ -64,8 +64,14 @@ void modem_flush(void) {
     /* A +QMTRECV: URC can land on the wire between unrelated AT commands.
      * Accumulate what would otherwise be silently discarded and let the
      * rescue callback pull any complete message out of it before we
-     * actually throw the rest away. */
-    static char acc[600];
+     * actually throw the rest away. Sized to mqtt.c's PAYLOAD_MAX (2048) —
+     * a setconfig with the full connectivity block (apn/mqttHost/mqttPass/
+     * mqttBaseTopic etc.) can approach ~600 bytes on its own, and this used
+     * to be sized at exactly 600 with no margin: any URC landing in this
+     * rescue path (rather than the normal drain_recv() receive path, which
+     * is already sized to PAYLOAD_MAX) larger than that was silently
+     * truncated and dropped, with no retry. */
+    static char acc[2048 + 400];
     int total = 0;
     int n;
     while ((n = uart_read_bytes(MODEM_UART, tmp, sizeof(tmp), pdMS_TO_TICKS(30))) > 0) {
@@ -234,9 +240,14 @@ bool modem_power_on(void) {
         }
     }
 
-    /* Pulse PWRKEY high for 1.5 s */
+    /* Pulse PWRKEY high for 2.2 s. Quectel's own hardware design spec calls
+     * for >= 2.0 s minimum to reliably hit the internal PMIC power-on
+     * threshold; 1.5 s was borderline and more likely to intermittently
+     * fail to wake the baseband under field conditions (high enclosure
+     * temperature, voltage sag) than on a bench. 2.2 s gives real margin
+     * above the spec floor. */
     gpio_set_level(MODEM_PWRKEY, 1);
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    vTaskDelay(pdMS_TO_TICKS(2200));
     gpio_set_level(MODEM_PWRKEY, 0);
 
     /* Wait up to 15 s for the module to boot */
@@ -265,9 +276,9 @@ void modem_hard_reset(void) {
     gpio_set_level(MODEM_PWRKEY, 0);
     vTaskDelay(pdMS_TO_TICKS(3000));  /* allow full power-off */
 
-    /* Power on: 1.5 s pulse (matches modem_power_on's pulse width) */
+    /* Power on: 2.2 s pulse (matches modem_power_on's pulse width) */
     gpio_set_level(MODEM_PWRKEY, 1);
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    vTaskDelay(pdMS_TO_TICKS(2200));
     gpio_set_level(MODEM_PWRKEY, 0);
     ESP_LOGI(TAG, "EC200U power-cycled — waiting for boot ...");
 

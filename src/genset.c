@@ -235,9 +235,18 @@ void genset_build_payload(const GensetData_t *d,
     static const char * const alarm_state_names[] =
         {"Disabled","Inactive","Warning","Shutdown","ElecTrip","Notification"};
 
+    /* Reserve room for the fixed-size suffix (status + commandStatus +
+     * holdingRegs + closing) so the alarm loop stops with enough budget left
+     * that the FULL payload — not just the alarms block — stays under the
+     * modem's real transmission ceiling. Alarms are the only unbounded part;
+     * everything else here is fixed-size. See MQTT_MODEM_PAYLOAD_SAFE_MAX. */
+    int alarm_budget_end = MQTT_MODEM_PAYLOAD_SAFE_MAX - 280;
+    if (alarm_budget_end > (int)buf_size - 50) alarm_budget_end = (int)buf_size - 50;
+
     pos += snprintf(buf + pos, buf_size - pos, "\"alarms\":{");
     bool first_alarm = true;
-    for (int r = 0; r < 10 && pos < (int)buf_size - 50; r++) {
+    int  r;
+    for (r = 0; r < 10 && pos < alarm_budget_end; r++) {
         uint16_t word = b2[r];
         for (int n = 0; n < 4; n++) {
             uint8_t state = (word >> (12 - n * 4)) & 0x0F;
@@ -250,8 +259,13 @@ void genset_build_payload(const GensetData_t *d,
             }
         }
     }
+    /* r < 10 means the loop was cut short by the modem-payload budget, not
+     * because it ran out of alarm registers — flag it so the cloud side can
+     * tell "no more alarms" apart from "more alarms exist but didn't fit". */
+    bool alarms_truncated = (r < 10);
     pos = clamp_pos(pos, buf_size);
-    pos += snprintf(buf + pos, buf_size - pos, "},");
+    pos += snprintf(buf + pos, buf_size - pos,
+                    alarms_truncated ? "},\"alarmsTruncated\":true," : "},");
     pos = clamp_pos(pos, buf_size);
 
     /* Status word (batch2[10] = reg67, "Genset Status"): bits 15,14,13,12,11 per SEDEMAC spec.
@@ -304,6 +318,18 @@ void genset_build_payload(const GensetData_t *d,
      * a failed poll rather than publish something unparsable. */
     if (pos >= (int)buf_size - 2) {
         ESP_LOGW(TAG, "genset payload truncated at %d/%zu bytes — publishing 404 instead", pos, buf_size);
+        snprintf(buf, buf_size,
+                 "{\"HW_ID\":\"%s\",\"genset\":{\"data\":\"404\"},\"TS\":\"%s\"}",
+                 hw_id, ts);
+    } else if (pos > MQTT_MODEM_PAYLOAD_SAFE_MAX) {
+        /* Safety net only — the alarm-loop budget above should already keep
+         * this under the modem's real QMTPUBEX ceiling (~1500 bytes on the
+         * EC200U; data beyond it is rejected/omitted at the modem, not
+         * detectable from here). If it still overshot, publishing anyway
+         * would silently vanish at the modem — a 404 that's visible in
+         * diagnostics beats data that disappears with no trace. */
+        ESP_LOGW(TAG, "genset payload %d bytes exceeds modem safe max %d — publishing 404 instead",
+                 pos, MQTT_MODEM_PAYLOAD_SAFE_MAX);
         snprintf(buf, buf_size,
                  "{\"HW_ID\":\"%s\",\"genset\":{\"data\":\"404\"},\"TS\":\"%s\"}",
                  hw_id, ts);

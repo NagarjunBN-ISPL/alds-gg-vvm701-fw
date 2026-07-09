@@ -198,11 +198,20 @@ static bool fota_flash(char *reason, size_t reason_size) {
     int fh = atoi(p);
     ESP_LOGI(TAG, "File handle: %d", fh);
 
-    /* Begin OTA */
+    /* Begin OTA. The EC200U's UFS only holds a handful of simultaneously-open
+     * file handles — fh is already open at this point, so every return path
+     * below must close+delete it, or a repeated failure here (rare, but not
+     * impossible: a corrupt partition table, or esp_ota_begin failing under
+     * heap pressure) leaks a handle each time until the UFS runs out and
+     * every future FOTA attempt fails at QFOPEN until a physical reboot. */
     const esp_partition_t *update_part = esp_ota_get_next_update_partition(NULL);
     if (!update_part) {
         ESP_LOGE(TAG, "No OTA partition");
         fota_set_reason(reason, reason_size, "no_ota_partition");
+        snprintf(cmd, sizeof(cmd), "AT+QFCLOSE=%d", fh);
+        modem_at(cmd, "OK", 5000, NULL, 0);
+        snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s\"", FOTA_FILE);
+        modem_at(cmd, "OK", 5000, NULL, 0);
         return false;
     }
 
@@ -210,6 +219,10 @@ static bool fota_flash(char *reason, size_t reason_size) {
     if (esp_ota_begin(update_part, OTA_SIZE_UNKNOWN, &ota_hdl) != ESP_OK) {
         ESP_LOGE(TAG, "OTA begin failed");
         fota_set_reason(reason, reason_size, "ota_begin_failed");
+        snprintf(cmd, sizeof(cmd), "AT+QFCLOSE=%d", fh);
+        modem_at(cmd, "OK", 5000, NULL, 0);
+        snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s\"", FOTA_FILE);
+        modem_at(cmd, "OK", 5000, NULL, 0);
         return false;
     }
 

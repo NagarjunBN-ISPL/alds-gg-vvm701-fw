@@ -12,6 +12,12 @@
 #define MQTT_USER   "iotrondev"
 #define MQTT_PASS   "iotrondev@1234"
 #define MQTT_QOS    1
+/* Quectel's AT+QMTPUBEX has a hard ~1500-byte payload ceiling on the EC200U
+ * family — data beyond it is rejected/omitted at the modem level, not by
+ * anything in this firmware. Genset is the only payload type whose worst
+ * case (many simultaneous active alarms) can realistically approach this.
+ * Comfortably below 1500 to leave margin for exact modem-firmware behavior. */
+#define MQTT_MODEM_PAYLOAD_SAFE_MAX 1400
 
 /* ── Quectel EC200U (UART2) ─────────────────────────────────────────────── */
 #define MODEM_UART      UART_NUM_2

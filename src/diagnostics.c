@@ -85,10 +85,19 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
                  hw_id, FW_VERSION, ts);
     }
 
-    mqtt_publish(topic, buf);
-    ESP_LOGI(TAG, "Diagnostics published");
-
-    g_diag.pub_ok      = 0;
-    g_diag.pub_fail    = 0;
-    g_diag.loop_max_ms = 0;
+    /* Only clear the accumulated window on a CONFIRMED publish — if MQTT is
+     * briefly down exactly at this cycle boundary, the pub_ok/pub_fail/
+     * loop_max_ms stats for the whole DIAG_CYCLE_INTERVAL window would
+     * otherwise be silently discarded and the next report starts from zero,
+     * under-reporting the failure rate right when it matters most (a
+     * connectivity blip). Left uncleared, they keep accumulating into the
+     * next attempt instead. */
+    if (mqtt_publish(topic, buf)) {
+        ESP_LOGI(TAG, "Diagnostics published");
+        g_diag.pub_ok      = 0;
+        g_diag.pub_fail    = 0;
+        g_diag.loop_max_ms = 0;
+    } else {
+        ESP_LOGW(TAG, "Diagnostics publish failed — counters retained for next attempt");
+    }
 }
