@@ -1,3 +1,10 @@
+# Target chip. Pinning it here means `idf.py build` auto-selects the ESP32-S3
+# without a separate `idf.py set-target esp32s3` step — plain `idf.py build`
+# just works. PlatformIO also derives esp32s3 from the board, so the two agree
+# and neither fights the other. (This is the fix for the GPIO_NUM_40..44
+# "undeclared" errors, which mean the build was targeting the classic ESP32.)
+CONFIG_IDF_TARGET="esp32s3"
+
 # Console: move from UART0 to USB Serial JTAG so UART0 is free for Nuvoton MS51
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
@@ -19,7 +26,10 @@ CONFIG_ESP_TASK_WDT_INIT=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 # CONFIG_ESP_TASK_WDT_PANIC is not set
 
-# Dynamic Frequency Scaling: 160 MHz idle → 240 MHz active
+# Power management must stay on: sysmon_init() calls esp_pm_configure() to
+# pin the CPU at a fixed 160 MHz (no DFS — see sysmon.c). Without
+# CONFIG_PM_ENABLE, that call fails and the CPU falls back to the compiled
+# default (240 MHz) instead.
 CONFIG_PM_ENABLE=y
 
 # Partition table: custom dual-OTA layout
