@@ -212,6 +212,15 @@ bool di_publish_buffer(const char *topic, const char *hw_id,
                  "{\"HW_ID\":\"%s\",\"di\":%s,\"TS\":\"%s\"}",
                  hw_id, entry_payload, ts_latest);
 
+        /* What actually goes to the cloud — distinct from the "Nuvoton RAW"
+         * log in di_task(), which is the unfiltered sensor reply before the
+         * di_enable_mask filter and envelope wrap. mqtt_publish() itself only
+         * logs this body at DEBUG (suppressed) — that suppression exists to
+         * stop the OTHER sensors' 30s-periodic multi-KB payloads from
+         * flooding the console, which doesn't apply here: DI publishes only
+         * on a real transition, so logging every one at INFO is cheap. */
+        ESP_LOGI(TAG, "DI PUBLISH %s: %s", topic, msg);
+
         if (!mqtt_publish(topic, msg)) {
             /* Leave the entry in the FIFO for the next poll cycle to retry —
              * and stop draining now rather than hammering a link that just
