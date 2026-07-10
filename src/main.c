@@ -236,6 +236,15 @@ static bool json_has_key(const char *json, const char *key) {
     return strstr(json, search) != NULL;
 }
 
+/* True if a setconfig payload carries any connectivity credential (broker or
+ * APN user/pass). Used ONLY to suppress the plaintext payload log below so a
+ * pushed secret never reaches the serial console — the payload handed to
+ * parse_setconfig() is untouched, so parsing behaviour is identical. */
+static bool setcfg_has_secret(const char *json) {
+    return json_has_key(json, "mqttUser") || json_has_key(json, "mqttPass") ||
+           json_has_key(json, "apnUser")  || json_has_key(json, "apnPass");
+}
+
 /* Parse a JSON boolean. Accepts true/false and 1/0 — json_get_int can't be
  * used here because atoi("true") is 0, i.e. it can't tell true from false. */
 static bool json_get_bool(const char *json, const char *key, bool def) {
@@ -751,7 +760,10 @@ static void handle_msg(const char *topic, const char *payload) {
         return;
     }
     if (strcmp(topic, t_setcfg) == 0) {
-        ESP_LOGI(TAG, "setconfig payload: [%s]", payload);
+        if (setcfg_has_secret(payload))
+            ESP_LOGI(TAG, "setconfig payload: [redacted — contains credentials]");
+        else
+            ESP_LOGI(TAG, "setconfig payload: [%s]", payload);
         parse_setconfig(payload);
         return;
     }

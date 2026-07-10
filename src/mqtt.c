@@ -170,6 +170,15 @@ static const char *qmtrecv_payload_end(const char *p) {
     return strchr(p, '\n');
 }
 
+/* True if an inbound payload carries a connectivity credential (broker or APN
+ * user/pass, all settable via setconfig). Used ONLY to redact the RX log below
+ * so a pushed secret never lands on the serial console in cleartext — the
+ * payload itself is stashed and parsed untouched, so behaviour is identical. */
+static bool payload_has_secret(const char *p) {
+    return strstr(p, "\"mqttUser\"") || strstr(p, "\"mqttPass\"") ||
+           strstr(p, "\"apnUser\"")  || strstr(p, "\"apnPass\"");
+}
+
 /* ── Parse +QMTRECV URCs from a buffer, push into stash ──────────────── */
 static void parse_qmtrecv(const char *buf) {
     if (!buf) return;
@@ -195,7 +204,10 @@ static void parse_qmtrecv(const char *buf) {
         size_t pl = (pl_len   < PAYLOAD_MAX - 1)  ? pl_len   : PAYLOAD_MAX - 1;
         memcpy(m->topic,   topic_start,   tl); m->topic[tl]   = '\0';
         memcpy(m->payload, content_start, pl); m->payload[pl] = '\0';
-        ESP_LOGI(TAG, "RX stashed: topic=[%s] payload=[%s]", m->topic, m->payload);
+        if (payload_has_secret(m->payload))
+            ESP_LOGI(TAG, "RX stashed: topic=[%s] payload=[redacted — contains credentials]", m->topic);
+        else
+            ESP_LOGI(TAG, "RX stashed: topic=[%s] payload=[%s]", m->topic, m->payload);
 
         search_from = content_stop;
     }

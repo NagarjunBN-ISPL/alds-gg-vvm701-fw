@@ -103,6 +103,12 @@ static void log_at_cmd(const char *cmd) {
      * than rely on the password field always being non-empty. */
     if (pass[0] != '\0' && strstr(cmd, pass)) {
         ESP_LOGI(TAG, ">> AT+QMTCONN=... (credentials redacted)");
+    } else if (strncmp(cmd, "AT+QICSGP=", 10) == 0) {
+        /* QICSGP carries the APN username/password (apnUser/apnPass, also
+         * remotely settable via setconfig). The APN NAME is not secret and is
+         * still visible in the AT+CGDCONT log line, so redact the whole
+         * command rather than parse out just the two credential fields. */
+        ESP_LOGI(TAG, ">> AT+QICSGP=... (APN credentials redacted)");
     } else {
         ESP_LOGI(TAG, ">> %s", cmd);
     }
