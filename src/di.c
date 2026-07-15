@@ -116,9 +116,13 @@ void di_task(void *param) {
         resp[got] = '\0';
 
         /* Raw Nuvoton response for field debugging — shows exactly what the
-         * MS51 sent every read (every 2s), before parsing. */
-        if (got > 0) ESP_LOGI(TAG, "Nuvoton RAW (%d bytes): %s", got, resp);
-        else         ESP_LOGI(TAG, "Nuvoton RAW: no response");
+         * MS51 sent every read (every 2s), before parsing. Debug-level: this
+         * fires on every poll regardless of whether anything changed or was
+         * ever sent to the cloud, so at INFO it drowned out the "what did we
+         * actually publish" signal (mqtt.c's PUBLISH log). Raise the log
+         * level to DEBUG at build time if this is needed again. */
+        if (got > 0) ESP_LOGD(TAG, "Nuvoton RAW (%d bytes): %s", got, resp);
+        else         ESP_LOGD(TAG, "Nuvoton RAW: no response");
 
         /* Build payload JSON */
         char payload[256];
@@ -212,15 +216,10 @@ bool di_publish_buffer(const char *topic, const char *hw_id,
                  "{\"HW_ID\":\"%s\",\"di\":%s,\"TS\":\"%s\"}",
                  hw_id, entry_payload, ts_latest);
 
-        /* What actually goes to the cloud — distinct from the "Nuvoton RAW"
-         * log in di_task(), which is the unfiltered sensor reply before the
-         * di_enable_mask filter and envelope wrap. mqtt_publish() itself only
-         * logs this body at DEBUG (suppressed) — that suppression exists to
-         * stop the OTHER sensors' 30s-periodic multi-KB payloads from
-         * flooding the console, which doesn't apply here: DI publishes only
-         * on a real transition, so logging every one at INFO is cheap. */
-        ESP_LOGI(TAG, "DI PUBLISH %s: %s", topic, msg);
-
+        /* mqtt_publish() itself now logs the full topic + payload at INFO,
+         * so no separate log line is needed here — this msg is distinct from
+         * the "Nuvoton RAW" log in di_task(), which is the unfiltered sensor
+         * reply before the di_enable_mask filter and envelope wrap. */
         if (!mqtt_publish(topic, msg)) {
             /* Leave the entry in the FIFO for the next poll cycle to retry —
              * and stop draining now rather than hammering a link that just

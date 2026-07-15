@@ -380,13 +380,11 @@ bool mqtt_publish(const char *topic, const char *payload) {
 
     int  mid = next_msgid();
     int  len = strlen(payload);
-    /* Log topic + size at INFO (the useful "what/how-big" for field debug);
-     * the full JSON body only at DEBUG. Every 30 s the old INFO line dumped
-     * ~10-15 KB of dispenser/radar/genset/sysmon JSON to UART0 — tens of MB
-     * of console traffic a day plus the string-format cost on the main loop,
-     * all for data the cloud already has. */
-    ESP_LOGI(TAG, "PUBLISH %s (%d bytes)", topic, len);
-    ESP_LOGD(TAG, "  payload: %s", payload);
+    /* Full topic + payload at INFO — field visibility into exactly what goes
+     * to the broker on every publish, requested explicitly over the earlier
+     * DEBUG-only tradeoff (that one existed to cap UART0 console volume;
+     * this supersedes it for active field validation). */
+    ESP_LOGI(TAG, "PUBLISH %s (%d bytes): %s", topic, len, payload);
     static char cmd[512];
     snprintf(cmd, sizeof(cmd), "AT+QMTPUBEX=0,%d,%d,0,\"%s\",%d", mid, MQTT_QOS, topic, len);
 

@@ -260,13 +260,22 @@ static bool json_get_bool(const char *json, const char *key, bool def) {
 }
 
 /* ── setconfig ────────────────────────────────────────────────────────── */
+/* This is only the coarse "is this payload a recognized setconfig at all"
+ * gate — it requires at least ONE key below to be present, then the actual
+ * per-field parsing loops (sfxBs%d/sfxZtech%d/sfxPantech%d further down)
+ * run over DU_BLUESKY_MAX/RADAR_MAX dynamically regardless of this list. A
+ * key missing here only matters for a payload that contains *nothing else*
+ * recognized (e.g. a bare {"sfxBs4":"04"}), which would otherwise be
+ * rejected as bad_payload — so every suffix key up to the current caps is
+ * listed explicitly to avoid that trap. Keep this in sync with
+ * DU_BLUESKY_MAX/RADAR_MAX in config.h when either cap changes. */
 static const char * const s_setcfg_known_keys[] = {
     "duBlueskyCount","ztechCount","pantechCount","radarType","tankCount",
     "gensetType","gensetModel","gensetSlave","gensetBaud","diEnable",
     "sfxGenset","sfxDI",
-    "sfxBs1","sfxBs2","sfxBs3",
-    "sfxZtech1","sfxZtech2",
-    "sfxPantech1","sfxPantech2",
+    "sfxBs1","sfxBs2","sfxBs3","sfxBs4","sfxBs5","sfxBs6",
+    "sfxZtech1","sfxZtech2","sfxZtech3","sfxZtech4",
+    "sfxPantech1","sfxPantech2","sfxPantech3","sfxPantech4",
     "apn","apnUser","apnPass",
     "mqttHost","mqttPort","mqttUser","mqttPass","mqttBaseTopic","mqttTls",
 };
@@ -382,8 +391,9 @@ static void publish_config_report(void) {
         "\"diEnable\":%u,"
         "\"sfxGenset\":\"%s\",\"sfxDI\":\"%s\","
         "\"sfxBs1\":\"%s\",\"sfxBs2\":\"%s\",\"sfxBs3\":\"%s\","
-        "\"sfxZtech1\":\"%s\",\"sfxZtech2\":\"%s\","
-        "\"sfxPantech1\":\"%s\",\"sfxPantech2\":\"%s\","
+        "\"sfxBs4\":\"%s\",\"sfxBs5\":\"%s\",\"sfxBs6\":\"%s\","
+        "\"sfxZtech1\":\"%s\",\"sfxZtech2\":\"%s\",\"sfxZtech3\":\"%s\",\"sfxZtech4\":\"%s\","
+        "\"sfxPantech1\":\"%s\",\"sfxPantech2\":\"%s\",\"sfxPantech3\":\"%s\",\"sfxPantech4\":\"%s\","
         "\"apn\":\"%s\",\"apnUser\":\"%s\",\"apnPassSet\":%s,"
         "\"mqttHost\":\"%s\",\"mqttPort\":%u,\"mqttUser\":\"%s\","
         "\"mqttPassSet\":%s,\"mqttBaseTopic\":\"%s\",\"mqttTls\":%s,"
@@ -396,8 +406,9 @@ static void publish_config_report(void) {
         (unsigned)g_cfg.di_enable,
         g_cfg.sfx_genset, g_cfg.sfx_di,
         g_cfg.sfx_bs[0], g_cfg.sfx_bs[1], g_cfg.sfx_bs[2],
-        g_cfg.sfx_ztech[0], g_cfg.sfx_ztech[1],
-        g_cfg.sfx_pantech[0], g_cfg.sfx_pantech[1],
+        g_cfg.sfx_bs[3], g_cfg.sfx_bs[4], g_cfg.sfx_bs[5],
+        g_cfg.sfx_ztech[0], g_cfg.sfx_ztech[1], g_cfg.sfx_ztech[2], g_cfg.sfx_ztech[3],
+        g_cfg.sfx_pantech[0], g_cfg.sfx_pantech[1], g_cfg.sfx_pantech[2], g_cfg.sfx_pantech[3],
         g_cfg.apn, g_cfg.apn_user, g_cfg.apn_pass[0] ? "true" : "false",
         g_cfg.mqtt_host, (unsigned)g_cfg.mqtt_port, g_cfg.mqtt_user,
         g_cfg.mqtt_pass[0] ? "true" : "false", g_cfg.mqtt_base_topic,
@@ -538,7 +549,7 @@ static void parse_setconfig(const char *json) {
      * into a reboot loop. Coerce to the Sedemac default like the counts. */
     if (nc.genset_baud != 4800 && nc.genset_baud != 9600 && nc.genset_baud != 19200)
         nc.genset_baud = 9600;
-    if (nc.genset_model > GENSET_MODEL_GC1111) nc.genset_model = GENSET_MODEL_GC1211;
+    if (nc.genset_model > GENSET_MODEL_MAX) nc.genset_model = GENSET_MODEL_GC1211;
     if (nc.genset_slave < 1 || nc.genset_slave > 247) nc.genset_slave = GENSET_SLAVE_DEFAULT;
 
     /* Genset shares the RS485 bus with the radars, and its FC03/FC04 polls

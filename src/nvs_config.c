@@ -131,7 +131,7 @@ bool nvs_config_load(DeviceConfig *cfg) {
     if (cfg->ztech_count      > RADAR_MAX)      cfg->ztech_count      = RADAR_MAX;
     if (cfg->pantech_count    > RADAR_MAX)      cfg->pantech_count    = RADAR_MAX;
     if (cfg->genset_type > GENSET_SEDEMAC) cfg->genset_type = GENSET_OFF;
-    if (cfg->genset_model > GENSET_MODEL_GC1111) cfg->genset_model = GENSET_MODEL_GC1211;
+    if (cfg->genset_model > GENSET_MODEL_MAX) cfg->genset_model = GENSET_MODEL_GC1211;
     if (cfg->genset_slave < 1 || cfg->genset_slave > 247) cfg->genset_slave = GENSET_SLAVE_DEFAULT;
     /* Baud whitelist — 0 (or any junk) would divide-by-zero the UART clock
      * divider in rs485_set_8n1() and panic-loop the device. */
