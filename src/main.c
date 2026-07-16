@@ -40,13 +40,11 @@ static char g_hw_genset[24], g_hw_di[24];
 
 #define TOPIC_MAX 200
 static char t_data[TOPIC_MAX];
-static char t_diag[TOPIC_MAX];
 static char t_update[TOPIC_MAX];
 static char t_update_bcast[TOPIC_MAX];
 static char t_setcfg[TOPIC_MAX];
 static char t_rsp_bs_in[DU_BLUESKY_MAX][TOPIC_MAX], t_rsp_bs_out[DU_BLUESKY_MAX][TOPIC_MAX];
 static char t_kf_bs_in[DU_BLUESKY_MAX][TOPIC_MAX],  t_kf_bs_out[DU_BLUESKY_MAX][TOPIC_MAX];
-static char t_sysmon[TOPIC_MAX];
 
 typedef struct {
     bool pending;
@@ -172,8 +170,19 @@ static void build_hw_ids(void) {
 }
 
 static void build_topics(void) {
-    snprintf(t_data,        TOPIC_MAX, "%s/%s/data",       g_cfg.mqtt_base_topic, g_imei);
-    snprintf(t_diag,        TOPIC_MAX, "%s/diagnostics",   g_cfg.mqtt_base_topic);
+    /* One flat, IMEI-less outbound topic (e.g. "gogas/data") — the original
+     * pipeline layout the cloud built against. ALL device→cloud messages go
+     * here: equipment telemetry, lifecycle/status events, and the diagnostics
+     * and sysmon health reports (which used to have their own topics but now
+     * share this one). Every payload carries "HW_ID" (bare IMEI, or IMEI+suffix
+     * for per-equipment telemetry) so the cloud attributes it to a device by
+     * that field, and self-identifies its kind by a shape marker: "nozzles" /
+     * "tanks" / "genset" / "di" for telemetry, "status" for lifecycle,
+     * "type":"diagnostics"/"sysmon" for the health reports. Inbound command
+     * topics (setconfig/update/rsp/kfactor below) stay per-IMEI — they must
+     * target one device, and flattening them would make every device act on
+     * every push. */
+    snprintf(t_data,        TOPIC_MAX, "%s/data",          g_cfg.mqtt_base_topic);
     snprintf(t_update,      TOPIC_MAX, "%s/%s/update",     g_cfg.mqtt_base_topic, g_imei);
     snprintf(t_update_bcast,TOPIC_MAX, "%s/update",        g_cfg.mqtt_base_topic);
     snprintf(t_setcfg,      TOPIC_MAX, "%s/%s/setconfig",  g_cfg.mqtt_base_topic, g_imei);
@@ -183,7 +192,6 @@ static void build_topics(void) {
         snprintf(t_kf_bs_in[i],   TOPIC_MAX, "%s/kfactor/imei/%s/in",  g_cfg.mqtt_base_topic, g_hw_bs[i]);
         snprintf(t_kf_bs_out[i],  TOPIC_MAX, "%s/kfactor/imei/%s/out", g_cfg.mqtt_base_topic, g_hw_bs[i]);
     }
-    snprintf(t_sysmon,      TOPIC_MAX, "%s/sysmon",              g_cfg.mqtt_base_topic);
 }
 
 /* Forward decls — defined later in the file. */
@@ -1061,8 +1069,8 @@ static void run_poll_cycle(void) {
 
     if (++g_diag_cycle >= DIAG_CYCLE_INTERVAL) {
         modem_get_timestamp(ts, sizeof(ts));
-        diag_publish(g_imei, ts, t_diag);
-        sysmon_publish(g_imei, ts, t_sysmon);
+        diag_publish(g_imei, ts, t_data);
+        sysmon_publish(g_imei, ts, t_data);
         g_diag_cycle = 0;
     }
 

@@ -45,6 +45,7 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
     char buf[512];
     int written = snprintf(buf, sizeof(buf),
         "{\"HW_ID\":\"%s\","
+        "\"type\":\"diagnostics\","
         "\"fw\":\"%s\","
         "\"temp_c\":%.1f,"
         "\"thermal_zone\":\"%s\","

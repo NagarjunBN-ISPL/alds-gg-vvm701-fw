@@ -249,6 +249,26 @@ static bool sedemac_read(uint8_t slave, uint8_t fc, bool probe_holding,
     /* Alarms: regs 57..66 = b2[0..9], nibble MSN→LSN. */
     decode_nibble_alarms(b2, 10, g_sedemac_alarm_names, out);
 
+    /* Raw first-3-alarm-register values, alongside (not instead of) the
+     * decoded alarms[] above — no extra bus transaction, already in b2. */
+    out->alr1     = b2[0];
+    out->alr2     = b2[1];
+    out->alr3     = b2[2];
+    out->has_alr  = true;
+
+    /* Cumulative energy, regs 35-36 — outside both existing batches, needs
+     * its own read. NOT wire-verified: scale factor and word order (assumed
+     * high-word-first) are unconfirmed. Optional/non-fatal like holdingRegs
+     * below — a failure here must not fail measurements+alarms that already
+     * succeeded. */
+    uint16_t kwh_regs[2];
+    if (modbus_read(slave, fc, 35, 2, kwh_regs)) {
+        out->kwh     = ((uint32_t)kwh_regs[0] << 16) | kwh_regs[1];
+        out->has_kwh = true;
+    } else {
+        ESP_LOGW(TAG, "Sedemac KWH regs (35-36) unavailable — omitting kwh");
+    }
+
     /* Status word (b2[10] = reg67): bits 15,14,13,12,11 per SEDEMAC spec.
      * Verified vs GC1211: C000 = available+running; 2000 = stoppedNormally. */
     uint16_t sw = b2[10];
@@ -432,19 +452,19 @@ void genset_build_payload(const GensetData_t *d,
     int pos = 0;
     pos += snprintf(buf + pos, buf_size - pos,
         "{\"HW_ID\":\"%s\",\"genset\":{"
-        "\"protocolRevision\":%u,"
-        "\"lubeOilPressure\":%.2f,"
-        "\"engineTemp\":%d,"
-        "\"fuelLevel\":%u,"
-        "\"chargingAltVoltage\":%.1f,"
-        "\"batteryVoltage\":%.1f,"
-        "\"noOfStarts\":%u,"
-        "\"engineRunTime\":%lu,"
-        "\"engineSpeed\":%u,"
-        "\"gensetFrequency\":%.1f,"
-        "\"gensetL1Voltage\":%.1f,\"gensetL2Voltage\":%.1f,\"gensetL3Voltage\":%.1f,"
-        "\"loadL1Current\":%.2f,\"loadL2Current\":%.2f,\"loadL3Current\":%.2f,"
-        "\"gensetL1Power\":%.1f,\"gensetL2Power\":%.1f,\"gensetL3Power\":%.1f,\"gensetTotalPower\":%.1f,",
+        "\"PREV\":%u,"
+        "\"OPR\":%.2f,"
+        "\"CT\":%d,"
+        "\"FLVL\":%u,"
+        "\"CAV\":%.1f,"
+        "\"BV\":%.1f,"
+        "\"NOS\":%u,"
+        "\"RHR\":%lu,"
+        "\"ENGSP\":%u,"
+        "\"HZ\":%.1f,"
+        "\"L1N\":%.1f,\"L2N\":%.1f,\"L3N\":%.1f,"
+        "\"I1\":%.2f,\"I2\":%.2f,\"I3\":%.2f,"
+        "\"KW1\":%.1f,\"KW2\":%.1f,\"KW3\":%.1f,\"KW\":%.1f,",
         hw_id,
         d->protocol_rev,
         d->lube_oil_pressure,
@@ -460,6 +480,19 @@ void genset_build_payload(const GensetData_t *d,
         d->load_current[0],   d->load_current[1],   d->load_current[2],
         d->genset_power[0],   d->genset_power[1],   d->genset_power[2], d->genset_power[3]);
     pos = clamp_pos(pos, buf_size);
+
+    /* Optional: cumulative energy + raw first-3-alarm-registers (Sedemac
+     * only — absent on DEIF SGC 120 and unverified reserved models). */
+    if (d->has_kwh) {
+        pos += snprintf(buf + pos, buf_size - pos, "\"KWH\":%lu,", (unsigned long)d->kwh);
+        pos = clamp_pos(pos, buf_size);
+    }
+    if (d->has_alr) {
+        pos += snprintf(buf + pos, buf_size - pos,
+                        "\"ALR1\":%u,\"ALR2\":%u,\"ALR3\":%u,",
+                        d->alr1, d->alr2, d->alr3);
+        pos = clamp_pos(pos, buf_size);
+    }
 
     /* Alarms object. Reserve room for the fixed-size suffix (status +
      * commandStatus + holdingRegs + closing) so the alarm loop stops with

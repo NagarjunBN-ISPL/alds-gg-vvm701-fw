@@ -133,6 +133,7 @@ void sysmon_publish(const char *hw_id, const char *ts, const char *topic) {
     int written = snprintf(buf, sizeof(buf),
         "{"
         "\"HW_ID\":\"%s\","
+        "\"type\":\"sysmon\","
         "\"fw\":\"%s\","
         "\"cpu_temp_c\":%.1f,"
         "\"thermal_zone\":\"%s\","

@@ -37,6 +37,18 @@ typedef struct {
     float    load_current[3];     /* L1, L2, L3        */
     float    genset_power[4];     /* L1, L2, L3, total */
 
+    /* Optional: cumulative energy, regs 35-36 (Sedemac only) — 32-bit value
+     * spanning two registers, word order NOT wire-verified (assumed
+     * high-word-first per standard Modbus convention). Not currently read
+     * by any DEIF SGC 120 driver. */
+    bool     has_kwh;
+    uint32_t kwh;
+
+    /* Optional: raw values of the first three alarm registers (Sedemac only),
+     * alongside — not instead of — the decoded `alarms[]` above. */
+    bool     has_alr;
+    uint16_t alr1, alr2, alr3;
+
     /* Active alarms — only Warning/Shutdown/ElecTrip/Notification are stored;
      * Disabled/Inactive are dropped at decode time. */
     GensetAlarm_t alarms[GENSET_MAX_ALARMS];
