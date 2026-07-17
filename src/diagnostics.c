@@ -42,10 +42,14 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
     uint32_t free_heap = esp_get_free_heap_size();
     uint32_t uptime_s  = (uint32_t)(esp_timer_get_time() / 1000000ULL);
 
+    /* Fields live under a "diagnostics" key rather than a flat "type" marker
+     * — matches the wrapping-key pattern every other message shape uses
+     * (nozzles/tanks/genset/di): the cloud identifies a message kind by which
+     * key is present, not by reading a value. */
     char buf[512];
     int written = snprintf(buf, sizeof(buf),
         "{\"HW_ID\":\"%s\","
-        "\"type\":\"diagnostics\","
+        "\"diagnostics\":{"
         "\"fw\":\"%s\","
         "\"temp_c\":%.1f,"
         "\"thermal_zone\":\"%s\","
@@ -61,6 +65,8 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
         "\"radar_ok\":%s,"
         "\"genset_ok\":%s,"
         "\"di_ok\":%s,"
+        "\"gps_ok\":%s"
+        "},"
         "\"TS\":\"%s\"}",
         hw_id, FW_VERSION,
         temp_c,
@@ -76,13 +82,14 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
         g_diag.radar_ok  ? "true" : "false",
         g_diag.genset_ok ? "true" : "false",
         g_diag.di_ok     ? "true" : "false",
+        g_diag.gps_ok    ? "true" : "false",
         ts);
 
     if (written >= (int)sizeof(buf)) {
         ESP_LOGW(TAG, "payload truncated at %d/%zu bytes — publishing minimal report instead",
                  written, sizeof(buf));
         snprintf(buf, sizeof(buf),
-                 "{\"HW_ID\":\"%s\",\"fw\":\"%s\",\"error\":\"payload_truncated\",\"TS\":\"%s\"}",
+                 "{\"HW_ID\":\"%s\",\"diagnostics\":{\"fw\":\"%s\",\"error\":\"payload_truncated\"},\"TS\":\"%s\"}",
                  hw_id, FW_VERSION, ts);
     }
 

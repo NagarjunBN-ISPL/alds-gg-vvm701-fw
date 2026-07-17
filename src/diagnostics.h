@@ -14,6 +14,7 @@ typedef struct {
     bool     radar_ok;
     bool     genset_ok;
     bool     di_ok;
+    bool     gps_ok;
 } DiagState_t;
 
 extern DiagState_t g_diag;

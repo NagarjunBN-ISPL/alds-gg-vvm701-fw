@@ -65,6 +65,20 @@
  * instead of every cycle. With PUBLISH_INTERVAL_MS=30s, 2 → every 60s. */
 #define RADAR_CYCLE_INTERVAL  2
 
+/* ── GPS/GNSS cadence ──────────────────────────────────────────────────────
+ * VVM701 is a stationary fuel-station asset — its position never changes
+ * after installation, so there's no value in re-querying the fix on the same
+ * cadence as mobile telemetry. The GNSS engine runs continuously in the
+ * background from boot (gps_init); this only controls how often poll_gps()
+ * re-reads AT+QGPSLOC. 20 -> every 20 poll cycles, 20*30s = 10 min. Kept as
+ * its own constant (not reusing DIAG_CYCLE_INTERVAL) so the two can be tuned
+ * independently.
+ *
+ * TEMPORARY DEBUG OVERRIDE (2026-07-17): set to 1 (poll every ~30s) while
+ * field-testing a live antenna/fix outdoors — 10 min per attempt is too slow
+ * to iterate on. REVERT TO 20 before this reaches any deployed gateway. */
+#define GPS_CYCLE_INTERVAL  1
+
 /* ── Connectivity recovery (layered escalation) ──────────────────────────── */
 #define MQTT_RECONNECT_RETRIES 5      /* L1: plain MQTT reconnect attempts   */
 #define NET_BRINGUP_RETRIES    3      /* L2: network rebuild attempts        */

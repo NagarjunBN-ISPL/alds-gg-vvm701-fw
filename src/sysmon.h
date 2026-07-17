@@ -20,7 +20,7 @@ typedef struct {
     uint32_t pub_ok;
     uint32_t pub_fail;
     uint32_t loop_max_ms;
-    bool     du_ok, radar_ok, genset_ok, di_ok;
+    bool     du_ok, radar_ok, genset_ok, di_ok, gps_ok;
 } SysmonSnapshot_t;
 
 void  sysmon_init(void);

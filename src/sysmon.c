@@ -123,17 +123,22 @@ void sysmon_sample(SysmonSnapshot_t *out) {
     out->radar_ok    = g_diag.radar_ok;
     out->genset_ok   = g_diag.genset_ok;
     out->di_ok       = g_diag.di_ok;
+    out->gps_ok      = g_diag.gps_ok;
 }
 
 void sysmon_publish(const char *hw_id, const char *ts, const char *topic) {
     SysmonSnapshot_t s;
     sysmon_sample(&s);
 
+    /* Fields live under a "sysmon" key rather than a flat "type" marker —
+     * matches the wrapping-key pattern every other message shape uses
+     * (nozzles/tanks/genset/di): the cloud identifies a message kind by which
+     * key is present, not by reading a value. */
     char buf[768];
     int written = snprintf(buf, sizeof(buf),
         "{"
         "\"HW_ID\":\"%s\","
-        "\"type\":\"sysmon\","
+        "\"sysmon\":{"
         "\"fw\":\"%s\","
         "\"cpu_temp_c\":%.1f,"
         "\"thermal_zone\":\"%s\","
@@ -157,6 +162,8 @@ void sysmon_publish(const char *hw_id, const char *ts, const char *topic) {
         "\"radar_ok\":%s,"
         "\"genset_ok\":%s,"
         "\"di_ok\":%s,"
+        "\"gps_ok\":%s"
+        "},"
         "\"TS\":\"%s\""
         "}",
         hw_id, FW_VERSION,
@@ -181,6 +188,7 @@ void sysmon_publish(const char *hw_id, const char *ts, const char *topic) {
         s.radar_ok  ? "true" : "false",
         s.genset_ok ? "true" : "false",
         s.di_ok     ? "true" : "false",
+        s.gps_ok    ? "true" : "false",
         ts);
 
     /* snprintf's return value is the length it WOULD have written, not what
@@ -192,7 +200,7 @@ void sysmon_publish(const char *hw_id, const char *ts, const char *topic) {
         ESP_LOGW(TAG, "payload truncated at %d/%zu bytes — publishing minimal report instead",
                  written, sizeof(buf));
         snprintf(buf, sizeof(buf),
-                 "{\"HW_ID\":\"%s\",\"fw\":\"%s\",\"error\":\"payload_truncated\",\"TS\":\"%s\"}",
+                 "{\"HW_ID\":\"%s\",\"sysmon\":{\"fw\":\"%s\",\"error\":\"payload_truncated\"},\"TS\":\"%s\"}",
                  hw_id, FW_VERSION, ts);
     }
 

@@ -20,6 +20,11 @@ typedef struct {
     char     sfx_ztech[RADAR_MAX][3];
     char     sfx_pantech[RADAR_MAX][3];
 
+    /* GNSS via the modem's built-in GPS (see gps.c) — default false. Most
+     * gateways stay disabled since not every unit has the GNSS antenna
+     * physically connected; toggled remotely via setconfig (gpsEnable). */
+    bool     gps_enable;
+
     /* ── Connectivity (remotely configurable via setconfig) ───────────────
      * Covers both the cellular APN and the MQTT broker. _bak holds whatever
      * connectivity config last PROVED it could get all the way to a live

@@ -19,6 +19,7 @@ void nvs_config_defaults(DeviceConfig *cfg) {
     cfg->genset_slave     = GENSET_SLAVE_DEFAULT;
     cfg->genset_baud      = 9600;
     cfg->di_enable        = 0;
+    cfg->gps_enable       = false;
     /* sfx all empty strings */
 
     /* Connectivity defaults = the compile-time fallback in config.h. Primary
@@ -80,6 +81,11 @@ bool nvs_config_load(DeviceConfig *cfg) {
     LOAD_U8 ("genset_model", genset_model);
     LOAD_U8 ("genset_slave", genset_slave);
     LOAD_U8 ("di_enable",    di_enable);
+    /* No key in NVS yet on any gateway flashed before this feature existed —
+     * nvs_get_u8 simply misses and leaves the nvs_config_defaults() false
+     * untouched, so upgrading an already-deployed gateway's firmware is a
+     * behavioral no-op. */
+    LOAD_U8 ("gps_enable",   gps_enable);
     LOAD_U32("genset_baud",  genset_baud);
     LOAD_STR("sfx_genset",   sfx_genset);
     LOAD_STR("sfx_di",       sfx_di);
@@ -208,6 +214,7 @@ bool nvs_config_save(const DeviceConfig *cfg) {
     ok &= (nvs_set_u8 (h, "genset_model", cfg->genset_model)     == ESP_OK);
     ok &= (nvs_set_u8 (h, "genset_slave", cfg->genset_slave)     == ESP_OK);
     ok &= (nvs_set_u8 (h, "di_enable",    cfg->di_enable)        == ESP_OK);
+    ok &= (nvs_set_u8 (h, "gps_enable",   cfg->gps_enable)       == ESP_OK);
     ok &= (nvs_set_u32(h, "genset_baud",  cfg->genset_baud)      == ESP_OK);
     ok &= (nvs_set_str(h, "sfx_genset",   cfg->sfx_genset)       == ESP_OK);
     ok &= (nvs_set_str(h, "sfx_di",       cfg->sfx_di)           == ESP_OK);

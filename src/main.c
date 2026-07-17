@@ -8,6 +8,7 @@
 #include "radar.h"
 #include "genset.h"
 #include "di.h"
+#include "gps.h"
 #include "diagnostics.h"
 #include "sysmon.h"
 
@@ -176,9 +177,9 @@ static void build_topics(void) {
      * and sysmon health reports (which used to have their own topics but now
      * share this one). Every payload carries "HW_ID" (bare IMEI, or IMEI+suffix
      * for per-equipment telemetry) so the cloud attributes it to a device by
-     * that field, and self-identifies its kind by a shape marker: "nozzles" /
-     * "tanks" / "genset" / "di" for telemetry, "status" for lifecycle,
-     * "type":"diagnostics"/"sysmon" for the health reports. Inbound command
+     * that field, and self-identifies its kind by which top-level key is
+     * present: "nozzles" / "tanks" / "genset" / "di" for telemetry, "status"
+     * for lifecycle, "diagnostics" / "sysmon" for the health reports. Inbound command
      * topics (setconfig/update/rsp/kfactor below) stay per-IMEI — they must
      * target one device, and flattening them would make every device act on
      * every push. */
@@ -279,7 +280,7 @@ static bool json_get_bool(const char *json, const char *key, bool def) {
  * DU_BLUESKY_MAX/RADAR_MAX in config.h when either cap changes. */
 static const char * const s_setcfg_known_keys[] = {
     "duBlueskyCount","ztechCount","pantechCount","radarType","tankCount",
-    "gensetType","gensetModel","gensetSlave","gensetBaud","diEnable",
+    "gensetType","gensetModel","gensetSlave","gensetBaud","diEnable","gpsEnable",
     "sfxGenset","sfxDI",
     "sfxBs1","sfxBs2","sfxBs3","sfxBs4","sfxBs5","sfxBs6",
     "sfxZtech1","sfxZtech2","sfxZtech3","sfxZtech4",
@@ -396,7 +397,7 @@ static void publish_config_report(void) {
         "\"HW_ID\":\"%s\",\"status\":\"config_report\",\"fw\":\"%s\","
         "\"duBlueskyCount\":%u,\"ztechCount\":%u,\"pantechCount\":%u,"
         "\"gensetType\":%u,\"gensetModel\":%u,\"gensetSlave\":%u,\"gensetBaud\":%lu,"
-        "\"diEnable\":%u,"
+        "\"diEnable\":%u,\"gpsEnable\":%s,"
         "\"sfxGenset\":\"%s\",\"sfxDI\":\"%s\","
         "\"sfxBs1\":\"%s\",\"sfxBs2\":\"%s\",\"sfxBs3\":\"%s\","
         "\"sfxBs4\":\"%s\",\"sfxBs5\":\"%s\",\"sfxBs6\":\"%s\","
@@ -411,7 +412,7 @@ static void publish_config_report(void) {
         (unsigned)g_cfg.du_bluesky_count, (unsigned)g_cfg.ztech_count, (unsigned)g_cfg.pantech_count,
         (unsigned)g_cfg.genset_type, (unsigned)g_cfg.genset_model, (unsigned)g_cfg.genset_slave,
         (unsigned long)g_cfg.genset_baud,
-        (unsigned)g_cfg.di_enable,
+        (unsigned)g_cfg.di_enable, g_cfg.gps_enable ? "true" : "false",
         g_cfg.sfx_genset, g_cfg.sfx_di,
         g_cfg.sfx_bs[0], g_cfg.sfx_bs[1], g_cfg.sfx_bs[2],
         g_cfg.sfx_bs[3], g_cfg.sfx_bs[4], g_cfg.sfx_bs[5],
@@ -551,6 +552,7 @@ static void parse_setconfig(const char *json) {
     nc.genset_slave  = (uint8_t) json_get_int(json,"gensetSlave",nc.genset_slave);
     nc.genset_baud   = (uint32_t)json_get_int(json,"gensetBaud", (int)nc.genset_baud);
     nc.di_enable     = (uint8_t) json_get_int(json,"diEnable",   nc.di_enable);
+    nc.gps_enable    = json_get_bool(json, "gpsEnable", nc.gps_enable);
 
     /* Baud whitelist — an out-of-range value (0 in particular) reaches the
      * UART clock-divider division in rs485_set_8n1() and panics the chip
@@ -674,6 +676,12 @@ static void parse_setconfig(const char *json) {
         mqtt_publish(t_data, err);
         return;
     }
+
+    /* Turn the GNSS engine off cleanly on a live disable rather than leaving
+     * it running until the modem's next power-cycle — cheap given the reboot
+     * that follows a few lines down anyway. Compared against the OLD g_cfg
+     * (not yet overwritten), so this only fires on an actual on->off edge. */
+    if (g_cfg.gps_enable && !nc.gps_enable) gps_end();
 
     g_cfg = nc;
     if (!nvs_config_save(&g_cfg)) {
@@ -935,6 +943,21 @@ static void poll_genset(const char *ts) {
     g_diag.genset_ok = ok && pub;
 }
 
+/* ── Poll GPS ─────────────────────────────────────────────────────────────
+ * Bare IMEI as HW_ID, no suffix — GPS describes the gateway's own fixed
+ * location, not a specific piece of equipment behind it (same reasoning as
+ * status/diagnostics/sysmon). Not on the RS485 bus, so no mode-switch calls
+ * like poll_genset()'s rs485_set_8n1/8e1_9600. */
+static void poll_gps(const char *ts) {
+    static GpsFix_t fix;
+    static char payload[384];
+    bool ok = gps_poll(&fix);
+    gps_build_payload(&fix, g_imei, ts, payload, sizeof(payload));
+    bool pub = mqtt_publish(t_data, payload);
+    if (pub) g_diag.pub_ok++; else g_diag.pub_fail++;
+    g_diag.gps_ok = ok && pub;
+}
+
 /* ── Timestamp hour extractor ─────────────────────────────────────────── */
 /* ts format: "2026-07-01 02:00:15"  →  returns 2 */
 static int ts_hour(const char *ts) {
@@ -1062,6 +1085,19 @@ static void run_poll_cycle(void) {
     execute_pending();
     if (g_cfg.di_enable)
         g_diag.di_ok = di_publish_buffer(t_data, g_hw_di, ts, g_cfg.di_enable);
+    esp_task_wdt_reset();
+    poll_incoming_mqtt();
+
+    /* GPS runs on an even slower cadence than radar — the gateway is a
+     * stationary asset, its position never changes after install. Gated
+     * solely by gps_enable, which defaults to false: this is the one line
+     * that keeps the whole feature dead for every gateway that hasn't been
+     * explicitly enabled from the cloud. */
+    static int gps_cycle = 0;
+    if (g_cfg.gps_enable) {
+        if (gps_cycle == 0) poll_gps(ts);
+        gps_cycle = (gps_cycle + 1) % GPS_CYCLE_INTERVAL;
+    }
     esp_task_wdt_reset();
     poll_incoming_mqtt();
 
@@ -1207,6 +1243,15 @@ void app_main(void) {
     }
     esp_task_wdt_add(NULL);
     esp_task_wdt_reset();
+
+    /* GNSS power-on — deliberately AFTER network_init() rather than right
+     * after modem confirmation: network_init() is what sends AT+CMEE=2
+     * (network.c), and without verbose CME errors active yet, a failed
+     * AT+QGPS=1 comes back as a bare, undiagnosable "+CME ERROR" with no
+     * code (seen in the field on 2026-07-17 — moved here specifically to
+     * fix that). A true no-op when gps_enable is false, which is the
+     * default and normal state for most gateways. */
+    gps_init(g_cfg.gps_enable);
 
     if (!modem_get_imei(g_imei, sizeof(g_imei)))
         strncpy(g_imei, "000000000000000", sizeof(g_imei));

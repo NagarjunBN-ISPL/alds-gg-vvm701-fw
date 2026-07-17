@@ -114,6 +114,27 @@ static void log_at_cmd(const char *cmd) {
     }
 }
 
+/* Called once a marker (expect string, or an error like "+CME ERROR") has
+ * been spotted in buf, but the rest of that line — a value field, a numeric/
+ * verbose error code, the trailing OK — may not have arrived yet since this
+ * is checked byte-by-byte as bytes stream in. Settles briefly then drains up
+ * to 500ms more so callers (and logs) see the complete line, not just
+ * whatever had arrived at the instant the marker matched. */
+static void drain_rest_of_line(char *buf, size_t buf_size, int *total) {
+    vTaskDelay(pdMS_TO_TICKS(30));
+    int space = (int)buf_size - 1 - *total;
+    int64_t drain_deadline = esp_timer_get_time() + 500000LL;
+    while (space > 0 && esp_timer_get_time() < drain_deadline) {
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+        int n2 = uart_read_bytes(MODEM_UART, (uint8_t *)buf + *total,
+                                  space, pdMS_TO_TICKS(20));
+        if (n2 <= 0) break;
+        *total += n2;
+        buf[*total] = '\0';
+        space = (int)buf_size - 1 - *total;
+    }
+}
+
 bool modem_at(const char *cmd, const char *expect, int timeout_ms,
               char *resp, size_t resp_size) {
     modem_flush();
@@ -137,28 +158,14 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
                 buf[total]   = '\0';
             }
             if (expect && strstr(buf, expect)) {
-                /* Found the marker, but the rest of this line (value, or the
-                 * trailing OK) may not have arrived yet — drain a bit more
-                 * before returning so callers don't see a truncated field. */
-                vTaskDelay(pdMS_TO_TICKS(30));
-                int space = (int)sizeof(buf) - 1 - total;
-                /* Hard cap on top of the "exit on silence" condition — a
-                 * modem trickling single bytes continuously (RF noise, a
-                 * chatty URC stream) would otherwise keep this loop alive
-                 * for ~(space/20ms), tens of seconds, and callers chaining
-                 * many modem_at() calls (e.g. network_init()) could
+                /* Hard cap on top of the "exit on silence" condition inside
+                 * drain_rest_of_line() — a modem trickling single bytes
+                 * continuously (RF noise, a chatty URC stream) would
+                 * otherwise keep it alive for tens of seconds, and callers
+                 * chaining many modem_at() calls (e.g. network_init()) could
                  * accumulate well past what's reasonable across a single
                  * bring-up attempt. */
-                int64_t drain_deadline = esp_timer_get_time() + 500000LL;
-                while (space > 0 && esp_timer_get_time() < drain_deadline) {
-                    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
-                    int n2 = uart_read_bytes(MODEM_UART, (uint8_t *)buf + total,
-                                              space, pdMS_TO_TICKS(20));
-                    if (n2 <= 0) break;
-                    total += n2;
-                    buf[total] = '\0';
-                    space = (int)sizeof(buf) - 1 - total;
-                }
+                drain_rest_of_line(buf, sizeof(buf), &total);
                 ESP_LOGI(TAG, "<< %s", buf);
                 if (resp && resp_size > 0) {
                     strncpy(resp, buf, resp_size - 1);
@@ -167,6 +174,13 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
                 return true;
             }
             if (strstr(buf, "\r\nERROR") || strstr(buf, "+CME ERROR")) {
+                /* Same drain as the expect-match branch above — the matched
+                 * substring ("+CME ERROR" in particular) can arrive before
+                 * its trailing ": <code>" has been transmitted, so without
+                 * this a real numeric/verbose CME error code was being cut
+                 * off here and logged as a bare, undiagnosable "+CME ERROR"
+                 * (seen in the field on 2026-07-17 debugging AT+QGPS=1). */
+                drain_rest_of_line(buf, sizeof(buf), &total);
                 ESP_LOGW(TAG, "<< %s", buf);
                 if (resp && resp_size > 0) {
                     strncpy(resp, buf, resp_size - 1);
