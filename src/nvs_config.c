@@ -5,9 +5,23 @@
 #include "esp_log.h"
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
 
 static const char *TAG = "nvs_cfg";
 #define NS "iot_cfg"
+
+/* A stored HW_ID suffix must be empty or exactly 2 alphanumeric characters —
+ * setconfig enforces this on the way in (validate_suffixes, main.c), and this
+ * enforces it on the way out of flash: corrupt NVS, or a value written by an
+ * older firmware without the rule, would otherwise corrupt every JSON payload
+ * built with that HW_ID. Clearing falls back to the auto-generated suffix. */
+static void clamp_sfx(char *s) {
+    if (!s[0]) return;
+    if (strlen(s) != 2 || !isalnum((unsigned char)s[0]) || !isalnum((unsigned char)s[1])) {
+        ESP_LOGW(TAG, "invalid stored suffix [%s] — cleared to auto-fallback", s);
+        s[0] = '\0';
+    }
+}
 
 void nvs_config_defaults(DeviceConfig *cfg) {
     memset(cfg, 0, sizeof(*cfg));
@@ -157,6 +171,13 @@ bool nvs_config_load(DeviceConfig *cfg) {
         }
     }
     if (cfg->di_enable  > 0x0F)            cfg->di_enable   = 0;
+    clamp_sfx(cfg->sfx_genset);
+    clamp_sfx(cfg->sfx_di);
+    for (int i = 0; i < DU_BLUESKY_MAX; i++) clamp_sfx(cfg->sfx_bs[i]);
+    for (int i = 0; i < RADAR_MAX; i++) {
+        clamp_sfx(cfg->sfx_ztech[i]);
+        clamp_sfx(cfg->sfx_pantech[i]);
+    }
 
     /* A corrupt/truncated connectivity field would otherwise brick the
      * device with no way to recover remotely (no WiFi fallback, no physical

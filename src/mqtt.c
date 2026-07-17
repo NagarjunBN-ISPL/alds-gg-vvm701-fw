@@ -1,5 +1,6 @@
 #include "mqtt.h"
 #include "modem.h"
+#include "tls_ca.h"
 #include "config.h"
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -296,12 +297,23 @@ bool mqtt_connect(void) {
     /* TLS + persistent session — both must be set before QMTOPEN, since
      * Quectel rejects QMTCFG/QSSLCFG changes once the link is already open. */
     if (s_mqtt_tls) {
-        /* seclevel=0: no cert verification (no CA cert provisioned on-device
-         * yet). Still encrypts the transport so credentials aren't sent in
-         * the clear. QMTCFG "ssl",0,1,2 = client 0, SSL on, SSL context 2. */
+        /* seclevel=1: verify the broker's certificate against the CA
+         * uploaded by tls_ca_provision() (called once at boot, before the
+         * first connect attempt) — was seclevel=0 (no verification at all)
+         * until 2026-07-17. cacert is re-asserted on every connect attempt,
+         * same defensive "don't assume it survived" posture already used
+         * for sslversion/ciphersuite below, since QSSLCFG settings are reset
+         * by some recovery paths (e.g. modem_hard_reset) that this function
+         * gets called again after. QMTCFG "ssl",0,1,2 = client 0, SSL on,
+         * SSL context 2. */
         modem_at("AT+QSSLCFG=\"sslversion\",2,4",       "OK", 3000, NULL, 0);
         modem_at("AT+QSSLCFG=\"ciphersuite\",2,0XFFFF", "OK", 3000, NULL, 0);
-        modem_at("AT+QSSLCFG=\"seclevel\",2,0",         "OK", 3000, NULL, 0);
+        {
+            char cacert_cmd[64];
+            snprintf(cacert_cmd, sizeof(cacert_cmd), "AT+QSSLCFG=\"cacert\",2,\"%s\"", TLS_CA_FILE);
+            modem_at(cacert_cmd, "OK", 3000, NULL, 0);
+        }
+        modem_at("AT+QSSLCFG=\"seclevel\",2,1",         "OK", 3000, NULL, 0);
         modem_at("AT+QMTCFG=\"ssl\",0,1,2",             "OK", 3000, NULL, 0);
     } else {
         /* Plaintext MQTT — credentials and telemetry travel unencrypted.
@@ -373,6 +385,30 @@ bool mqtt_subscribe(const char *topic) {
     return true;
 }
 
+/* Single accounting point for EVERY publish outcome. The streak counter is
+ * the backstop for a silently-dead link (see the comment at the QMTPUBEX-ack
+ * wait below) — but it only works if every failure mode feeds it. The two
+ * early-out failures (modem ERROR before the '>' prompt, and no prompt at
+ * all) used to return without counting: a modem whose MQTT session died in a
+ * way that rejects QMTPUBEX outright — with the +QMTSTAT URC lost — would
+ * fail every publish forever while g_connected stayed true, so the reconnect
+ * ladder never fired and the device went silent until the 2 AM daily reboot. */
+static bool pub_result(bool ok, const char *topic) {
+    if (ok) {
+        s_pub_fail_streak = 0;
+        return true;
+    }
+    ESP_LOGW(TAG, "Publish failed for %s (streak %d/%d)",
+             topic, s_pub_fail_streak + 1, MQTT_PUB_FAIL_MAX);
+    if (++s_pub_fail_streak >= MQTT_PUB_FAIL_MAX) {
+        ESP_LOGE(TAG, "%d consecutive publish failures — marking link DOWN",
+                 s_pub_fail_streak);
+        g_connected = false;
+        s_pub_fail_streak = 0;
+    }
+    return false;
+}
+
 bool mqtt_publish(const char *topic, const char *payload) {
     if (!g_connected) return false;
 
@@ -406,14 +442,17 @@ bool mqtt_publish(const char *topic, const char *payload) {
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(20)) > 0) {
             if (bi < (int)sizeof(buf) - 1) { buf[bi++] = (char)ch; buf[bi] = '\0'; }
             if (ch == '>') { got_prompt = true; break; }
-            if (strstr(buf, "ERROR")) { parse_qmtrecv(buf); return false; }
+            if (strstr(buf, "ERROR")) {
+                parse_qmtrecv(buf);
+                return pub_result(false, topic);
+            }
         }
     }
     parse_qmtrecv(buf);  /* rescue any URCs that arrived before > */
 
     if (!got_prompt) {
         ESP_LOGW(TAG, "No > prompt for %s", topic);
-        return false;
+        return pub_result(false, topic);
     }
 
     /* Send payload bytes */
@@ -453,20 +492,10 @@ bool mqtt_publish(const char *topic, const char *payload) {
      * (returning OK/'>') while the broker TCP session is actually gone, so
      * mqtt_is_connected() alone never trips. Count consecutive missing
      * PUBEX acks; past the threshold, mark the link down so the next
-     * mqtt_reconnect_if_needed() rebuilds it (L1→L4). */
-    if (pub_ok) {
-        s_pub_fail_streak = 0;
-    } else {
-        ESP_LOGW(TAG, "No PUBEX ack for %s (streak %d/%d)",
-                 topic, s_pub_fail_streak + 1, MQTT_PUB_FAIL_MAX);
-        if (++s_pub_fail_streak >= MQTT_PUB_FAIL_MAX) {
-            ESP_LOGE(TAG, "%d consecutive publish failures — marking link DOWN",
-                     s_pub_fail_streak);
-            g_connected = false;
-            s_pub_fail_streak = 0;
-        }
-    }
-    return pub_ok;
+     * mqtt_reconnect_if_needed() rebuilds it (L1→L4). Accounting lives in
+     * pub_result() so the two early-out failure paths above feed the same
+     * streak. */
+    return pub_result(pub_ok, topic);
 }
 
 bool mqtt_poll(char *topic_out, size_t topic_size,

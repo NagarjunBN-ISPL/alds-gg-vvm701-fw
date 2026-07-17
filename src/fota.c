@@ -1,6 +1,7 @@
 #include "fota.h"
 #include "modem.h"
 #include "network.h"
+#include "tls_ca.h"
 #include "config.h"
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -71,19 +72,44 @@ static bool fota_download(const char *url, char *reason, size_t reason_size) {
 
     fota_pdp_refresh();
 
-    /* SSL config on dedicated context — no cert verification (dev mode),
-     * ignore clock/cert issues, enable SNI (required by GitHub/CDNs). */
+    /* SSL config on dedicated context. Until 2026-07-17 this ran with
+     * seclevel=0 PLUS ignoreinvalidcertsign=1 and ignoremulticertchainverify
+     * =1 — meaning the HTTPS-only check in fota_perform() was the only real
+     * gate, and a network-position attacker (rogue DNS, compromised APN
+     * routing, a fake AP) could present ANY certificate, including a
+     * self-signed one, and this device would download and FLASH whatever
+     * "firmware" it served. That's the worst-case outcome in this whole
+     * system: attacker-controlled code execution. Now verified against the
+     * CA tls_ca_provision() uploads at boot (see tls_ca.c) — cacert is
+     * re-asserted here every attempt, same defensive posture as the rest of
+     * this block, since a modem_hard_reset() between retries (see
+     * fota_perform()) clears QSSLCFG state.
+     *
+     * ignorelocaltime stays 1: this is a clock-skew safety net (the modem's
+     * own RTC may not be network-synced yet at the point FOTA runs), not a
+     * certificate-authenticity check — keeping it doesn't reopen the RCE
+     * gap the other two flags did. sni stays 1: needed for any host that
+     * serves multiple certs off one IP (common on CDNs/S3-style storage).
+     *
+     * This has NOT been tested against a real FOTA download yet — unlike
+     * the MQTT broker's cert (directly inspected, confirmed to chain
+     * through the CA this uploads), the actual FOTA host's certificate
+     * chain is unverified. If it's Let's Encrypt-issued this works
+     * unchanged; if some other CA issued it, downloads will start failing
+     * with a TLS/cert error until that CA gets added to tls_ca.c too. */
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"sslversion\",%d,4", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ciphersuite\",%d,0XFFFF", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
-    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"seclevel\",%d,0", FOTA_SSL_CTX);
+    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"cacert\",%d,\"%s\"", FOTA_SSL_CTX, TLS_CA_FILE);
+    modem_at(cmd, "OK", 3000, NULL, 0);
+    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"seclevel\",%d,1", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignorelocaltime\",%d,1", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
-    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignoreinvalidcertsign\",%d,1", FOTA_SSL_CTX);
+    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignoreinvalidcertsign\",%d,0", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
-    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignoremulticertchainverify\",%d,1", FOTA_SSL_CTX);
+    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignoremulticertchainverify\",%d,0", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"sni\",%d,1", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);

@@ -21,3 +21,8 @@ bool modem_get_timestamp(char *buf, size_t size);
 /* Read UART (no command sent) until expect is found or timeout elapses. */
 bool modem_read_until(const char *expect, int timeout_ms,
                       char *resp, size_t resp_size);
+/* Uploads `len` bytes of `data` to a file on the modem's UFS filesystem via
+ * AT+QFUPL (send command, wait for CONNECT, stream the raw bytes, wait for
+ * the +QFUPL: confirmation). Overwrites any existing file of the same name.
+ * Same CONNECT-prompt pattern fota.c already uses for AT+QHTTPURL. */
+bool modem_upload_file(const char *filename, const char *data, size_t len);

@@ -11,21 +11,7 @@ void gps_init(bool enable) {
     if (!enable) return;   /* zero AT traffic — this is what keeps GPS inert
                              * while gps_enable is false, the default state. */
 
-    /* GNSS and cellular (WWAN) share RF hardware on Quectel modules and don't
-     * run at full strength simultaneously unless told which one to favor —
-     * documented in the EC200U series GNSS Application Note, and confirmed
-     * by field reports of EC200U-CN GNSS commands struggling specifically
-     * while a PDP/internet session is active (which it always is here, since
-     * gps_init() now runs after network_init() — see the app_main comment on
-     * why that ordering was chosen). 0 = GNSS priority, for this initial
-     * acquisition window; this trades a small amount of cellular throughput
-     * for a real chance at a first fix, not a permanent WWAN downgrade.
-     * Non-fatal if rejected (e.g. not supported on this exact firmware) —
-     * AT+QGPS=1 below is still attempted either way. */
     char resp[64] = {0};
-    if (!modem_at("AT+QGPSCFG=\"priority\",0", "OK", 5000, resp, sizeof(resp)))
-        ESP_LOGW(TAG, "AT+QGPSCFG priority=GNSS rejected/unsupported — continuing anyway");
-
     if (!modem_at("AT+QGPS=1", "OK", 10000, resp, sizeof(resp))) {
         /* Non-fatal, known-benign causes: (a) GNSS already running from a
          * prior boot that didn't power-cycle the modem — an ESP-only reset
@@ -67,11 +53,25 @@ bool gps_poll(GpsFix_t *out) {
 
     char resp[256] = {0};
     if (!modem_at("AT+QGPSLOC=2", "+QGPSLOC:", 5000, resp, sizeof(resp))) {
-        /* Covers both "no fix yet" (+CME ERROR) and any other error/timeout —
-         * modem_at() already treats +CME ERROR as failure, so no separate
-         * fix-vs-error distinction is needed. This is the normal state for a
-         * long time after boot (cold GNSS acquisition can take minutes), not
-         * a fault. */
+        /* Covers both "no fix yet" (+CME ERROR 516) and any other error/
+         * timeout — modem_at() already treats +CME ERROR as failure, so no
+         * separate fix-vs-error distinction is needed. "No fix yet" is the
+         * normal state for a long time after boot (cold GNSS acquisition can
+         * take minutes), not a fault.
+         *
+         * One error IS worth acting on: 505 ("session not active") means the
+         * GNSS engine is OFF. That happens whenever a recovery path power-
+         * cycles the modem via PWRKEY (mqtt_reconnect_if_needed's L3,
+         * network_init's SIM rescue, FOTA's final-attempt escalation) —
+         * gps_init() only runs at boot, so without this re-arm a GPS-enabled
+         * unit would publish 404 forever after any such recovery, until the
+         * next reboot. Re-arming here restores fixes within a poll cycle or
+         * two. (Numeric code matched because this modem reports GNSS errors
+         * numerically even with AT+CMEE=2 — see the 2026-07-17 field logs.) */
+        if (strstr(resp, "ERROR: 505") || strstr(resp, "not active")) {
+            ESP_LOGW(TAG, "GNSS session not active (modem power-cycled?) — re-arming engine");
+            gps_init(true);   /* only reachable when gps_enable is true */
+        }
         return false;
     }
 
@@ -80,49 +80,21 @@ bool gps_poll(GpsFix_t *out) {
     start += strlen("+QGPSLOC:");
     while (*start == ' ') start++;
 
-    /* Field order per Quectel's general GNSS AT command set with mode 2
-     * (decimal-degree format): UTC,lat,lon,hdop,alt,fix,cog,spkm,spkn,date,
-     * nsat. NOT yet confirmed against the EC200U-CN's own AT command manual
-     * or a live capture with the antenna connected — see the TODOs on
-     * GpsFix_t in gps.h. The lat/lon range check below catches a wrong field
-     * order landing an out-of-range number in latitude/longitude, but does
-     * NOT itself confirm the other fields (hdop/altitude/fixType/speed/
-     * courseDeg) are in the right slots — treat every gps_poll() result as
-     * provisional until checked against a real capture. */
+    /* Field order: UTC,lat,lon,hdop,alt,fix,cog,spkm,spkn,date,nsat. Confirmed
+     * against a real capture on 2026-07-17 (Bangalore, ~847m elevation,
+     * 7 satellites, 3D fix). Only lat/lon (fields 2 and 3) are kept — see the
+     * comment on GpsFix_t in gps.h — so parsing stops right after longitude;
+     * the remaining 8 fields on the wire are never read. */
     const char *cur = start;
     char field[24];
 
-    if (!next_field(&cur, out->fix_time_utc, sizeof(out->fix_time_utc))) return false;
+    if (!next_field(&cur, field, sizeof(field))) return false;   /* UTC time, discarded */
 
     if (!next_field(&cur, field, sizeof(field))) return false;
     double lat = atof(field);
 
     if (!next_field(&cur, field, sizeof(field))) return false;
     double lon = atof(field);
-
-    if (!next_field(&cur, field, sizeof(field))) return false;
-    out->hdop = (float)atof(field);
-
-    if (!next_field(&cur, field, sizeof(field))) return false;
-    out->altitude_m = (float)atof(field);
-
-    if (!next_field(&cur, field, sizeof(field))) return false;
-    out->fix_type = (uint8_t)atoi(field);
-
-    if (!next_field(&cur, field, sizeof(field))) return false;
-    out->course_deg = (float)atof(field);
-
-    if (!next_field(&cur, field, sizeof(field))) return false;
-    out->speed = (float)atof(field);   /* spkm — speed over ground */
-
-    if (!next_field(&cur, field, sizeof(field))) return false;
-    /* spkn (speed in knots) intentionally not stored — spkm above is kept as
-     * the one reported speed value. */
-
-    if (!next_field(&cur, out->fix_date, sizeof(out->fix_date))) return false;
-
-    if (!next_field(&cur, field, sizeof(field))) return false;
-    out->num_sats = (uint8_t)atoi(field);
 
     /* Sanity check, not a format re-verification: a real fix's coordinates
      * must land in valid Earth-coordinate range. This catches "the field
@@ -150,14 +122,6 @@ void gps_build_payload(const GpsFix_t *fix, const char *hw_id, const char *ts,
     }
 
     snprintf(buf, buf_size,
-        "{\"HW_ID\":\"%s\",\"gps\":{"
-        "\"lat\":%.6f,\"lon\":%.6f,\"alt_m\":%.1f,\"hdop\":%.1f,"
-        "\"numSat\":%u,\"fixType\":%u,\"speed\":%.1f,\"courseDeg\":%.1f,"
-        "\"fixTime\":\"%s\",\"fixDate\":\"%s\""
-        "},\"TS\":\"%s\"}",
-        hw_id,
-        fix->latitude, fix->longitude, fix->altitude_m, fix->hdop,
-        (unsigned)fix->num_sats, (unsigned)fix->fix_type, fix->speed, fix->course_deg,
-        fix->fix_time_utc, fix->fix_date,
-        ts);
+        "{\"HW_ID\":\"%s\",\"gps\":{\"lat\":%.6f,\"lon\":%.6f},\"TS\":\"%s\"}",
+        hw_id, fix->latitude, fix->longitude, ts);
 }

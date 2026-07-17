@@ -250,6 +250,44 @@ bool modem_read_until(const char *expect, int timeout_ms,
     return false;
 }
 
+bool modem_upload_file(const char *filename, const char *data, size_t len) {
+    char cmd[80];
+
+    /* QFUPL does NOT overwrite an existing file — it rejects the upload
+     * (+CME ERROR: 407, observed on real hardware 2026-07-17 on the second
+     * boot after a successful first upload). The modem's UFS survives ESP
+     * resets, since the modem itself stays powered across them, so on every
+     * boot after the first the file is already there. Delete first and
+     * ignore the failure when it doesn't exist — same fire-and-forget QFDEL
+     * pattern fota.c already uses for its own download file. Without this,
+     * a file that got there once could never be REPLACED — so a truncated
+     * or corrupt first upload would be permanent, and TLS would fail
+     * forever with no way to recover short of a modem power-cycle. */
+    snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s\"", filename);
+    modem_at(cmd, "OK", 5000, NULL, 0);
+
+    snprintf(cmd, sizeof(cmd), "AT+QFUPL=\"%s\",%d,10", filename, (int)len);
+    if (!modem_at(cmd, "CONNECT", 10000, NULL, 0)) {
+        ESP_LOGE(TAG, "QFUPL: no CONNECT for %s", filename);
+        return false;
+    }
+    uart_write_bytes(MODEM_UART, data, len);
+
+    /* +QFUPL: <size>,<crc16> confirms the modem received and wrote exactly
+     * what was sent. A byte-exact CRC check isn't done here — the data is a
+     * small, fixed, compiled-in constant (not something that varies at
+     * runtime the way a FOTA download body does), so the only realistic
+     * failure mode is "the write didn't happen at all," which the marker's
+     * presence/absence already catches. */
+    char resp[128] = {0};
+    if (!modem_read_until("+QFUPL:", 15000, resp, sizeof(resp))) {
+        ESP_LOGE(TAG, "QFUPL: no confirmation for %s", filename);
+        return false;
+    }
+    ESP_LOGI(TAG, "QFUPL: uploaded %s (%d bytes)", filename, (int)len);
+    return true;
+}
+
 bool modem_power_on(void) {
     /* Try AT first — module may already be on */
     for (int i = 0; i < 3; i++) {

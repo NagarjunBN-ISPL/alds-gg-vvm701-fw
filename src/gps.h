@@ -11,36 +11,29 @@
  *
  * lat/lon are stored as double: a coordinate needs ~9 significant digits
  * (e.g. 12.9715987), which is past float's ~7.2-digit mantissa precision.
- * fix_time_utc/fix_date are kept as raw, unreformatted tokens copied
- * straight out of the modem response rather than parsed into a struct-tm —
- * see the AT-manual-verification note in gps.c before trusting fix_type/
- * speed/course_deg's exact units/encoding. */
+ * Only lat/lon are kept — AT+QGPSLOC also reports altitude/hdop/satellite
+ * count/speed/course/fix-time, but nothing downstream uses them, and this is
+ * a stationary asset (fuel station) where they add little; position was
+ * confirmed against a real capture on 2026-07-17. If a confidence signal
+ * (hdop/numSat) is ever needed — e.g. to distinguish a real relocation from
+ * a marginal fix for a drift/tamper alert — gps_poll() already receives
+ * those fields on the wire, they'd just need to be threaded back out. */
 typedef struct {
-    bool     valid;          /* true only if AT+QGPSLOC returned a usable fix */
-
-    double   latitude;       /* decimal degrees, +N/-S      */
-    double   longitude;      /* decimal degrees, +E/-W      */
-    float    altitude_m;     /* metres above sea level      */
-    float    hdop;           /* horizontal dilution of precision */
-    uint8_t  num_sats;       /* satellites used in the fix  */
-    char     fix_time_utc[16]; /* raw HHMMSS.s token, unformatted */
-    char     fix_date[8];      /* raw DDMMYY token, unformatted   */
-
-    /* Present in Quectel's general GNSS field set but NOT yet confirmed for
-     * exact meaning/units on this specific module/firmware — see gps.c. */
-    uint8_t  fix_type;       /* TODO verify against AT manual (2D/3D encoding) */
-    float    speed;          /* TODO verify unit (km/h vs knots)               */
-    float    course_deg;     /* TODO verify true vs magnetic course            */
+    bool   valid;      /* true only if AT+QGPSLOC returned a usable fix */
+    double latitude;   /* decimal degrees, +N/-S */
+    double longitude;  /* decimal degrees, +E/-W */
 } GpsFix_t;
 
-/* Called once at boot, right after the modem is confirmed powered on. A true
- * no-op (issues zero AT traffic) when enable is false — this is what keeps
- * the feature fully inert while gps_enable is false in config, which is the
- * default and normal state for most gateways (not every unit has the GNSS
- * antenna physically connected). When enable is true, powers on the GNSS
- * engine (AT+QGPS=1) once so it can acquire/hold a fix in the background for
- * the rest of uptime; gps_poll() only ever queries afterwards, it never
- * re-powers the engine. Failure is logged and non-fatal, never blocks boot. */
+/* Called once at boot, after network_init() has brought up the modem's AT
+ * session for this boot (see the app_main comment on why it runs there and
+ * not right after modem power-on). A true no-op (issues zero AT traffic)
+ * when enable is false — this is what keeps the feature fully inert while
+ * gps_enable is false in config, which is the default and normal state for
+ * most gateways (not every unit has the GNSS antenna physically connected).
+ * When enable is true, powers on the GNSS engine (AT+QGPS=1) once so it can
+ * acquire/hold a fix in the background for the rest of uptime; gps_poll()
+ * only ever queries afterwards, it never re-powers the engine. Failure is
+ * logged and non-fatal, never blocks boot. */
 void gps_init(bool enable);
 
 /* Queries the current fix (AT+QGPSLOC). Returns false (leaving out->valid =

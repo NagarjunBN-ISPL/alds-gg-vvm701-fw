@@ -68,6 +68,12 @@ void di_task(void *param) {
      * exit the task cleanly instead. */
     if (!di_mutex) {
         ESP_LOGE(TAG, "di_mutex is NULL (heap OOM at boot?) — di_task exiting, DI monitoring disabled");
+        /* g_di_task_handle was set at task entry above, and sysmon_sample()
+         * calls uxTaskGetStackHighWaterMark() on it every report cycle —
+         * leaving it pointing at this task's about-to-be-freed TCB is a
+         * use-after-free that fires 5 minutes after the OOM, far from the
+         * cause. NULL it first; sysmon already guards the NULL case. */
+        g_di_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }

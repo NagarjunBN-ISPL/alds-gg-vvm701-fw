@@ -72,12 +72,9 @@
  * background from boot (gps_init); this only controls how often poll_gps()
  * re-reads AT+QGPSLOC. 20 -> every 20 poll cycles, 20*30s = 10 min. Kept as
  * its own constant (not reusing DIAG_CYCLE_INTERVAL) so the two can be tuned
- * independently.
- *
- * TEMPORARY DEBUG OVERRIDE (2026-07-17): set to 1 (poll every ~30s) while
- * field-testing a live antenna/fix outdoors — 10 min per attempt is too slow
- * to iterate on. REVERT TO 20 before this reaches any deployed gateway. */
-#define GPS_CYCLE_INTERVAL  1
+ * independently. (Field-verified working end-to-end on 2026-07-17 with a
+ * temporary 1-cycle debug override, since reverted back to 20.) */
+#define GPS_CYCLE_INTERVAL  20
 
 /* ── Connectivity recovery (layered escalation) ──────────────────────────── */
 #define MQTT_RECONNECT_RETRIES 5      /* L1: plain MQTT reconnect attempts   */

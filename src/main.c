@@ -9,6 +9,7 @@
 #include "genset.h"
 #include "di.h"
 #include "gps.h"
+#include "tls_ca.h"
 #include "diagnostics.h"
 #include "sysmon.h"
 
@@ -25,6 +26,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 static const char *TAG = "main";
 
@@ -335,10 +337,17 @@ static bool validate_suffixes(const DeviceConfig *c, char *err, size_t err_size)
         n++;
     }
 
-    /* Format: a non-empty custom suffix must be exactly 2 characters. */
+    /* Format: a non-empty custom suffix must be exactly 2 ALPHANUMERIC
+     * characters. Length alone isn't enough: the suffix is embedded verbatim
+     * into every JSON payload ("HW_ID":"<imei><sfx>") and into the rsp/
+     * kfactor MQTT topic strings — a quote corrupts every telemetry message
+     * from that unit into unparseable JSON, and a space/wildcard breaks the
+     * topic matching. */
     for (int i = 0; i < n; i++) {
-        if (sfx[i][0] && strlen(sfx[i]) != 2) {
-            snprintf(err, err_size, "%s suffix must be exactly 2 characters", label[i]);
+        if (sfx[i][0] && (strlen(sfx[i]) != 2 ||
+                          !isalnum((unsigned char)sfx[i][0]) ||
+                          !isalnum((unsigned char)sfx[i][1]))) {
+            snprintf(err, err_size, "%s suffix must be exactly 2 alphanumeric characters", label[i]);
             return false;
         }
     }
@@ -373,6 +382,20 @@ static bool streq_ci(const char *a, const char *b) {
         a++; b++;
     }
     return *a == *b;
+}
+
+/* Connectivity strings (APN + broker fields) are embedded verbatim inside
+ * quoted AT command arguments — AT+QICSGP (network.c), AT+QMTOPEN/AT+QMTCONN
+ * (mqtt.c). A double quote in any of them breaks the AT syntax outright, and
+ * an embedded CR/LF terminates the command line early — which would let a
+ * setconfig payload inject arbitrary AT commands after it. The connectivity
+ * trial would eventually roll such a push back, but reject it up front with
+ * a clear reason instead of burning a reboot + trial on a value that can
+ * never work (and to keep even a transient injection window closed). */
+static bool conn_str_ok(const char *s) {
+    for (; *s; s++)
+        if (*s == '"' || *s == '\\' || (unsigned char)*s < 0x20) return false;
+    return true;
 }
 
 /* Publish a config_failed status with a machine-readable reason. */
@@ -645,6 +668,14 @@ static void parse_setconfig(const char *json) {
                      "{\"HW_ID\":\"%s\",\"status\":\"config_failed\",\"reason\":\"bad_mqtt_broker_fields\"}",
                      g_imei);
             mqtt_publish(t_data, err);
+            return;
+        }
+        if (!conn_str_ok(nc.apn)       || !conn_str_ok(nc.apn_user)  ||
+            !conn_str_ok(nc.apn_pass)  || !conn_str_ok(nc.mqtt_host) ||
+            !conn_str_ok(nc.mqtt_user) || !conn_str_ok(nc.mqtt_pass) ||
+            !conn_str_ok(nc.mqtt_base_topic)) {
+            ESP_LOGW(TAG, "setconfig: rejected — quote/control char in a connectivity field");
+            setcfg_fail("invalid_chars_in_connectivity_fields");
             return;
         }
         nc.mqtt_port = (uint16_t)port_val;
@@ -950,7 +981,7 @@ static void poll_genset(const char *ts) {
  * like poll_genset()'s rs485_set_8n1/8e1_9600. */
 static void poll_gps(const char *ts) {
     static GpsFix_t fix;
-    static char payload[384];
+    static char payload[160];  /* {"HW_ID":..,"gps":{"lat":..,"lon":..},"TS":..} ~100 bytes worst case */
     bool ok = gps_poll(&fix);
     gps_build_payload(&fix, g_imei, ts, payload, sizeof(payload));
     bool pub = mqtt_publish(t_data, payload);
@@ -1261,6 +1292,15 @@ void app_main(void) {
     build_topics();
     mqtt_init(g_imei);
     mqtt_set_activity_cb(led_activity_pulse);   /* blink on every cloud push */
+
+    /* Upload the trusted root CA once, before the first TLS attempt of any
+     * kind — both mqtt_connect() and fota_download() assume this file
+     * already exists on the modem's UFS by the time they run. A failure
+     * here is logged but not fatal: mqtt_connect() will still try TLS with
+     * seclevel=1 pointing at a cacert file that doesn't exist, which the
+     * modem will reject — that's a loud, visible connect failure, safer
+     * than silently falling back to no validation. */
+    tls_ca_provision();
 
     /* Initial MQTT: try a few times; if the broker/session won't come up,
      * rebuild the whole network (PDP may be stale) before giving up. */
