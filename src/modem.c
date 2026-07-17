@@ -139,8 +139,21 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
               char *resp, size_t resp_size) {
     modem_flush();
 
+    /* snprintf returns the length it WANTED to write, not what fit. Passing
+     * that straight to uart_write_bytes() when the command overflows `line`
+     * would read PAST the end of the buffer and transmit whatever adjacent
+     * memory happens to follow it — a silent out-of-bounds read that leaks
+     * RAM contents onto the wire. No caller currently gets close (the longest
+     * is QMTCONN at ~511 bytes from mqtt.c's cmd[512]), but fota.c passes a
+     * cmd[640] buffer into here, so a future long command would land exactly
+     * on this landmine. Fail loudly instead. */
     static char line[520];
     int n = snprintf(line, sizeof(line), "%s\r\n", cmd);
+    if (n < 0 || n >= (int)sizeof(line)) {
+        ESP_LOGE(TAG, "modem_at: command too long (%d bytes, max %d) — dropped",
+                 n, (int)sizeof(line) - 1);
+        return false;
+    }
     log_at_cmd(cmd);
     uart_write_bytes(MODEM_UART, line, n);
 

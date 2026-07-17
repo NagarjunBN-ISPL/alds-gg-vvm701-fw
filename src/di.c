@@ -197,16 +197,21 @@ bool di_publish_buffer(const char *topic, const char *hw_id,
     bool all_ok = true;  /* stays true if nothing to drain (DI healthy, idle) */
     for (;;) {
         char entry_payload[256];
+        int  snap_head = -1;
         bool got = false;
 
         /* Peek the head entry WITHOUT removing it — it's only popped after a
          * confirmed successful publish below. Popping first (as this used to)
          * meant a failed publish permanently lost that DI transition: the
          * entry was already gone from the FIFO by the time mqtt_publish()
-         * told us it didn't make it to the broker. */
+         * told us it didn't make it to the broker.
+         *
+         * Snapshot the head INDEX as well, so the pop below can verify the
+         * FIFO hasn't shifted under us — see the race note there. */
         if (xSemaphoreTake(di_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (di_count > 0) {
-                strncpy(entry_payload, di_fifo[di_head].payload,
+                snap_head = di_head;
+                strncpy(entry_payload, di_fifo[snap_head].payload,
                         sizeof(entry_payload) - 1);
                 entry_payload[sizeof(entry_payload) - 1] = '\0';
                 got = true;
@@ -234,10 +239,21 @@ bool di_publish_buffer(const char *topic, const char *hw_id,
             break;
         }
 
-        /* Publish confirmed — now it's safe to actually pop the entry. */
+        /* Publish confirmed — now it's safe to actually pop the entry, but
+         * ONLY if di_head still points at what we published. The mutex is
+         * released across the publish above (it takes a while, and holding it
+         * would block di_task's 2 s sampling), so di_task can run in between.
+         * If the FIFO was full, di_task's overwrite branch advances di_head
+         * itself to evict the oldest entry — the very one we just published.
+         * Popping unconditionally then would advance di_head a SECOND time
+         * and silently discard an unpublished transition. Compare against the
+         * snapshot: if it moved, our entry is already gone and there is
+         * nothing to pop. */
         if (xSemaphoreTake(di_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            di_head = (di_head + 1) % DI_FIFO_SIZE;
-            if (di_count > 0) di_count--;
+            if (di_head == snap_head && di_count > 0) {
+                di_head = (di_head + 1) % DI_FIFO_SIZE;
+                di_count--;
+            }
             xSemaphoreGive(di_mutex);
         }
     }

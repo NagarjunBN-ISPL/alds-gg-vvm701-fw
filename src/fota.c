@@ -8,6 +8,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -91,12 +92,15 @@ static bool fota_download(const char *url, char *reason, size_t reason_size) {
      * gap the other two flags did. sni stays 1: needed for any host that
      * serves multiple certs off one IP (common on CDNs/S3-style storage).
      *
-     * This has NOT been tested against a real FOTA download yet — unlike
-     * the MQTT broker's cert (directly inspected, confirmed to chain
-     * through the CA this uploads), the actual FOTA host's certificate
-     * chain is unverified. If it's Let's Encrypt-issued this works
-     * unchanged; if some other CA issued it, downloads will start failing
-     * with a TLS/cert error until that CA gets added to tls_ca.c too. */
+     * VERIFIED on real hardware 2026-07-17 against two different FOTA hosts,
+     * both downloading successfully with validation active:
+     *   AWS S3  (…s3.ap-south-1.amazonaws.com) — Amazon RSA 2048 M01
+     *                                            -> Amazon Root CA 1
+     *   GitHub  (raw.githubusercontent.com)     — LE YR2 -> ISRG Root YR
+     *                                            -> ISRG Root X1 (4-deep,
+     *                                            cross-signed: also proves
+     *                                            ignoremulticertchainverify=0
+     *                                            handles real chains) */
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"sslversion\",%d,4", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ciphersuite\",%d,0XFFFF", FOTA_SSL_CTX);
@@ -265,8 +269,17 @@ static bool fota_flash(char *reason, size_t reason_size) {
         }
         snprintf(cmd, sizeof(cmd), "AT+QFREAD=%d,%d", fh, FOTA_CHUNK);
         modem_flush();
+        /* Same snprintf-return bounds hazard guarded in modem_at()/mqtt.c —
+         * this loop writes the UART directly rather than going through
+         * modem_at(), so it needs its own check. */
         char full[160];
         int n = snprintf(full, sizeof(full), "%s\r\n", cmd);
+        if (n < 0 || n >= (int)sizeof(full)) {
+            ESP_LOGE(TAG, "QFREAD cmd too long (%d) — aborting", n);
+            fota_set_reason(reason, reason_size, "read_cmd_too_long");
+            ok = false;
+            break;
+        }
         uart_write_bytes(MODEM_UART, full, n);
 
         /* Read header line: "CONNECT <actual_bytes>\r\n" */
@@ -275,6 +288,13 @@ static bool fota_flash(char *reason, size_t reason_size) {
         int  actual = 0;
         int64_t dl = esp_timer_get_time() + 10000000LL;
         while (esp_timer_get_time() < dl) {
+            /* Feed the WDT: this loop reads the UART directly instead of via
+             * modem_at() (which feeds internally), and can sit here for the
+             * full 10 s. Harmless while FOTA ran with the WDT detached, but
+             * the WDT now stays armed for the device's whole life — an
+             * unfed 10 s window is still far inside the 120 s timeout, but
+             * feeding here keeps the margin honest rather than accidental. */
+            if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
             uint8_t ch;
             if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(20)) > 0) {
                 if (hi < (int)sizeof(hdr) - 1) hdr[hi++] = ch;
@@ -307,6 +327,7 @@ static bool fota_flash(char *reason, size_t reason_size) {
         int got = 0;
         dl = esp_timer_get_time() + 15000000LL;
         while (got < actual && esp_timer_get_time() < dl) {
+            if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
             int r = uart_read_bytes(MODEM_UART, chunk + got,
                                     actual - got, pdMS_TO_TICKS(200));
             if (r > 0) got += r;

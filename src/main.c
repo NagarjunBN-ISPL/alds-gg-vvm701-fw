@@ -750,8 +750,13 @@ static void handle_msg(const char *topic, const char *payload) {
          * a successful FOTA restarts the device anyway. */
         static char s_fota_blocked[600] = "";
         char fota_msg[128];
-        if (s_fota_blocked[0] &&
-            strncmp(payload, s_fota_blocked, strlen(s_fota_blocked)) == 0) {
+        /* strcmp, not strncmp(payload, blocked, strlen(blocked)): that form
+         * returns 0 whenever payload merely STARTS WITH the blocked URL, so a
+         * genuinely different, never-tried firmware whose URL shares a prefix
+         * — ".../fw_v1.0.bin" vs ".../fw_v1.0.bin.bak", or "/v1.1" vs "/v1.10"
+         * — was refused as "known bad". The intent (and the comment above) is
+         * an EXACT repeat of the URL that just failed. */
+        if (s_fota_blocked[0] && strcmp(payload, s_fota_blocked) == 0) {
             ESP_LOGW(TAG, "FOTA: identical URL already failed — skipping "
                           "(clear the retained message or publish a new URL)");
             snprintf(fota_msg, sizeof(fota_msg),
@@ -776,10 +781,14 @@ static void handle_msg(const char *topic, const char *payload) {
         mqtt_disconnect();
         vTaskDelay(pdMS_TO_TICKS(1000));
 
+        /* WDT stays armed across FOTA too. Every long wait inside
+         * fota_perform() feeds it: the HTTP GET / READFILE waits go through
+         * modem_read_until() (feeds per read iteration), and fota_flash()'s
+         * two raw UART loops now feed explicitly. The whole flash loop is
+         * additionally bounded by FOTA_FLASH_MAX_MS. A download that genuinely
+         * wedges the UART driver should reboot the device, not strand it. */
         char fota_reason[48] = "unknown";
-        esp_task_wdt_delete(NULL);
         bool fota_ok = fota_perform(payload, t_data, fota_reason, sizeof(fota_reason));
-        esp_task_wdt_add(NULL);
 
         led_blink_stop();   /* FOTA end — back to per-push blinks / reboot */
 
@@ -1021,13 +1030,22 @@ static void check_daily_reboot(const char *ts) {
 static void mqtt_reconnect_if_needed(void) {
     if (mqtt_is_connected()) return;
     ESP_LOGW(TAG, "MQTT offline — reconnecting");
-    esp_task_wdt_delete(NULL);
+    /* WDT deliberately stays ARMED through the whole ladder. This function
+     * used to delete it, leaving up to ~25 minutes (5 QMTOPEN retries + 3
+     * network rebuilds with 120 s registration waits + 3 modem power-cycles)
+     * completely unmonitored — the longest blind window in the firmware, and
+     * it ran on every connectivity blip. Every blocking call below feeds the
+     * WDT internally (modem_at/modem_read_until reset it on each read
+     * iteration); the explicit resets here cover the bare vTaskDelay backoffs
+     * and modem_hard_reset()'s PWRKEY delays. */
 
     for (int i = 0; i < MQTT_RECONNECT_RETRIES; i++) {
-        if (i > 0) vTaskDelay(pdMS_TO_TICKS(5000));
+        if (i > 0) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            esp_task_wdt_reset();
+        }
         if (mqtt_connect()) {
             subscribe_all();
-            esp_task_wdt_add(NULL);
             esp_task_wdt_reset();
             return;
         }
@@ -1035,11 +1053,13 @@ static void mqtt_reconnect_if_needed(void) {
 
     ESP_LOGW(TAG, "[RECOVER L2] Rebuilding network ...");
     for (int i = 0; i < NET_BRINGUP_RETRIES; i++) {
-        if (i > 0) vTaskDelay(pdMS_TO_TICKS(10000));
+        if (i > 0) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            esp_task_wdt_reset();
+        }
         if (network_init() && mqtt_connect()) {
             subscribe_all();
             ESP_LOGI(TAG, "[RECOVER L2] OK");
-            esp_task_wdt_add(NULL);
             esp_task_wdt_reset();
             return;
         }
@@ -1048,10 +1068,10 @@ static void mqtt_reconnect_if_needed(void) {
     ESP_LOGE(TAG, "[RECOVER L3] Power-cycling modem ...");
     for (int i = 0; i < MODEM_PWRCYCLE_MAX; i++) {
         modem_hard_reset();
+        esp_task_wdt_reset();
         if (network_init() && mqtt_connect()) {
             subscribe_all();
             ESP_LOGI(TAG, "[RECOVER L3] OK on cycle %d", i + 1);
-            esp_task_wdt_add(NULL);
             esp_task_wdt_reset();
             return;
         }
@@ -1226,16 +1246,38 @@ void app_main(void) {
     esp_task_wdt_add(NULL);
     esp_task_wdt_reset();
 
+    /* ── The task WDT stays armed from here for the device's whole life ────
+     * This block, network bring-up, MQTT connect and FOTA all used to run
+     * with the WDT DELETED, on the reasoning that they're legitimately slow
+     * and shouldn't trip a false timeout. That reasoning was wrong, and it
+     * was the single worst hang risk in the firmware: deleting the WDT
+     * doesn't pause monitoring, it removes it. A UART driver deadlock, a
+     * kernel mutex starvation, or a silicon glitch anywhere inside those
+     * windows (up to ~25 min across the recovery ladder) left the device
+     * hung forever, unrecoverable without someone physically power-cycling
+     * a device at a fuel station.
+     *
+     * Keeping it armed is safe because nothing here blocks anywhere near the
+     * 120 s timeout WITHOUT feeding: modem_at()/modem_read_until() reset the
+     * WDT at the top of every read iteration (so they feed even when the
+     * modem is silent), and the longest unfed stretch anywhere is
+     * modem_hard_reset()'s ~10.2 s of PWRKEY delays — a 12x margin. Every
+     * raw UART loop that doesn't go through modem_at() (fota.c's chunk
+     * reader, dispenser.c's rs485_xfer) now feeds explicitly too.
+     *
+     * The result is what we actually want: a real hang trips the WDT within
+     * 120 s and reboots, while normal slow operations are unaffected. */
+
     /* Modem power-on: modem_power_on() already probes AT and pulses PWRKEY.
      * If it still fails, hard power-cycle a couple of times before rebooting
      * — a wedged modem won't recover from an ESP reset alone (it stays
      * powered), so the reboot loop must escalate to PWRKEY. */
-    esp_task_wdt_delete(NULL);
     {
         bool modem_ok = modem_power_on();
         for (int i = 0; !modem_ok && i < MODEM_PWRCYCLE_MAX; i++) {
             ESP_LOGW(TAG, "Modem unresponsive — hard reset %d/%d", i + 1, MODEM_PWRCYCLE_MAX);
             modem_hard_reset();
+            esp_task_wdt_reset();
             modem_ok = modem_power_on();
         }
         if (!modem_ok) {
@@ -1255,6 +1297,7 @@ void app_main(void) {
             ESP_LOGW(TAG, "Network bring-up retry %d/%d — hard-resetting modem",
                      i + 1, NET_BRINGUP_RETRIES);
             modem_hard_reset();
+            esp_task_wdt_reset();
         }
         net_ok = network_init();
     }
@@ -1272,7 +1315,6 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         esp_restart();
     }
-    esp_task_wdt_add(NULL);
     esp_task_wdt_reset();
 
     /* GNSS power-on — deliberately AFTER network_init() rather than right
@@ -1303,17 +1345,19 @@ void app_main(void) {
     tls_ca_provision();
 
     /* Initial MQTT: try a few times; if the broker/session won't come up,
-     * rebuild the whole network (PDP may be stale) before giving up. */
-    esp_task_wdt_delete(NULL);
+     * rebuild the whole network (PDP may be stale) before giving up.
+     * WDT stays armed throughout — see the note above the modem power-on. */
     for (int attempts = 0; attempts < MQTT_RECONNECT_RETRIES && !mqtt_is_connected(); attempts++) {
         if (mqtt_connect()) break;
         ESP_LOGW(TAG, "MQTT retry %d/%d", attempts + 1, MQTT_RECONNECT_RETRIES);
         vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_task_wdt_reset();
     }
     if (!mqtt_is_connected()) {
         ESP_LOGW(TAG, "MQTT down — rebuilding network before final retry");
         for (int i = 0; i < NET_BRINGUP_RETRIES && !mqtt_is_connected(); i++) {
             modem_hard_reset();
+            esp_task_wdt_reset();
             if (network_init() && mqtt_connect()) break;
         }
     }
@@ -1339,7 +1383,6 @@ void app_main(void) {
         ESP_LOGI(TAG, "connectivity change confirmed — now permanent");
     }
 
-    esp_task_wdt_add(NULL);
     esp_task_wdt_reset();
 
     led_blink_stop();   /* boot done (MQTT up) — stop the boot blink */
@@ -1359,9 +1402,18 @@ void app_main(void) {
         snprintf(rb, sizeof(rb),
                  "{\"HW_ID\":\"%s\",\"status\":\"connectivity_rollback\","
                  "\"reason\":\"new_settings_unreachable\"}", g_imei);
-        mqtt_publish(t_data, rb);
-        g_cfg.conn_rollback_notify = false;
-        nvs_config_save(&g_cfg);
+        /* Only clear the flag on a CONFIRMED publish — same rule diagnostics.c
+         * already applies to its counters. The link has only just come up here
+         * and is at its least reliable; clearing unconditionally (as this used
+         * to) meant one failed publish silently swallowed the only notice the
+         * cloud ever gets that a connectivity push was rejected and reverted.
+         * Left set, it simply retries on the next boot. */
+        if (mqtt_publish(t_data, rb)) {
+            g_cfg.conn_rollback_notify = false;
+            nvs_config_save(&g_cfg);
+        } else {
+            ESP_LOGW(TAG, "rollback notice publish failed — retrying next boot");
+        }
     }
 
     if (g_cfg.di_enable) {

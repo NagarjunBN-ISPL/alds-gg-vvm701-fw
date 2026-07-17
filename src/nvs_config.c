@@ -285,10 +285,26 @@ bool nvs_config_save(const DeviceConfig *cfg) {
         }
     }
 
+    /* Don't force a commit of a known-partial write. The dangerous shape is a
+     * connectivity change where (say) "apn" lands but "conn_pend" doesn't:
+     * the device would boot on a new, untried APN with the trial/rollback
+     * flag clear — the exact safety net that exists to stop a bad APN
+     * stranding a field unit. Skipping the commit does NOT guarantee the
+     * successful writes are discarded (NVS may flush on its own schedule;
+     * commit only guarantees they ARE written), so this narrows the window
+     * rather than closing it — but forcing the flush of a state we know is
+     * inconsistent is strictly worse than not. The false return is what
+     * actually protects the caller: parse_setconfig() reports
+     * nvs_save_failed and does NOT reboot. */
+    if (!ok) {
+        ESP_LOGE(TAG, "NVS write error — skipping commit to avoid persisting a partial config");
+        nvs_close(h);
+        return false;
+    }
+
     esp_err_t err = nvs_commit(h);
     nvs_close(h);
     if (err != ESP_OK) { ESP_LOGE(TAG, "NVS commit failed"); return false; }
-    if (!ok) { ESP_LOGE(TAG, "Config saved with errors — one or more keys not updated"); return false; }
     ESP_LOGI(TAG, "Config saved");
     return true;
 }

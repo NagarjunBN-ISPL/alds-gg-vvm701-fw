@@ -426,8 +426,17 @@ bool mqtt_publish(const char *topic, const char *payload) {
 
     /* Send command, wait for '>' prompt, rescue any +QMTRECV URCs */
     modem_flush();
+    /* Same snprintf-return-is-not-what-fit hazard guarded in modem_at() —
+     * this path bypasses modem_at() and writes the UART directly, so it needs
+     * its own bounds check or an over-long command reads past `full` and
+     * transmits adjacent RAM. */
     static char full[600];
     int n = snprintf(full, sizeof(full), "%s\r\n", cmd);
+    if (n < 0 || n >= (int)sizeof(full)) {
+        ESP_LOGE(TAG, "publish cmd too long (%d bytes, max %d) — dropped",
+                 n, (int)sizeof(full) - 1);
+        return pub_result(false, topic);
+    }
     uart_write_bytes(MODEM_UART, full, n);
 
     static char buf[PAYLOAD_MAX + 300];

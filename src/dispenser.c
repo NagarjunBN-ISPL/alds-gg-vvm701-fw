@@ -67,6 +67,13 @@ static int rs485_xfer(const uint8_t *cmd, size_t cmd_len,
     while ((uint32_t)(esp_timer_get_time() / 1000) - t0 < RS485_RECV_TIMEOUT_MS
            && esp_timer_get_time() < hard_dl
            && got < (int)resp_max) {
+        /* Feed the WDT inside the loop, matching modem_at()'s pattern. The
+         * hard cap above bounds this at RS485_RECV_TIMEOUT_MS*3 = 6 s, well
+         * inside the 120 s WDT — but that safety is arithmetic coincidence,
+         * not design: raising RS485_RECV_TIMEOUT_MS past ~40 s would silently
+         * make this loop able to trip the watchdog. Feeding here makes the
+         * loop safe by construction regardless of that constant. */
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(RS485_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
             resp[got++] = ch;
