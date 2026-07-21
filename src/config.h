@@ -94,22 +94,26 @@
 #define DU_BLUESKY_MAX  6
 
 /* ── Radar ─────────────────────────────────────────────────────────────────
- * Ztech and Pantech are standard Modbus RTU on the shared RS485 bus with
- * fixed, non-overlapping slave ranges: Ztech = 4..4+N-1 (4..7), Pantech =
- * 8..8+N-1 (8..11). RADAR_MAX caps each type independently at 4 tanks so the
- * two ranges can never meet — if you raise RADAR_MAX again, PANTECH_SLAVE_BASE
- * MUST move to at least ZTECH_SLAVE_BASE + RADAR_MAX, or the two ranges
- * overlap and the bus crosstalk guard in genset.c/radar.c's slave-echo check
- * can no longer tell a Ztech reply from a Pantech one. (BlueSky nozzle
- * addresses 4-6 numerically overlap these but use different framing/protocol
- * and are time-multiplexed on the bus, so there is no real collision there.)
- * Same "actual count, not the cap, drives every runtime loop" property as
- * DU_BLUESKY_MAX above — the genset/radar slave-collision check (main.c,
- * nvs_config.c) is already computed from these macros dynamically, so it
- * stays correct automatically when these change. */
+ * Ztech and Pantech are standard Modbus RTU on the shared RS485 bus. Slave
+ * addressing matches the convention actually wired at outlets: Ztech =
+ * 4..4+N-1 (normally 4,5), Pantech = 6..6+N-1 (normally 6,7) — confirmed
+ * 2026-07-20 against real field installs. (An earlier PANTECH_SLAVE_BASE=8
+ * was never correct against any real outlet; it was a guess that happened to
+ * leave 8-11 free, not a documented convention.)
+ *
+ * Unlike the old 8-11 spacing, these two ranges are NOT structurally
+ * non-overlapping at RADAR_MAX: ztechCount >= 3 pushes Ztech's range onto
+ * slave 6, which is Pantech tank 1's fixed address. This only matters if a
+ * station runs more than the normal 2 Ztech tanks AND has Pantech enabled at
+ * the same time — the field convention (2 + 2) never hits it. Because the
+ * macros no longer guarantee non-overlap by themselves, parse_setconfig()
+ * and nvs_config_validate() both actively reject/clamp ztech_count/
+ * pantech_count combinations that would collide, the same way they already
+ * guard genset_slave against landing inside either radar range. If you ever
+ * change either base or RADAR_MAX, re-check those two guards. */
 #define RADAR_MAX          4
 #define ZTECH_SLAVE_BASE   4
-#define PANTECH_SLAVE_BASE 8
+#define PANTECH_SLAVE_BASE 6
 
 /* ── Genset ─────────────────────────────────────────────────────────────── */
 #define GENSET_OFF          0

@@ -570,6 +570,23 @@ static void parse_setconfig(const char *json) {
         nc.ztech_count   = (uint8_t)ztech;
         nc.pantech_count = (uint8_t)pantech;
     }
+
+    /* Ztech and Pantech ranges are adjacent (4.. / 6..), not spaced apart —
+     * ztechCount >= 3 pushes Ztech's range onto slave 6, Pantech tank 1's
+     * fixed address. Reject rather than let both types poll the same slave. */
+    if (nc.ztech_count > 0 && nc.pantech_count > 0 &&
+        ZTECH_SLAVE_BASE + nc.ztech_count > PANTECH_SLAVE_BASE) {
+        ESP_LOGW(TAG, "setconfig: rejected — ztechCount %u pushes Ztech range onto Pantech slave %u",
+                 nc.ztech_count, PANTECH_SLAVE_BASE);
+        char err[192];
+        snprintf(err, sizeof(err),
+                 "{\"HW_ID\":\"%s\",\"status\":\"config_failed\","
+                 "\"reason\":\"ztechCount %u and pantechCount %u produce overlapping radar slave ranges\"}",
+                 g_imei, nc.ztech_count, nc.pantech_count);
+        mqtt_publish(t_data, err);
+        return;
+    }
+
     nc.genset_type   = (uint8_t) json_get_int(json,"gensetType", nc.genset_type);
     nc.genset_model  = (uint8_t) json_get_int(json,"gensetModel",nc.genset_model);
     nc.genset_slave  = (uint8_t) json_get_int(json,"gensetSlave",nc.genset_slave);

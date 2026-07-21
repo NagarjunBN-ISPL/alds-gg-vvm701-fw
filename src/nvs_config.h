@@ -4,9 +4,9 @@
 #include "config.h"
 
 typedef struct {
-    uint8_t  du_bluesky_count;  /* 0-3                              */
-    uint8_t  ztech_count;       /* 0-2 (slaves 4,5)                 */
-    uint8_t  pantech_count;     /* 0-2 (slaves 6,7)                 */
+    uint8_t  du_bluesky_count;  /* 0-6 (DU_BLUESKY_MAX)              */
+    uint8_t  ztech_count;       /* 0-4 alone (slaves 4-7); 0-2 if pantech_count>0 (slaves 4,5) */
+    uint8_t  pantech_count;     /* 0-4 (slaves 6-9); ztech capped to 2 whenever this is >0 */
     uint8_t  genset_type;       /* 0=Off,1=SEDEMAC                  */
     uint8_t  genset_model;      /* 0=GC1211,1=GC1111,2=SGC120       */
     uint8_t  genset_slave;      /* Modbus slave, default 10         */

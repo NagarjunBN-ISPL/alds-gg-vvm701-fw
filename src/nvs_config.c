@@ -145,11 +145,20 @@ bool nvs_config_load(DeviceConfig *cfg) {
     nvs_close(h);
 
     /* Clamp all fields to valid ranges — guards against NVS corruption.
-     * Ztech (slaves 4,5) and Pantech (slaves 6,7) occupy fixed, non-
-     * overlapping ranges, so each type is capped independently at RADAR_MAX. */
+     * Ztech (normally slaves 4,5) and Pantech (normally slaves 6,7) are
+     * capped independently at RADAR_MAX here, but the ranges are adjacent,
+     * not spaced apart — a stale/corrupt ztech_count >= 3 combined with any
+     * pantech_count > 0 would push Ztech's range onto Pantech tank 1's fixed
+     * slave (6). Checked explicitly below rather than assumed. */
     if (cfg->du_bluesky_count > DU_BLUESKY_MAX) cfg->du_bluesky_count = DU_BLUESKY_MAX;
     if (cfg->ztech_count      > RADAR_MAX)      cfg->ztech_count      = RADAR_MAX;
     if (cfg->pantech_count    > RADAR_MAX)      cfg->pantech_count    = RADAR_MAX;
+    if (cfg->ztech_count > 0 && cfg->pantech_count > 0 &&
+        ZTECH_SLAVE_BASE + cfg->ztech_count > PANTECH_SLAVE_BASE) {
+        ESP_LOGW(TAG, "ztech_count %u collides with pantech range at slave %u — disabling pantech",
+                 cfg->ztech_count, PANTECH_SLAVE_BASE);
+        cfg->pantech_count = 0;
+    }
     if (cfg->genset_type > GENSET_SEDEMAC) cfg->genset_type = GENSET_OFF;
     if (cfg->genset_model > GENSET_MODEL_MAX) cfg->genset_model = GENSET_MODEL_GC1211;
     if (cfg->genset_slave < 1 || cfg->genset_slave > 247) cfg->genset_slave = GENSET_SLAVE_DEFAULT;
