@@ -201,6 +201,7 @@ static void build_topics(void) {
 static void mqtt_reconnect_if_needed(void);
 static void poll_incoming_mqtt(void);
 
+
 static void subscribe_all(void) {
     mqtt_subscribe(t_update);
     mqtt_subscribe(t_update_bcast);
@@ -295,13 +296,6 @@ static const char * const s_setcfg_known_keys[] = {
  * else the auto-generated B<n>/Z<n>/P<n> pattern from build_hw_ids())
  * must be unique, or two pieces of equipment publish under the same HW_ID
  * and become indistinguishable downstream. */
-/* Upper bound on the number of active equipment items this function can list:
- * every BlueSky + both radar types at full cap + genset + DI. Sizing the
- * scratch arrays from this (rather than a magic constant) makes an overflow
- * impossible by construction if DU_BLUESKY_MAX/RADAR_MAX are ever raised —
- * which config.h explicitly invites. */
-#define SFX_MAX_ITEMS (DU_BLUESKY_MAX + 2 * RADAR_MAX + 2)
-
 static bool validate_suffixes(const DeviceConfig *c, char *err, size_t err_size) {
     /* Static rather than stack-local: this trio is ~770 bytes, and this
      * function sits at the bottom of a deep call chain (app_main -> ... ->
@@ -310,9 +304,9 @@ static bool validate_suffixes(const DeviceConfig *c, char *err, size_t err_size)
      * ever called sequentially from the single main task, never re-entrantly
      * or concurrently, so static is safe here and trades BSS (abundant) for
      * stack headroom (the scarcer resource on this call path). */
-    static const char *sfx[SFX_MAX_ITEMS];
-    static char        label[SFX_MAX_ITEMS][12];
-    static char        auto_sfx[SFX_MAX_ITEMS][8];
+    static const char *sfx[32];
+    static char        label[32][12];
+    static char        auto_sfx[32][8];
     int         n = 0;
 
     for (int i = 0; i < c->du_bluesky_count; i++) {
