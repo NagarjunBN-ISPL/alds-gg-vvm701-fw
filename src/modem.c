@@ -368,15 +368,19 @@ bool modem_get_imei(char *imei, size_t size) {
     char resp[128] = {0};
     if (!modem_at("AT+CGSN", "OK", 5000, resp, sizeof(resp))) return false;
 
-    /* Find a 15-digit run of digits */
+    /* Find a run of at least 15 digits and take the first 15 as the IMEI.
+     * >= 15 (not == 15) so a module answering AT+CGSN with the 17-digit
+     * IMEISV (IMEI + 2-digit software version) still yields a valid IMEI —
+     * the IMEI is the leading 15 digits — instead of failing the run match
+     * and falling back to the all-zero placeholder (which would collide
+     * HW_IDs and command topics across every such unit). */
     for (char *p = resp; *p; p++) {
         if (*p >= '0' && *p <= '9') {
             size_t len = 0;
             while (p[len] >= '0' && p[len] <= '9') len++;
-            if (len == 15) {
-                size_t copy = (len < size - 1) ? len : size - 1;
-                memcpy(imei, p, copy);
-                imei[copy] = '\0';
+            if (len >= 15 && size > 15) {
+                memcpy(imei, p, 15);
+                imei[15] = '\0';
                 return true;
             }
             p += len - 1;

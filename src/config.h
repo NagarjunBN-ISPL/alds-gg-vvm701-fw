@@ -66,15 +66,17 @@
 #define RADAR_CYCLE_INTERVAL  2
 
 /* ── GPS/GNSS cadence ──────────────────────────────────────────────────────
- * VVM701 is a stationary fuel-station asset — its position never changes
- * after installation, so there's no value in re-querying the fix on the same
- * cadence as mobile telemetry. The GNSS engine runs continuously in the
- * background from boot (gps_init); this only controls how often poll_gps()
- * re-reads AT+QGPSLOC. 20 -> every 20 poll cycles, 20*30s = 10 min. Kept as
- * its own constant (not reusing DIAG_CYCLE_INTERVAL) so the two can be tuned
- * independently. (Field-verified working end-to-end on 2026-07-17 with a
- * temporary 1-cycle debug override, since reverted back to 20.) */
-#define GPS_CYCLE_INTERVAL  20
+ * Controls how often poll_gps() re-reads AT+QGPSLOC and publishes. The GNSS
+ * engine runs continuously in the background from boot (gps_init); this only
+ * gates the read/publish rate. N -> every N poll cycles (PUBLISH_INTERVAL_MS
+ * each), so 1 = every cycle (~30s), 20 = ~10 min. Kept as its own constant
+ * (not reusing DIAG_CYCLE_INTERVAL) so the two can be tuned independently.
+ *
+ * Set to 1 (publish GPS every ~30s) per request 2026-07-21. Note: the asset
+ * is stationary, so the coordinate is essentially unchanging — a 30s cadence
+ * is far more frequent than the position warrants; raise this back toward 20
+ * if the extra fleet-wide GPS traffic becomes a concern. */
+#define GPS_CYCLE_INTERVAL  1
 
 /* ── Connectivity recovery (layered escalation) ──────────────────────────── */
 #define MQTT_RECONNECT_RETRIES 5      /* L1: plain MQTT reconnect attempts   */
