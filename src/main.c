@@ -661,6 +661,40 @@ static void parse_setconfig(const char *json) {
     bool tls_present   = json_has_key(json, "mqttTls");
     bool tls_val       = tls_present ? json_get_bool(json, "mqttTls", nc.mqtt_tls) : nc.mqtt_tls;
 
+    /* Resolve mqttPort/mqttTls into nc now — port_val/tls_val already default to
+     * the current values when their keys are absent, so this is a no-op unless
+     * they were actually sent. Doing it here (rather than only inside the
+     * connectivity block below) lets the duplicate-config check see the fully
+     * resolved effective config. */
+    nc.mqtt_port = (uint16_t)port_val;
+    nc.mqtt_tls  = tls_val;
+
+    /* ── Retained / duplicate setconfig guard ────────────────────────────────
+     * If the fully-parsed config is byte-identical to the live one, this is
+     * almost certainly a RETAINED setconfig the broker re-delivers on every
+     * reconnect (the FOTA path guards the same hazard via s_fota_blocked).
+     * Saving + rebooting on it would loop the device forever: reboot →
+     * reconnect → broker re-delivers the retained message → reboot. Acknowledge
+     * it (so the cloud still sees success) but do NOT save or reboot.
+     *
+     * memcmp is exact and fail-safe here: a genuinely different value always
+     * makes it non-zero, so a real change can NEVER be skipped; at worst struct
+     * padding makes it miss this optimization and fall through to the normal
+     * save+reboot path. nc's _bak/conn_pending/conn_rollback_notify are still
+     * copied verbatim from g_cfg at this point (the connectivity block below is
+     * the first thing to touch them), so they compare equal and don't taint the
+     * result. */
+    if (memcmp(&nc, &g_cfg, sizeof(nc)) == 0) {
+        ESP_LOGI(TAG, "setconfig: no effective change vs. live config — "
+                      "ack without save/reboot (retained or duplicate?)");
+        char ok[128];
+        snprintf(ok, sizeof(ok),
+                 "{\"HW_ID\":\"%s\",\"status\":\"config_successful\",\"fw\":\"%s\"}",
+                 g_imei, FW_VERSION);
+        mqtt_publish(t_data, ok);
+        return;
+    }
+
     bool apn_changed  = apn_present || auser_present || apass_present;
     bool mqtt_changed = host_present || user_present || pass_present ||
                         topic_present || port_present || tls_present;
@@ -696,8 +730,8 @@ static void parse_setconfig(const char *json) {
             setcfg_fail("invalid_chars_in_connectivity_fields");
             return;
         }
-        nc.mqtt_port = (uint16_t)port_val;
-        nc.mqtt_tls  = tls_val;
+        /* mqtt_port/mqtt_tls are already resolved into nc above (before the
+         * duplicate-config guard), so they don't need re-applying here. */
         /* Stage the whole current connectivity set as the rollback target —
          * APN and broker share one pending flag, so a trial failure reverts
          * both together (see nvs_config.h). */
@@ -1174,8 +1208,13 @@ static void run_poll_cycle(void) {
 
     if (++g_diag_cycle >= DIAG_CYCLE_INTERVAL) {
         modem_get_timestamp(ts, sizeof(ts));
-        diag_publish(g_imei, ts, t_data);
+        /* sysmon MUST publish before diag: diag_publish() zeroes the shared
+         * pub_ok/pub_fail/loop_max_ms window counters on a successful publish,
+         * so if it ran first sysmon would read (and report) all-zero for those
+         * three fields every cycle. sysmon only reads the counters; diag is the
+         * one that reports-and-clears, so it goes last. */
         sysmon_publish(g_imei, ts, t_data);
+        diag_publish(g_imei, ts, t_data);
         g_diag_cycle = 0;
     }
 
