@@ -18,15 +18,23 @@ typedef struct {
 /* RS485 UART must already be installed before calling this. */
 void du_rs485_set_bluesky_mode(void);   /* 8E1 9600 */
 
-/* unit_idx is 0-based (0 = first BlueSky unit). Each BlueSky unit occupies 2
- * RS485 addresses (unit_idx*2+1, unit_idx*2+2). */
-void du_poll_bluesky_unit(int unit_idx, DuNozzle_t *out_a, DuNozzle_t *out_b);
+/* Poll ONE nozzle at RS485 address `addr` (1-based, global across the bus).
+ * A BlueSky unit occupies two consecutive addresses: unit_idx*2+1 and
+ * unit_idx*2+2, so DU1 = 1,2 · DU2 = 3,4 · DU3 = 5,6 ...
+ *
+ * Deliberately per-nozzle rather than per-unit: the caller publishes each
+ * nozzle the instant its read completes, so NZ1's data reaches the cloud while
+ * NZ2 is still being read instead of waiting ~10 s for its partner. This also
+ * matches the BlueSky protocol doc, which specifies one JSON message per
+ * nozzle, and is the shape an event-driven (idle→busy) capture needs, since
+ * two nozzles never finish a sale at the same moment. */
+void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *out);
 
-/* Build JSON payload for one DU into buf (caller provides HW_ID and TS). */
-void du_build_payload(const DuNozzle_t *nz_a, const DuNozzle_t *nz_b,
-                      int label_a, int label_b,   /* global nozzle numbers */
-                      const char *hw_id, const char *ts,
-                      char *buf, size_t buf_size);
+/* Build the JSON payload for a SINGLE nozzle (caller provides HW_ID and TS).
+ * `label` is the global nozzle number (1-based) used as the JSON key. */
+void du_build_nozzle_payload(const DuNozzle_t *nz, int label,
+                             const char *hw_id, const char *ts,
+                             char *buf, size_t buf_size);
 
 /* Convert raw bytes to comma-separated hex string. */
 void du_bytes_to_hex(const uint8_t *data, int len, char *out, size_t out_size);

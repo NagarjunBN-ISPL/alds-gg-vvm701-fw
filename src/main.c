@@ -946,29 +946,67 @@ static void check_post_ota(void) {
     }
 }
 
-/* ── Poll dispensers ──────────────────────────────────────────────────── */
-static void poll_dispensers(const char *ts) {
-    /* Worst case (both nozzles present, all 4 fields at DU_RESP_MAX=32 bytes
-     * each) is ~920 bytes — 2048 matches mqtt.c's PAYLOAD_MAX for headroom,
-     * on top of the clamp_pos guard in du_build_payload(). */
-    static char     payload[2048];
-    static DuNozzle_t nz_a, nz_b;
+/* ── Poll dispensers ──────────────────────────────────────────────────────
+ * One nozzle at a time: read it, timestamp it, publish it, move on.
+ *
+ * Two deliberate changes from the previous per-DU batching:
+ *
+ *  1. Each nozzle is published the moment its own read completes instead of
+ *     waiting for its partner. On a 2-DU station that gets NZ1's data to the
+ *     cloud ~10 s sooner and NZ3's ~10 s sooner. It also matches the BlueSky
+ *     protocol doc (which specifies one JSON message per nozzle) and what the
+ *     fleet's older firmware already emits, and it is the shape an
+ *     event-driven capture needs — two nozzles never finish a sale together.
+ *
+ *  2. TS is taken PER NOZZLE, at the instant that nozzle was read, rather than
+ *     once at cycle start and stamped onto everything. Previously the last
+ *     nozzle of a cycle carried a timestamp ~40 s older than its own reading.
+ *     That matters because the cloud reconstructs each sale by differencing
+ *     consecutive totalizer samples and orders those samples by TS. This is
+ *     only affordable because timestamps now come from the RTC (see modem.h) —
+ *     as a modem AT round-trip it would have cost 4 extra calls per cycle.
+ *
+ * poll_incoming_mqtt() runs after every publish rather than every DU, so a
+ * queued setconfig/FOTA/rsp command is serviced within about one nozzle read
+ * of arriving. */
+static void poll_dispensers(void) {
+    /* One nozzle with all 4 fields at DU_RESP_MAX=32 bytes each is ~500 bytes
+     * worst case, so 1024 keeps ~2x headroom on top of the clamp_pos guard in
+     * du_build_nozzle_payload() and stays well under the modem's ~1400-byte
+     * QMTPUBEX ceiling (MQTT_MODEM_PAYLOAD_SAFE_MAX). */
+    static char       payload[1024];
+    static DuNozzle_t nz;
+    char ts[32];
 
-    /* Aggregated across all units polled THIS cycle via AND — a plain
-     * assignment inside the loop (as this used to be) left du_ok reflecting
-     * only whichever unit happened to be polled LAST, so e.g. DU1 and DU2
-     * both silently offline while DU3 works would still report du_ok:true. */
+    /* AND across every nozzle polled THIS cycle rather than last-one-wins — a
+     * dead nozzle hidden behind a healthy one would otherwise report ok. */
     bool all_ok = true;
+
     for (int i = 0; i < g_cfg.du_bluesky_count; i++) {
-        rs485_set_8e1_9600();
-        du_poll_bluesky_unit(i, &nz_a, &nz_b);
-        rs485_set_8n1(9600);
-        du_build_payload(&nz_a, &nz_b, i * 2 + 1, i * 2 + 2,
-                         g_hw_bs[i], ts, payload, sizeof(payload));
-        bool ok = mqtt_publish(t_data, payload);
-        if (ok) g_diag.pub_ok++; else g_diag.pub_fail++;
-        all_ok &= ok;
-        poll_incoming_mqtt();  /* stay responsive to setconfig/FOTA mid-poll */
+        for (int half = 0; half < 2; half++) {
+            int     label = i * 2 + half + 1;  /* global nozzle number, 1-based */
+            uint8_t addr  = (uint8_t)label;    /* BlueSky address == label       */
+
+            /* Re-assert the mode per nozzle rather than once per DU:
+             * poll_incoming_mqtt() below can execute a queued rsp/kfactor
+             * command, which reconfigures the UART for its own transaction.
+             * Setting it here keeps this loop correct without depending on
+             * what that path happened to leave behind. */
+            rs485_set_8e1_9600();
+            du_poll_bluesky_nozzle(addr, &nz);
+            rs485_set_8n1(9600);
+
+            rtc_timestamp(ts, sizeof(ts));   /* stamped at the read, not the cycle */
+            du_build_nozzle_payload(&nz, label, g_hw_bs[i], ts,
+                                    payload, sizeof(payload));
+
+            bool ok = mqtt_publish(t_data, payload);
+            if (ok) g_diag.pub_ok++; else g_diag.pub_fail++;
+            all_ok &= ok;
+
+            esp_task_wdt_reset();
+            poll_incoming_mqtt();  /* stay responsive to setconfig/FOTA mid-poll */
+        }
     }
     g_diag.du_ok = all_ok;
 }
@@ -1164,30 +1202,64 @@ static void run_poll_cycle(void) {
 
     int64_t loop_start = esp_timer_get_time();
     char ts[32];
-    modem_get_timestamp(ts, sizeof(ts));
+    /* RTC read — instant and cannot fail on I/O, unlike the modem AT round-trip
+     * this replaced. Re-read before each subsystem below so every payload
+     * carries the time of its own reading rather than the cycle's start. */
+    rtc_timestamp(ts, sizeof(ts));
 
     check_daily_reboot(ts);  /* scheduled reboot at 2 AM */
 
     sysmon_pm_acquire();
 
-    if (g_cfg.du_bluesky_count > 0) poll_dispensers(ts);
+    /* Dispensers first, unconditionally, on every cycle. They are the only
+     * equipment on this bus whose data can be permanently degraded by being
+     * late: the cloud reconstructs each sale by differencing consecutive
+     * totalizer samples, so any sale that begins and ends between two reads is
+     * merged into its neighbour instead of being recorded on its own. Radar and
+     * genset are rate-limited below specifically to keep this path tight. */
+    if (g_cfg.du_bluesky_count > 0) poll_dispensers();
     esp_task_wdt_reset();
     poll_incoming_mqtt();
-    /* Radar runs on its own slower cadence (~60s) — poll on the first cycle
-     * after boot, then every RADAR_CYCLE_INTERVAL cycles. */
-    static int radar_cycle = 0;
+
+    /* Radar and genset run on wall-clock rate limits (RADAR_POLL_INTERVAL_S /
+     * GENSET_POLL_INTERVAL_S) rather than the old "every N poll cycles".
+     * Cycle length is not constant — it varies with nozzle count, retries and
+     * publish latency — so a cycle count mapped to no predictable period: the
+     * old RADAR_CYCLE_INTERVAL=2 was nominally 60 s but measured ~168 s in the
+     * field. esp_timer_get_time() is a monotonic 64-bit microsecond counter
+     * (~292,000 year range), so plain subtraction needs no wrap handling.
+     * 0 = "never polled", so both fire on the first cycle after boot. */
+    static int64_t last_radar_us  = 0;
+    static int64_t last_genset_us = 0;
+
     if (g_cfg.ztech_count > 0 || g_cfg.pantech_count > 0) {
-        if (radar_cycle == 0) poll_radar(ts);
-        radar_cycle = (radar_cycle + 1) % RADAR_CYCLE_INTERVAL;
+        int64_t now_us = esp_timer_get_time();
+        if (last_radar_us == 0 ||
+            now_us - last_radar_us >= (int64_t)RADAR_POLL_INTERVAL_S * 1000000LL) {
+            last_radar_us = now_us;
+            rtc_timestamp(ts, sizeof(ts));
+            poll_radar(ts);
+        }
     }
     esp_task_wdt_reset();
     poll_incoming_mqtt();
-    if (g_cfg.genset_type == GENSET_SEDEMAC)                    poll_genset(ts);
+
+    if (g_cfg.genset_type == GENSET_SEDEMAC) {
+        int64_t now_us = esp_timer_get_time();
+        if (last_genset_us == 0 ||
+            now_us - last_genset_us >= (int64_t)GENSET_POLL_INTERVAL_S * 1000000LL) {
+            last_genset_us = now_us;
+            rtc_timestamp(ts, sizeof(ts));
+            poll_genset(ts);
+        }
+    }
     esp_task_wdt_reset();
     poll_incoming_mqtt();
     execute_pending();
-    if (g_cfg.di_enable)
+    if (g_cfg.di_enable) {
+        rtc_timestamp(ts, sizeof(ts));
         g_diag.di_ok = di_publish_buffer(t_data, g_hw_di, ts, g_cfg.di_enable);
+    }
     esp_task_wdt_reset();
     poll_incoming_mqtt();
 
@@ -1198,16 +1270,28 @@ static void run_poll_cycle(void) {
      * explicitly enabled from the cloud. */
     static int gps_cycle = 0;
     if (g_cfg.gps_enable) {
-        if (gps_cycle == 0) poll_gps(ts);
+        if (gps_cycle == 0) {
+            rtc_timestamp(ts, sizeof(ts));
+            poll_gps(ts);
+        }
         gps_cycle = (gps_cycle + 1) % GPS_CYCLE_INTERVAL;
     }
     esp_task_wdt_reset();
     poll_incoming_mqtt();
 
+    /* Periodic RTC re-sync, deliberately the LAST modem-touching work in the
+     * cycle so its ~1 s AT round-trip can never land between two dispenser
+     * reads. Failure is non-fatal — the RTC keeps running on the last good
+     * sync, which is why this replaced per-cycle modem time reads. */
+    if (modem_time_resync_due()) {
+        modem_time_sync();
+        esp_task_wdt_reset();
+    }
+
     diag_record_loop_time(esp_timer_get_time() - loop_start);
 
     if (++g_diag_cycle >= DIAG_CYCLE_INTERVAL) {
-        modem_get_timestamp(ts, sizeof(ts));
+        rtc_timestamp(ts, sizeof(ts));
         /* sysmon MUST publish before diag: diag_publish() zeroes the shared
          * pub_ok/pub_fail/loop_max_ms window counters on a successful publish,
          * so if it ran first sysmon would read (and report) all-zero for those
@@ -1374,6 +1458,30 @@ void app_main(void) {
     }
     esp_task_wdt_reset();
 
+    /* Discipline the RTC from network time now that we're registered. From here
+     * on every timestamp in the firmware is a local RTC read (see modem.h), so
+     * no payload path ever blocks on an AT round-trip — that is what makes
+     * per-nozzle timestamping affordable.
+     *
+     * Retried a few times: the network's time is occasionally not yet available
+     * in the first seconds after attach. A total failure is deliberately NOT
+     * fatal — payloads carry the epoch string, rtc_is_synced() stays false, and
+     * the periodic re-sync in run_poll_cycle() picks it up as soon as the
+     * network provides it, rather than the device rebooting over a clock. */
+    {
+        bool time_ok = false;
+        for (int i = 0; i < 3 && !time_ok; i++) {
+            if (i > 0) {
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                esp_task_wdt_reset();
+            }
+            time_ok = modem_time_sync();
+        }
+        if (!time_ok)
+            ESP_LOGW(TAG, "initial time sync failed — RTC unsynced until re-sync");
+        esp_task_wdt_reset();
+    }
+
     /* GNSS power-on — deliberately AFTER network_init() rather than right
      * after modem confirmation: network_init() is what sends AT+CMEE=2
      * (network.c), and without verbose CME errors active yet, a failed
@@ -1503,6 +1611,8 @@ void app_main(void) {
 
     bool post_ota_checked = false;
     for (;;) {
+        int64_t cycle_start = esp_timer_get_time();
+
         esp_task_wdt_reset();
         poll_incoming_mqtt();   /* drain any queued commands before sensor work */
         run_poll_cycle();
@@ -1515,6 +1625,40 @@ void app_main(void) {
             check_post_ota();
             post_ota_checked = true;
         }
-        sleep_with_poll(PUBLISH_INTERVAL_MS / 1000);
+
+        /* Start-to-start pacing, not a flat post-work sleep.
+         *
+         * This used to be sleep_with_poll(30) unconditionally, which ran AFTER
+         * the cycle regardless of how long the cycle took — so the real period
+         * was always work + 30 s. A 2-dispenser station doing ~50 s of work
+         * published every ~80 s despite PUBLISH_INTERVAL_MS being 30 s.
+         * Measuring from the cycle START makes the constant mean what it says,
+         * and when the work alone already exceeds it the next cycle begins
+         * immediately instead of idling for a further 30 s. That directly
+         * tightens the gap between consecutive reads of the same nozzle, which
+         * is what bounds how many separate sales can collapse into one
+         * totalizer delta. (This is also how the older Arduino firmware paced
+         * itself, which is why it measured ~57 s on 4 nozzles where this
+         * firmware measured ~84 s for identical RS485 work.) */
+        int64_t elapsed_ms = (esp_timer_get_time() - cycle_start) / 1000;
+        int     remain_s   = (int)(((int64_t)PUBLISH_INTERVAL_MS - elapsed_ms) / 1000);
+        if (remain_s > 0) {
+            sleep_with_poll(remain_s);
+        } else {
+            /* Overran the interval — no idle time left. Still do the per-second
+             * housekeeping sleep_with_poll() would have done, so a dropped link
+             * is healed and queued cloud commands are serviced even on a busy
+             * station that never gets a quiet moment. */
+            esp_task_wdt_reset();
+            mqtt_reconnect_if_needed();
+            poll_incoming_mqtt();
+            /* Explicit yield so this branch can never become a tight loop.
+             * Today every path that reaches it has already blocked on RS485/
+             * modem I/O, so the scheduler has run — but that is a property of
+             * the current call graph, not something this loop enforces. One
+             * tick is ~0.2% of a 50 s cycle: unmeasurable against the dispenser
+             * cadence, and it makes the guarantee local instead of inherited. */
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
 }

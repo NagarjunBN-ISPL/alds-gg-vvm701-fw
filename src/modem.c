@@ -11,6 +11,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
 
 static const char *TAG = "modem";
 
@@ -428,43 +430,139 @@ bool modem_get_operator(char *out, size_t out_size) {
     return true;
 }
 
-bool modem_get_timestamp(char *buf, size_t size) {
+/* ── Time: network → RTC, everything else reads the RTC ─────────────────── */
+static bool    s_time_synced   = false;
+static int64_t s_last_sync_us  = 0;
+
+/* Parse a Quectel time string and set the ESP32 RTC from it, in UTC.
+ *
+ * Format: "YYYY/MM/DD,HH:MM:SS±ZZ[,D]" (QLTS) or "YY/MM/DD,HH:MM:SS±ZZ" (CCLK).
+ * The value is the modem's LOCAL time, and ±ZZ is its offset from UTC in
+ * QUARTER-hours (IST = +5:30 = +22). The previous implementation parsed only
+ * the six date/time fields and ignored ±ZZ entirely, so on an Indian network
+ * it published IST while the cloud interpreted the field as UTC — every
+ * timestamp 5:30 ahead. The offset is applied here so the RTC holds true UTC.
+ *
+ * The sign is located by scanning past the SECOND ':' rather than with
+ * strchr('-'): a '-' can legitimately appear nowhere else in these formats
+ * today, but anchoring to the seconds field keeps that from becoming a silent
+ * trap if the modem ever emits a different date separator. */
+static bool parse_and_set_rtc(const char *s, bool two_digit_year) {
+    int Y, Mo, D, h, m, sec;
+    if (sscanf(s, "%d/%d/%d,%d:%d:%d", &Y, &Mo, &D, &h, &m, &sec) != 6)
+        return false;
+
+    int  tz_qh   = 0;
+    char tz_sign = '+';
+    {
+        int colons = 0;
+        for (const char *p = s; *p && *p != '"'; p++) {
+            if (*p == ':') { colons++; continue; }
+            if (colons >= 2 && (*p == '+' || *p == '-')) {
+                tz_sign = *p;
+                tz_qh   = atoi(p + 1);
+                break;
+            }
+        }
+    }
+    /* tz_sign carries the direction, so tz_qh is a magnitude: 0..56 quarter-
+     * hours covers every real zone (UTC-12 .. UTC+14). Anything outside that is
+     * a mis-parse — treat it as "no offset" rather than shifting the clock by
+     * hours on the strength of a garbled field. */
+    if (tz_qh < 0 || tz_qh > 56) tz_qh = 0;
+
+    if (two_digit_year || Y < 100) Y += 2000;
+
+    if (Y < 2020 || Y > 2099 || Mo < 1 || Mo > 12 || D < 1 || D > 31 ||
+        h < 0 || h > 23 || m < 0 || m > 59 || sec < 0 || sec > 60)
+        return false;
+
+    struct tm t = {0};
+    t.tm_year  = Y - 1900;
+    t.tm_mon   = Mo - 1;
+    t.tm_mday  = D;
+    t.tm_hour  = h;
+    t.tm_min   = m;
+    t.tm_sec   = sec;
+    t.tm_isdst = 0;
+
+    /* mktime() interprets struct tm in the process timezone; pin it to UTC so
+     * the conversion is exact regardless of what TZ happens to be set to. */
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    time_t epoch = mktime(&t);
+    if (epoch == (time_t)-1) return false;
+
+    long off = (long)tz_qh * 15 * 60;
+    epoch = (tz_sign == '+') ? epoch - off : epoch + off;
+
+    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+    if (settimeofday(&tv, NULL) != 0) return false;
+    return true;
+}
+
+bool modem_time_sync(void) {
     char resp[128] = {0};
 
     /* Prefer AT+QLTS=2 → "+QLTS: "2026/03/22,10:30:00+22,0"" */
     if (modem_at("AT+QLTS=2", "+QLTS:", 5000, resp, sizeof(resp))) {
         char *q = strchr(resp, '"');
-        if (q) {
-            q++;
-            int Y, Mo, D, h, m, s;
-            if (sscanf(q, "%d/%d/%d,%d:%d:%d", &Y, &Mo, &D, &h, &m, &s) == 6) {
-                /* QLTS=2 is documented as 4-digit year, but some Quectel
-                 * firmware variants have been seen returning 2-digit — apply
-                 * the same normalization already used for the CCLK fallback
-                 * below rather than assume the modem always complies. */
-                if (Y < 100) Y += 2000;
-                snprintf(buf, size, "%04d-%02d-%02d %02d:%02d:%02d",
-                         Y, Mo, D, h, m, s);
-                return true;
-            }
+        if (q && parse_and_set_rtc(q + 1, false)) {
+            s_time_synced  = true;
+            s_last_sync_us = esp_timer_get_time();
+            char now[32];
+            rtc_timestamp(now, sizeof(now));
+            ESP_LOGI(TAG, "RTC synced from AT+QLTS — %s UTC", now);
+            return true;
         }
     }
 
-    /* Fallback: AT+CCLK? → "+CCLK: "26/03/22,10:30:00+22"" */
+    /* Fallback: AT+CCLK? → "+CCLK: "26/03/22,10:30:00+22"" (2-digit year) */
     memset(resp, 0, sizeof(resp));
     if (modem_at("AT+CCLK?", "+CCLK:", 3000, resp, sizeof(resp))) {
         char *q = strchr(resp, '"');
-        if (q) {
-            q++;
-            int y, Mo, D, h, m, s;
-            if (sscanf(q, "%d/%d/%d,%d:%d:%d", &y, &Mo, &D, &h, &m, &s) == 6) {
-                snprintf(buf, size, "20%02d-%02d-%02d %02d:%02d:%02d",
-                         y, Mo, D, h, m, s);
-                return true;
-            }
+        if (q && parse_and_set_rtc(q + 1, true)) {
+            s_time_synced  = true;
+            s_last_sync_us = esp_timer_get_time();
+            char now[32];
+            rtc_timestamp(now, sizeof(now));
+            ESP_LOGI(TAG, "RTC synced from AT+CCLK — %s UTC", now);
+            return true;
         }
     }
 
-    snprintf(buf, size, "1970-01-01 00:00:00");
+    /* A failed re-sync is not fatal: the RTC keeps running on the last good
+     * sync, which is far better than the old behaviour of shipping 1970 for
+     * that cycle. Only a device that has NEVER synced has unusable time. */
+    ESP_LOGW(TAG, "RTC sync failed — %s",
+             s_time_synced ? "continuing on last good sync" : "clock still UNSYNCED");
     return false;
+}
+
+bool rtc_timestamp(char *buf, size_t size) {
+    if (!buf || size < 20) return false;
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm t;
+    /* gmtime_r, not localtime_r: the RTC holds UTC by construction (see
+     * parse_and_set_rtc), so this stays correct even if TZ is changed later. */
+    gmtime_r(&tv.tv_sec, &t);
+
+    if (t.tm_year + 1900 < 2020) {          /* clock never set */
+        snprintf(buf, size, "1970-01-01 00:00:00");
+        return false;
+    }
+    snprintf(buf, size, "%04d-%02d-%02d %02d:%02d:%02d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+    return true;
+}
+
+bool rtc_is_synced(void) { return s_time_synced; }
+
+bool modem_time_resync_due(void) {
+    if (!s_time_synced) return true;
+    return (esp_timer_get_time() - s_last_sync_us)
+           >= (int64_t)TIME_RESYNC_INTERVAL_S * 1000000LL;
 }

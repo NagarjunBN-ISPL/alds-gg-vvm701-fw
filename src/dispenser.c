@@ -45,8 +45,16 @@ void du_rs485_set_bluesky_mode(void) {
 
 static const char *TAG = "du";
 
-/* ── Low-level RS485 transaction ─────────────────────────────────────── */
-/* 2000 ms per-byte-reset timeout (timer resets each time a byte arrives),
+/* ── Low-level RS485 transaction ─────────────────────────────────────────
+ * Normal path: return as soon as the frame's self-declared length has been
+ * received (see the length note in the loop below) — typically tens of ms.
+ *
+ * Fallback path, used whenever the header isn't a recognisable BlueSky frame
+ * (line noise, a non-conforming device, a corrupted length byte): the original
+ * wait-for-silence rule below, unchanged. That keeps this strictly no worse
+ * than the previous behaviour in every case it can't speed up.
+ *
+ * 2000 ms per-byte-reset timeout (timer resets each time a byte arrives),
  * PLUS an absolute cap: on a noisy line, sporadic garbage bytes keep
  * resetting the per-byte timer, and without a hard ceiling a single
  * nozzle read can stretch toward a minute — several units of that in one
@@ -60,7 +68,8 @@ static int rs485_xfer(const uint8_t *cmd, size_t cmd_len,
 
     uart_write_bytes(RS485_UART, cmd, cmd_len);
 
-    int got = 0;
+    int got      = 0;
+    int expected = 0;   /* frame length once known from the header; 0 = unknown */
     uint32_t t0      = (uint32_t)(esp_timer_get_time() / 1000);
     int64_t  hard_dl = esp_timer_get_time()
                        + (int64_t)RS485_RECV_TIMEOUT_MS * 3 * 1000;
@@ -78,6 +87,24 @@ static int rs485_xfer(const uint8_t *cmd, size_t cmd_len,
         if (uart_read_bytes(RS485_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
             resp[got++] = ch;
             t0 = (uint32_t)(esp_timer_get_time() / 1000); /* reset on each byte */
+
+            /* BlueSky frames are self-describing: byte[2] is 0xA<n> where n is
+             * the number of bytes that follow the 3-byte header, so the total
+             * length is (byte[2] & 0x0F) + 3. Verified against the protocol
+             * doc's own examples and against every frame captured on the bench
+             * (a3→6, a4→7, a6→9, a7→10, ac→15) — the outgoing commands obey it
+             * too (a2→5).
+             *
+             * Without this the loop had no way to know a reply was complete
+             * except by waiting out RS485_RECV_TIMEOUT_MS of silence, so a
+             * 15-byte response that lands in ~17 ms still cost the full 2 s.
+             * Bench measurement: 2.07 s per command x 20 commands = 41.4 s of a
+             * 46.7 s cycle spent waiting on data that had already arrived. */
+            if (got == 3 && resp[0] == 0xF5 && (resp[2] & 0xF0) == 0xA0) {
+                int len = (resp[2] & 0x0F) + 3;
+                if (len >= 3 && len <= (int)resp_max) expected = len;
+            }
+            if (expected && got >= expected) break;
         }
     }
     return got;
@@ -126,7 +153,7 @@ static void log_raw_frame(uint8_t addr, const char *what, const uint8_t *buf, in
 }
 
 /* ── BlueSky polling ──────────────────────────────────────────────────── */
-static void poll_one_bluesky(uint8_t addr, DuNozzle_t *nz) {
+void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz) {
     memset(nz, 0, sizeof(*nz));
     nz->present = false;
 
@@ -199,13 +226,6 @@ static void poll_one_bluesky(uint8_t addr, DuNozzle_t *nz) {
         nz->rfid_len = 0;
 }
 
-void du_poll_bluesky_unit(int unit_idx, DuNozzle_t *out_a, DuNozzle_t *out_b) {
-    uint8_t addr_a = (uint8_t)(unit_idx * 2 + 1);
-    uint8_t addr_b = (uint8_t)(unit_idx * 2 + 2);
-    poll_one_bluesky(addr_a, out_a);
-    poll_one_bluesky(addr_b, out_b);
-}
-
 /* ── Hex helpers ──────────────────────────────────────────────────────── */
 void du_bytes_to_hex(const uint8_t *data, int len, char *out, size_t out_size) {
     int pos = 0;
@@ -225,31 +245,30 @@ static inline int clamp_pos(int pos, size_t buf_size) {
     return (pos > (int)buf_size - 1) ? (int)buf_size - 1 : pos;
 }
 
-/* ── JSON payload builder ─────────────────────────────────────────────── */
-void du_build_payload(const DuNozzle_t *nz_a, const DuNozzle_t *nz_b,
-                      int label_a, int label_b,
-                      const char *hw_id, const char *ts,
-                      char *buf, size_t buf_size) {
-    int  pos = 0;
+/* ── JSON payload builder (one nozzle per message) ────────────────────────
+ * The "nozzles" wrapper is deliberately retained so the cloud parser sees the
+ * exact structure it already consumes; only the number of nozzles inside drops
+ * to one:
+ *   {"HW_ID":"..","nozzles":{"1":{"data":"..","rsp":"..","kfact":"..","rfid":".."}},"TS":".."}
+ *
+ * This is also what the BlueSky protocol doc specifies (one message per
+ * nozzle), and it halves the payload: worst case ~500 B instead of ~920 B,
+ * putting every dispenser message comfortably under the modem's ~1400-byte
+ * QMTPUBEX ceiling (MQTT_MODEM_PAYLOAD_SAFE_MAX) rather than near it. */
+void du_build_nozzle_payload(const DuNozzle_t *nz, int label,
+                             const char *hw_id, const char *ts,
+                             char *buf, size_t buf_size) {
+    int pos = 0;
 
     pos += snprintf(buf + pos, buf_size - pos,
                     "{\"HW_ID\":\"%s\",\"nozzles\":{", hw_id);
     pos = clamp_pos(pos, buf_size);
 
-    const DuNozzle_t *nzs[2] = {nz_a, nz_b};
-    int labels[2] = {label_a, label_b};
-
-    for (int i = 0; i < 2 && pos < (int)buf_size - 10; i++) {
-        const DuNozzle_t *nz = nzs[i];
-        if (i > 0) buf[pos++] = ',';
-
-        if (!nz->present) {
-            pos += snprintf(buf + pos, buf_size - pos,
-                            "\"%d\":{\"data\":\"404\"}", labels[i]);
-            pos = clamp_pos(pos, buf_size);
-            continue;
-        }
-
+    if (!nz->present) {
+        pos += snprintf(buf + pos, buf_size - pos,
+                        "\"%d\":{\"data\":\"404\"}", label);
+        pos = clamp_pos(pos, buf_size);
+    } else {
         /* All 4 fields are reported regardless of idle/busy status — any
          * field whose read got no valid response becomes "404". */
         char h_tot[128];
@@ -267,7 +286,7 @@ void du_build_payload(const DuNozzle_t *nz_a, const DuNozzle_t *nz_b,
         pos += snprintf(buf + pos, buf_size - pos,
                         "\"%d\":{\"data\":\"%s\",\"rsp\":\"%s\","
                         "\"kfact\":\"%s\",\"rfid\":\"%s\"}",
-                        labels[i], h_tot, h_rsp, h_kf, h_rf);
+                        label, h_tot, h_rsp, h_kf, h_rf);
         pos = clamp_pos(pos, buf_size);
     }
 
@@ -278,14 +297,15 @@ void du_build_payload(const DuNozzle_t *nz_a, const DuNozzle_t *nz_b,
     /* clamp_pos prevents memory corruption but not broken JSON syntax — a
      * truncated payload (missing closing braces, possibly mid-string) would
      * be silently dropped by the cloud parser. Landing within 2 bytes of the
-     * ceiling on a buffer sized with ~2x headroom over the worst case is
+     * ceiling on a buffer sized with wide headroom over the worst case is
      * itself a strong "something's wrong" signal, so fall back to a
-     * guaranteed-valid 404 shape for both nozzles instead. */
+     * guaranteed-valid 404 shape instead. */
     if (pos >= (int)buf_size - 2) {
-        ESP_LOGW(TAG, "dispenser payload truncated at %d/%zu bytes — publishing 404 instead", pos, buf_size);
+        ESP_LOGW(TAG, "nz%d payload truncated at %d/%zu bytes — publishing 404 instead",
+                 label, pos, buf_size);
         snprintf(buf, buf_size,
-                 "{\"HW_ID\":\"%s\",\"nozzles\":{\"%d\":{\"data\":\"404\"},\"%d\":{\"data\":\"404\"}},\"TS\":\"%s\"}",
-                 hw_id, label_a, label_b, ts);
+                 "{\"HW_ID\":\"%s\",\"nozzles\":{\"%d\":{\"data\":\"404\"}},\"TS\":\"%s\"}",
+                 hw_id, label, ts);
     }
 }
 

@@ -17,7 +17,30 @@ int  modem_get_csq(void);
 bool modem_get_vbat(int *vbat_mv);
 /* Network operator name (e.g. "Airtel"), via AT+COPS?. */
 bool modem_get_operator(char *out, size_t out_size);
-bool modem_get_timestamp(char *buf, size_t size);
+/* ── Time ─────────────────────────────────────────────────────────────────
+ * Network time is treated the way NTP is on any other system: it disciplines
+ * the ESP32's RTC, and everything else reads the RTC. Timestamps must never
+ * block on modem I/O — modem_get_timestamp() used to be called once per poll
+ * cycle (an AT round-trip, up to 5 s, silently yielding 1970 on failure) and
+ * the single value was then stamped onto every payload in that cycle, so the
+ * last nozzle of a cycle carried a timestamp ~40 s older than its own reading.
+ *
+ * modem_time_sync(): pulls network time (AT+QLTS=2, falling back to AT+CCLK?),
+ * converts the modem's LOCAL time + quarter-hour offset to UTC, and sets the
+ * RTC via settimeofday(). Call once after network bring-up, then periodically
+ * (see modem_time_resync_due()) to bound RTC drift.
+ *
+ * rtc_timestamp(): formats the current RTC time as UTC "YYYY-MM-DD HH:MM:SS".
+ * Instant, non-blocking, cannot fail on I/O — so it is affordable to call at
+ * the exact moment each nozzle is read. Returns false (and writes the epoch
+ * string) if the RTC has never been synced, so callers can tell the difference
+ * between "1970 because unsynced" and a real reading. */
+bool modem_time_sync(void);
+bool rtc_timestamp(char *buf, size_t size);
+bool rtc_is_synced(void);
+/* true if never synced, or the last good sync is older than
+ * TIME_RESYNC_INTERVAL_S — drives the periodic re-sync from the poll loop. */
+bool modem_time_resync_due(void);
 /* Read UART (no command sent) until expect is found or timeout elapses. */
 bool modem_read_until(const char *expect, int timeout_ms,
                       char *resp, size_t resp_size);

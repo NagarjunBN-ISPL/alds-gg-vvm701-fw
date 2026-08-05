@@ -60,10 +60,31 @@
 #define DIAG_CYCLE_INTERVAL  10       /* publish diag every N poll cycles    */
 #define DIAG_BOOT_GRACE_MS   60000    /* ignore loop_max during boot warmup  */
 
-/* ── Radar cadence ──────────────────────────────────────────────────────────
- * Tank levels change slowly, so radar is polled once every N poll cycles
- * instead of every cycle. With PUBLISH_INTERVAL_MS=30s, 2 → every 60s. */
-#define RADAR_CYCLE_INTERVAL  2
+/* ── Secondary-equipment cadence (wall-clock, not cycle counts) ─────────────
+ * Radar and genset are deliberately slow-cadence: tank level and genset state
+ * change over minutes, while a dispenser nozzle can start and finish a sale in
+ * seconds. Every second spent on the shared RS485 bus talking to a tank or a
+ * DG is a second the dispensers are NOT being read, and a sale that begins and
+ * ends inside that gap collapses into the next totalizer delta instead of
+ * being recorded as its own transaction.
+ *
+ * These are elapsed-time budgets, NOT "every N poll cycles" as before. Cycle
+ * length is not constant — it varies with nozzle count, retries and publish
+ * latency — so a cycle count maps to no predictable wall-clock period. The old
+ * RADAR_CYCLE_INTERVAL=2 was nominally "every 60 s" but measured ~168 s in the
+ * field once dispenser polling stretched the cycle. Anchoring to elapsed
+ * microseconds makes "every 3 minutes" mean exactly that. */
+#define RADAR_POLL_INTERVAL_S   180   /* tanks:  every 3 min */
+#define GENSET_POLL_INTERVAL_S  300   /* DG:     every 5 min */
+
+/* ── RTC discipline ─────────────────────────────────────────────────────────
+ * Network time sets the ESP32 RTC at boot and is refreshed on this interval to
+ * bound drift (~±20 ppm on the 32.768 kHz crystal ≈ ±1.7 s/day). Everything
+ * else reads the RTC, so no payload path ever blocks on a modem AT round-trip
+ * just to get a timestamp. 6 h keeps worst-case drift to a few hundred ms while
+ * costing 4 AT commands a day — against the ~2,900/day the per-cycle timestamp
+ * read used to cost. */
+#define TIME_RESYNC_INTERVAL_S  21600  /* 6 hours */
 
 /* ── GPS/GNSS cadence ──────────────────────────────────────────────────────
  * Controls how often poll_gps() re-reads AT+QGPSLOC and publishes. The GNSS
