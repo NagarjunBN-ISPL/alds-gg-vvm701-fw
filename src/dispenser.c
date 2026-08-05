@@ -159,32 +159,61 @@ void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz) {
 
     uint8_t cmd[5];
 
-    /* Status read — sent ONCE, for presence/idle reporting only. We do NOT
-     * gate the data reads on the idle (0x80) byte and do NOT retry waiting
-     * for idle: the totalizer/RSP/K-factor/RFID commands are issued whether
-     * the nozzle reports idle or busy. `idle` is kept purely informational.
-     * (Header/address validation is still applied so line noise can't fake a
-     * "present" nozzle.) */
+    /* ── Status gate ──────────────────────────────────────────────────────
+     * The data reads happen ONLY if the nozzle reports idle. See the
+     * DU_STATUS_RETRIES note in config.h for why (reading mid-delivery splits
+     * one sale into two cloud transactions) and for why 0x00 counts as idle
+     * alongside the documented 0x80.
+     *
+     * Two distinct failures are handled here and must not be conflated:
+     *   - no valid frame at all  → nozzle absent / wiring fault → 404
+     *   - valid frame, not idle  → nozzle is fuelling → skip reads, try again
+     *                              next cycle (NOT a fault)
+     * Retries cover the first case; the second is a normal operating state. */
     bluesky_frame(addr, BS_CMD_STATUS, cmd);
-    nz->status_len = rs485_xfer(cmd, 5, nz->status, DU_RESP_MAX);
-    esp_task_wdt_reset();
-    log_raw_frame(addr, "status", nz->status, nz->status_len);
-    if (nz->status_len > 0 &&
-        !bluesky_resp_valid(nz->status, nz->status_len, addr, "status"))
-        nz->status_len = 0;
-    if (nz->status_len > 0) nz->present = true;
-    nz->idle = (nz->status_len >= 4 && nz->status[3] == 0x80);
 
-    /* A nozzle that gave NO valid status reply is treated as physically
-     * absent — skip its four data reads so an unpopulated slot costs one
-     * timeout, not five. (This is presence detection, not the idle check:
-     * a busy nozzle still answers status, so it is polled normally.) */
+    for (int attempt = 1; attempt <= DU_STATUS_RETRIES; attempt++) {
+        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(DU_STATUS_RETRY_MS));
+
+        nz->status_len = rs485_xfer(cmd, 5, nz->status, DU_RESP_MAX);
+        esp_task_wdt_reset();
+        log_raw_frame(addr, "status", nz->status, nz->status_len);
+
+        if (nz->status_len > 0 &&
+            !bluesky_resp_valid(nz->status, nz->status_len, addr, "status"))
+            nz->status_len = 0;
+
+        if (nz->status_len < 4) {
+            ESP_LOGW(TAG, "BlueSky nz%u status: no valid frame (attempt %d/%d)",
+                     addr, attempt, DU_STATUS_RETRIES);
+            continue;                       /* comms problem — worth retrying */
+        }
+
+        nz->present = true;
+        uint8_t st  = nz->status[3];
+        if (st == 0x80 || st == 0x00) { nz->idle = true; break; }
+
+        ESP_LOGI(TAG, "BlueSky nz%u status 0x%02x = delivering (attempt %d/%d)",
+                 addr, st, attempt, DU_STATUS_RETRIES);
+    }
+
+    /* Nothing ever answered — physically absent or a dead link. Skipping the
+     * four data reads keeps an unpopulated slot at one status cost, not five. */
     if (!nz->present) return;
+
+    /* Answered, but still fuelling. Leave the totalizer alone until the sale
+     * completes so the next reading lands on a settled value. */
+    if (!nz->idle) {
+        nz->busy = true;
+        ESP_LOGI(TAG, "BlueSky nz%u delivering — data reads skipped this cycle", addr);
+        return;
+    }
+
     vTaskDelay(pdMS_TO_TICKS(30));
 
-    /* Data reads — attempted whenever the nozzle is present, idle OR busy.
-     * An invalid frame zeroes the length, so the payload builder reports
-     * "404" for that field instead of forwarding noise. */
+    /* Data reads — reached only with the nozzle confirmed idle. An invalid
+     * frame zeroes that field's length, so the payload builder reports "404"
+     * for it instead of forwarding noise. */
 
     /* Totalizer */
     bluesky_frame(addr, BS_CMD_TOTAL, cmd);
@@ -264,13 +293,19 @@ void du_build_nozzle_payload(const DuNozzle_t *nz, int label,
                     "{\"HW_ID\":\"%s\",\"nozzles\":{", hw_id);
     pos = clamp_pos(pos, buf_size);
 
-    if (!nz->present) {
+    /* Busy publishes the same "404" shape as absent, so the cloud parser needs
+     * no change to accept it — but the two are tracked separately in DuNozzle_t
+     * and logged differently, because only one of them is a fault. If the cloud
+     * ever wants to tell "pump is mid-sale" from "pump is unreachable", this is
+     * the single line to change (e.g. {"state":"busy"}); it needs a matching
+     * cloud-side parser update, so it is deliberately NOT done unilaterally. */
+    if (!nz->present || nz->busy) {
         pos += snprintf(buf + pos, buf_size - pos,
                         "\"%d\":{\"data\":\"404\"}", label);
         pos = clamp_pos(pos, buf_size);
     } else {
-        /* All 4 fields are reported regardless of idle/busy status — any
-         * field whose read got no valid response becomes "404". */
+        /* Reached only for a nozzle confirmed idle — any individual field whose
+         * read got no valid response becomes "404". */
         char h_tot[128];
         char h_rsp[128];
         char h_kf [128];

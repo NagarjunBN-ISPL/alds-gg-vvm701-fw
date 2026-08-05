@@ -116,6 +116,29 @@
  * cloud integration doc's setconfig key table. */
 #define DU_BLUESKY_MAX  6
 
+/* ── Dispenser nozzle status gate ─────────────────────────────────────────
+ * The totalizer/RSP/K-factor/RFID reads are issued ONLY when the nozzle
+ * reports idle, per the BlueSky protocol doc ("If nozzle is delivering or
+ * busy, then dont read anything"). Reading mid-delivery returns a totalizer
+ * captured part-way through a sale, which the cloud — which derives every
+ * transaction from the delta between consecutive readings — turns into two
+ * transactions for one fill. Skipping instead means the next reading is taken
+ * with the nozzle at rest, so each delta is a whole number of COMPLETED sales.
+ *
+ * Idle is (status byte 3 == 0x80 || == 0x00). 0x80 is the documented value;
+ * 0x00 is a known controller-firmware defect seen in the field where an idle
+ * nozzle reports zero instead. Treating only 0x80 as idle made those units
+ * look permanently busy, so they were never read at all.
+ *
+ * DU_STATUS_RETRY_MS is 300, not the 2000 the old Arduino firmware used. With
+ * 0x00 now accepted, retries no longer exist to wait out a mis-reported idle —
+ * they exist to recover a status frame lost to line noise, which needs
+ * milliseconds, not seconds. 3 x 2 s of bus-blocking per busy nozzle would
+ * directly widen the very polling gap that causes back-to-back sales to be
+ * merged into one transaction. Set to 2000 to reproduce the old timing. */
+#define DU_STATUS_RETRIES   3
+#define DU_STATUS_RETRY_MS  300
+
 /* ── Radar ─────────────────────────────────────────────────────────────────
  * Ztech and Pantech are standard Modbus RTU on the shared RS485 bus. Slave
  * addressing matches the convention actually wired at outlets: Ztech =

@@ -6,8 +6,12 @@
 #define DU_RESP_MAX 32
 
 typedef struct {
-    bool    present;
-    bool    idle;
+    bool    present;   /* answered the status poll at all                    */
+    bool    idle;      /* status byte 3 == 0x80 or 0x00 — safe to read data  */
+    bool    busy;      /* answered, but delivering — data reads were skipped.
+                        * Distinct from !present (no comms): a busy nozzle is
+                        * the healthiest possible state, so callers must not
+                        * treat it as a fault when scoring link health. */
     uint8_t status[DU_RESP_MAX]; int status_len;
     uint8_t total[DU_RESP_MAX];  int total_len;
     uint8_t rsp[DU_RESP_MAX];    int rsp_len;
