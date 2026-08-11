@@ -3,7 +3,16 @@
 /* ── Firmware identity ──────────────────────────────────────────────────── */
 #define FW_VERSION          "1.0.0"
 #define MQTT_TOPIC_BASE     "fuelsense"
-#define PUBLISH_INTERVAL_MS 30000
+/* Start-to-start pacing of one dispenser poll round. Each nozzle is polled and
+ * published once per round, so this doubles as the per-nozzle re-read interval:
+ * a nozzle's totalizer is sampled roughly every 20 s. Tightening this from the
+ * former 30 s — together with dropping the RFID read entirely and moving the
+ * k-factor read to a 15-min cadence (carried forward in between) so each round
+ * stays short — is what shrinks the window in which two back-to-back sales on
+ * the SAME nozzle merge into a single totalizer delta. When a due radar/genset
+ * poll falls in a round it runs a couple seconds longer (shared RS485 bus);
+ * that is bounded and unavoidable. */
+#define PUBLISH_INTERVAL_MS 20000
 #define WDT_TIMEOUT_MS      120000
 
 /* ── MQTT broker ────────────────────────────────────────────────────────── */
@@ -57,7 +66,7 @@
 /* GPIO 35/36/37 are used by 8MB PSRAM — must not be touched */
 
 /* ── Diagnostics ────────────────────────────────────────────────────────── */
-#define DIAG_CYCLE_INTERVAL  10       /* publish diag every N poll cycles    */
+#define DIAG_CYCLE_INTERVAL  45       /* publish diagnostics + sysmon every N poll cycles (~15 min at 20 s/cycle) */
 #define DIAG_BOOT_GRACE_MS   60000    /* ignore loop_max during boot warmup  */
 
 /* ── Secondary-equipment cadence (wall-clock, not cycle counts) ─────────────
@@ -74,8 +83,13 @@
  * RADAR_CYCLE_INTERVAL=2 was nominally "every 60 s" but measured ~168 s in the
  * field once dispenser polling stretched the cycle. Anchoring to elapsed
  * microseconds makes "every 3 minutes" mean exactly that. */
-#define RADAR_POLL_INTERVAL_S   180   /* tanks:  every 3 min */
-#define GENSET_POLL_INTERVAL_S  300   /* DG:     every 5 min */
+#define RADAR_POLL_INTERVAL_S   600   /* tanks:  every 10 min */
+#define GENSET_POLL_INTERVAL_S  300   /* DG:     every 5 min  */
+/* BlueSky k-factor is a near-constant calibration value; read it only this
+ * often and carry the last good reading forward on every other dispenser round
+ * (see du_poll_bluesky_nozzle) so the tight totalizer cadence isn't spent
+ * re-reading it. */
+#define KFACTOR_POLL_INTERVAL_S 900   /* k-factor: every 15 min */
 
 /* ── RTC discipline ─────────────────────────────────────────────────────────
  * Network time sets the ESP32 RTC at boot and is refreshed on this interval to
@@ -86,16 +100,26 @@
  * read used to cost. */
 #define TIME_RESYNC_INTERVAL_S  21600  /* 6 hours */
 
+/* ── Daily maintenance reboot ────────────────────────────────────────────────
+ * A once-a-day reboot clears any slow creep before it matters. The hour is UTC
+ * (the RTC holds UTC — see modem.c). 20:00 UTC = 01:30 IST, a deliberately quiet
+ * window at Indian fuel stations; the previous 02:00 UTC landed at 07:30 IST, in
+ * the morning rush. REARM_HOUR must be LATER than REBOOT_HOUR so the device
+ * doesn't reboot twice in the same window (see check_daily_reboot). A unit whose
+ * RTC never synced (stuck at 1970) simply never triggers this — which is fine. */
+#define DAILY_REBOOT_UTC_HOUR    20   /* 20:00 UTC = 01:30 IST */
+#define DAILY_REBOOT_REARM_HOUR  21   /* re-arm once per day after this UTC hour */
+
 /* ── GPS/GNSS cadence ──────────────────────────────────────────────────────
  * Controls how often poll_gps() re-reads AT+QGPSLOC and publishes. The GNSS
  * engine runs continuously in the background from boot (gps_init); this only
  * gates the read/publish rate. N -> every N poll cycles (PUBLISH_INTERVAL_MS
- * each), so 1 = every cycle (~30s), 20 = ~10 min. Kept as its own constant
+ * each), so 1 = every cycle (~20s), 20 = ~7 min. Kept as its own constant
  * (not reusing DIAG_CYCLE_INTERVAL) so the two can be tuned independently.
  *
- * Set to 1 (publish GPS every ~30s) per request 2026-07-21. Note: the asset
- * is stationary, so the coordinate is essentially unchanging — a 30s cadence
- * is far more frequent than the position warrants; raise this back toward 20
+ * Set to 1 (publish GPS every ~20s) per request 2026-07-21. Note: the asset
+ * is stationary, so the coordinate is essentially unchanging — a 20s cadence
+ * is far more frequent than the position warrants; raise this well above 1
  * if the extra fleet-wide GPS traffic becomes a concern. */
 #define GPS_CYCLE_INTERVAL  1
 
@@ -117,9 +141,10 @@
 #define DU_BLUESKY_MAX  6
 
 /* ── Dispenser nozzle status gate ─────────────────────────────────────────
- * The totalizer/RSP/K-factor/RFID reads are issued ONLY when the nozzle
- * reports idle, per the BlueSky protocol doc ("If nozzle is delivering or
- * busy, then dont read anything"). Reading mid-delivery returns a totalizer
+ * The totalizer/RSP/K-factor reads are issued ONLY when the nozzle reports
+ * idle, per the BlueSky protocol doc ("If nozzle is delivering or busy, then
+ * dont read anything"). (RFID is no longer read at all.) Reading mid-delivery
+ * returns a totalizer
  * captured part-way through a sale, which the cloud — which derives every
  * transaction from the delta between consecutive readings — turns into two
  * transactions for one fill. Skipping instead means the next reading is taken
@@ -138,6 +163,14 @@
  * merged into one transaction. Set to 2000 to reproduce the old timing. */
 #define DU_STATUS_RETRIES   3
 #define DU_STATUS_RETRY_MS  300
+/* Retry budgets for the per-nozzle DATA reads (attempts, not extra tries — 3
+ * means up to 3 total, matching DU_STATUS_RETRIES). The totalizer is the
+ * sale-critical value so it is retried like the status frame; k-factor (read
+ * only every KFACTOR_POLL_INTERVAL_S) is retried the same. RSP keeps a single
+ * read — see du_poll_bluesky_nozzle — so a normal round stays short. A read
+ * that fails every attempt degrades to "404" for that field this cycle. */
+#define DU_TOTAL_RETRIES    3
+#define DU_KFACTOR_RETRIES  3
 
 /* ── Radar ─────────────────────────────────────────────────────────────────
  * Ztech and Pantech are standard Modbus RTU on the shared RS485 bus. Slave
@@ -160,30 +193,42 @@
 #define RADAR_MAX          4
 #define ZTECH_SLAVE_BASE   4
 #define PANTECH_SLAVE_BASE 6
+/* Attempts per tank per radar poll before it reports 404 (total, not extra).
+ * Applied uniformly to every radar type (Ztech/Pantech/future) at the poll
+ * call site, so a new radar driver inherits the retry with no extra work. */
+#define RADAR_READ_RETRIES 3
 
 /* ── Genset ─────────────────────────────────────────────────────────────── */
 #define GENSET_OFF          0
 #define GENSET_SEDEMAC      1
 #define GENSET_SLAVE_DEFAULT 10   /* DG default Modbus slave ID */
+#define GENSET_READ_RETRIES  3    /* attempts per DG poll before reporting 404 (total, not extra) */
 
 /* Genset model — selects the driver in genset.c (see the g_drivers table).
- * Each model has its own register map, function code(s) and scaling:
- *   GC1211                 → Sedemac, FC04 (Read Input Registers) + FC03 holding
- *   GC1111                 → Sedemac, FC03 (Read Holding Registers), no holding
- *   SGC120                 → DEIF SGC 120 Mk II, FC03, separate DEIF register map
- *   GC1201/1202/1203/GC902 → NOT interchangeable with GC1211/GC1111 despite being
- *                            the same Sedemac GenControl family. Their alarm/status
- *                            block is documented one register higher than the
- *                            wire-verified GC1211/GC1111 offset (see genset.c) —
- *                            using GC1211's driver against this hardware would
- *                            silently misread every alarm by one register. These
- *                            IDs exist so the field can select "this station has
- *                            one of these, not a plain GC1211/GC1111" and get a
- *                            clean 404 instead of wrong data, until each gets its
- *                            own verified driver (protocol doc pending as of
- *                            2026-07-14).
- * Adding a model: define its id here, add a driver row in genset.c, and bump
- * GENSET_MODEL_MAX to the new highest id. */
+ * Every model uses the RAW single-command path (firmware ships raw register
+ * integers, the cloud owns the register map + all scaling). Each raw model has
+ * its OWN map — do not assume two share one just because the family name is
+ * close (GC902 differs from the GC1201/02/03 it is often sold with). Register
+ * offsets below are Modbus protocol offsets:
+ *   GC1211                 → Sedemac, RAW FC04, offsets 1..68:
+ *                            "registers"[1..36] + "alarms"[57..66] +
+ *                            "status"(67) + "commandStatus"(68).
+ *   GC1111                 → Sedemac, RAW FC04, offsets 1..68 — shares GC1211's
+ *                            driver+map (confirmed against field hardware). Its
+ *                            own manual documents a different, non-contiguous map
+ *                            (measurements at reg 1024.., alarms at 39425..) that
+ *                            can't be read in one command and that field units
+ *                            don't actually use; the GC1211 map is correct here.
+ *   SGC120                 → DEIF SGC 120 Mk II, RAW FC03, offsets 0..78:
+ *                            "registers"[0..61] + "alarms"[65..76] + "status"(78).
+ *   GC1201/1202/1203       → Ashok Leyland "Nel Botl", RAW FC04, offsets 1..67:
+ *                            "registers"[1..36] + "status"(67). One shared map.
+ *   GC902                  → Sedemac, RAW FC04, offsets 0..69 (its OWN map):
+ *                            "registers"[0..46] + "alarms"[58..66] +
+ *                            "auxDiag"(67) + "status"(68) + "commandStatus"(69).
+ * Adding a raw model: add a genset_read_raw() wrapper (fc/start/count + a static
+ * GensetRawSlice_t[] slice list) + a g_drivers row. Adding a decoded model:
+ * write a driver that fills GensetData_t + a row. Bump GENSET_MODEL_MAX. */
 #define GENSET_MODEL_GC1211  0
 #define GENSET_MODEL_GC1111  1
 #define GENSET_MODEL_SGC120  2

@@ -16,7 +16,9 @@ typedef struct {
     uint8_t total[DU_RESP_MAX];  int total_len;
     uint8_t rsp[DU_RESP_MAX];    int rsp_len;
     uint8_t kfact[DU_RESP_MAX];  int kfact_len;
-    uint8_t rfid[DU_RESP_MAX];   int rfid_len;
+    /* RFID is no longer read at all (removed to keep each poll round short —
+     * see du_poll_bluesky_nozzle); the field is gone from the struct and the
+     * published payload. */
 } DuNozzle_t;
 
 /* RS485 UART must already be installed before calling this. */
@@ -31,8 +33,15 @@ void du_rs485_set_bluesky_mode(void);   /* 8E1 9600 */
  * NZ2 is still being read instead of waiting ~10 s for its partner. This also
  * matches the BlueSky protocol doc, which specifies one JSON message per
  * nozzle, and is the shape an event-driven (idle→busy) capture needs, since
- * two nozzles never finish a sale at the same moment. */
-void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *out);
+ * two nozzles never finish a sale at the same moment.
+ *
+ * read_kfactor: true only on the rounds where the k-factor is actually due
+ * (every KFACTOR_POLL_INTERVAL_S — the caller gates this). When false, or when
+ * a due read fails all its retries, the last successfully-read k-factor for
+ * this address is carried forward into out->kfact so every published message
+ * still carries a stable value without spending bus time re-reading it. The
+ * totalizer is always read (with retries); RFID is never read. */
+void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *out, bool read_kfactor);
 
 /* Build the JSON payload for a SINGLE nozzle (caller provides HW_ID and TS).
  * `label` is the global nozzle number (1-based) used as the JSON key. */

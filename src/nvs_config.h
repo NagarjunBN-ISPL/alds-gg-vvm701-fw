@@ -8,7 +8,8 @@ typedef struct {
     uint8_t  ztech_count;       /* 0-4 alone (slaves 4-7); 0-2 if pantech_count>0 (slaves 4,5) */
     uint8_t  pantech_count;     /* 0-4 (slaves 6-9); ztech capped to 2 whenever this is >0 */
     uint8_t  genset_type;       /* 0=Off,1=SEDEMAC                  */
-    uint8_t  genset_model;      /* 0=GC1211,1=GC1111,2=SGC120       */
+    uint8_t  genset_model;      /* GENSET_MODEL_* in config.h: 0=GC1211 1=GC1111
+                                 * 2=SGC120 3=GC1201 4=GC1202 5=GC1203 6=GC902 */
     uint8_t  genset_slave;      /* Modbus slave, default 10         */
     uint32_t genset_baud;       /* 4800/9600/19200, default 9600    */
     uint8_t  di_enable;         /* bitmask: bit0=DI1..bit3=DI4      */

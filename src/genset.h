@@ -3,73 +3,36 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Maximum active alarms held in one reading. DEIF SGC 120 Mk II exposes 48
- * alarm bits (12 registers x 4 nibbles); Sedemac GC1211/GC1111 expose 40
- * (10 x 4). Sized to the largest so any single model's full alarm set fits. */
-#define GENSET_MAX_ALARMS 48
+/* Upper bound on registers captured by a raw single-command read. A Modbus
+ * read is itself capped at 125 registers, so this is the honest ceiling; the
+ * models today read 67 (GC1200), 68 (GC1211/GC1111), 70 (GC902), 79 (SGC120). */
+#define GENSET_RAW_MAX_REGS 125
 
+/* One named field carved out of the raw register block: raw_regs[start ..
+ * start+count-1] published under `key`, as a JSON array when as_array is true
+ * or a bare scalar (count == 1) when false. The cloud owns all scaling; a slice
+ * only names a register range, it never interprets it. */
 typedef struct {
-    const char *name;   /* alarm parameter name (points into a static table)  */
-    uint8_t     state;  /* 2=Warning 3=Shutdown 4=ElecTrip 5=Notification      */
-} GensetAlarm_t;
+    const char *key;
+    int         start;      /* raw_regs[] start index                    */
+    int         count;      /* registers in the field (>=1; 1 for scalar) */
+    bool        as_array;   /* true -> [ .. ]; false -> scalar            */
+} GensetRawSlice_t;
 
-/* ── Normalised, model-agnostic genset reading ────────────────────────────
- * Every model driver fills this with already-scaled physical values;
- * genset_build_payload() then serialises it to JSON without needing to know
- * which controller produced it. To add a new genset model you write ONE read
- * function that fills this struct and register it in the driver table in
- * genset.c — the payload builder, the JSON schema and main.c never change. */
+/* ── Raw genset reading (model-agnostic) ──────────────────────────────────
+ * A driver issues ONE Modbus read and stores the raw 16-bit register values
+ * here — no scaling, no decode. genset_build_payload() emits them verbatim as
+ * decimal JSON fields per raw_slices, and the cloud owns the register map and
+ * all conversion. To add a model you write a genset_read_raw() wrapper (its
+ * fc/start/count + a static GensetRawSlice_t[] slice list) and a driver-table
+ * row in genset.c; this struct, the serialiser and main.c never change. */
 typedef struct {
-    bool valid;
-
-    /* Measurements — already scaled to physical units by the model driver. */
-    uint16_t protocol_rev;
-    float    lube_oil_pressure;
-    int      engine_temp;
-    uint16_t fuel_level;
-    float    charging_alt_voltage;
-    float    battery_voltage;
-    uint16_t no_of_starts;
-    uint32_t engine_run_time;
-    uint16_t engine_speed;
-    float    genset_freq;
-    float    genset_voltage[3];   /* L1, L2, L3        */
-    float    load_current[3];     /* L1, L2, L3        */
-    float    genset_power[4];     /* L1, L2, L3, total */
-
-    /* Optional: cumulative energy, regs 35-36 (Sedemac only) — 32-bit value
-     * spanning two registers, word order NOT wire-verified (assumed
-     * high-word-first per standard Modbus convention). Not currently read
-     * by any DEIF SGC 120 driver. */
-    bool     has_kwh;
-    uint32_t kwh;
-
-    /* Optional: raw values of the first three alarm registers (Sedemac only),
-     * alongside — not instead of — the decoded `alarms[]` above. */
-    bool     has_alr;
-    uint16_t alr1, alr2, alr3;
-
-    /* Active alarms — only Warning/Shutdown/ElecTrip/Notification are stored;
-     * Disabled/Inactive are dropped at decode time. */
-    GensetAlarm_t alarms[GENSET_MAX_ALARMS];
-    int  alarm_count;
-    bool alarms_truncated;        /* more alarms exist than were captured      */
-
-    /* Status */
-    bool        available;
-    bool        running;
-    bool        stopped_normally;
-    bool        stopped_with_fault;
-    const char *mode;             /* "Auto"/"Manual"/"Scheduler"/"Unknown"     */
-
-    /* Optional: command-status readback (Sedemac only)                        */
-    bool        has_command_status;
-    const char *command_status;
-
-    /* Optional: holding-register readback (Sedemac GC1211 family only)        */
-    bool     has_holding;
-    uint16_t holding_command;
-    uint16_t holding_operating_mode;
+    bool     valid;
+    bool     is_raw;                      /* set by the raw reader; all models raw */
+    uint16_t raw_regs[GENSET_RAW_MAX_REGS];
+    int      raw_reg_count;               /* registers parsed from the response   */
+    const GensetRawSlice_t *raw_slices;   /* how to name-slice raw_regs into JSON  */
+    int      raw_slice_count;
 } GensetData_t;
 
 /* RS485 must be configured for 8N1 at the desired baud before calling.

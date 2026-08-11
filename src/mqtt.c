@@ -14,7 +14,14 @@
 
 static const char *TAG = "mqtt";
 
-#define STASH_MAX    8
+/* Inbound-command queue depth. Quectel auto-ACKs a QoS-1 message to the broker
+ * when it emits the +QMTRECV URC, so a message dropped here (stash full) is NOT
+ * redelivered — it's gone at the MQTT layer (the cloud can still retry at the
+ * app layer, e.g. re-sending an rsp/kfactor that got no response). 16 covers a
+ * realistic worst-case burst (a fleet k-factor push hitting all 12 nozzles at
+ * once) with margin; parse_qmtrecv logs if it ever fills. Each slot is
+ * TOPIC_MAX+PAYLOAD_MAX ≈ 2.3 KB of BSS. */
+#define STASH_MAX    16
 #define TOPIC_MAX    256
 #define PAYLOAD_MAX  2048
 
@@ -187,7 +194,14 @@ static void parse_qmtrecv(const char *buf) {
 
     const char *search_from = buf;
     for (;;) {
-        if (g_stash_cnt >= STASH_MAX) break;
+        if (g_stash_cnt >= STASH_MAX) {
+            /* Stash full: any further complete URCs in this buffer get walked
+             * past (and dropped) by drain_recv's resume logic. Surface it —
+             * a silent drop of an inbound command is otherwise invisible. */
+            if (strstr(search_from, "+QMTRECV:"))
+                ESP_LOGW(TAG, "stash full (%d) — inbound command(s) may be dropped", STASH_MAX);
+            break;
+        }
         const char *topic_start; size_t topic_len;
         const char *p = qmtrecv_payload_start(search_from, &topic_start, &topic_len);
         if (!p) break;                             /* nothing (more) usable yet */
@@ -416,6 +430,17 @@ bool mqtt_publish(const char *topic, const char *payload) {
 
     int  mid = next_msgid();
     int  len = strlen(payload);
+    /* Backstop: the modem's QMTPUBEX ceiling is ~1500 B. Every builder already
+     * self-caps under MQTT_MODEM_PAYLOAD_SAFE_MAX (falling back to a 404 shape),
+     * so reaching this is an upstream bug — drop it rather than hand the modem a
+     * doomed command it would reject or truncate into invalid JSON. Returns
+     * false WITHOUT touching the dead-link streak: the link is fine, not the
+     * payload. */
+    if (len > MQTT_MODEM_PAYLOAD_SAFE_MAX) {
+        ESP_LOGE(TAG, "publish %s: payload %d B over safe max %d — dropped",
+                 topic, len, MQTT_MODEM_PAYLOAD_SAFE_MAX);
+        return false;
+    }
     /* Full topic + payload at INFO — field visibility into exactly what goes
      * to the broker on every publish, requested explicitly over the earlier
      * DEBUG-only tradeoff (that one existed to cap UART0 console volume;

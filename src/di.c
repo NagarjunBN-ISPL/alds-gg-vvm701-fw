@@ -111,6 +111,11 @@ void di_task(void *param) {
         int64_t dl_first = esp_timer_get_time() + (int64_t)NUVOTON_TIMEOUT_MS * 1000;
         int64_t dl_gap    = 0;
         for (;;) {
+            /* Feed the WDT inside the byte loop, not just after it. Worst case a
+             * byte-every-99ms stream stretches this to NUVOTON_BUF×100ms (~25 s
+             * today) — safe under 120 s, but this keeps it safe by construction
+             * if NUVOTON_BUF ever grows, matching the modem/RS485 read loops. */
+            if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
             int64_t dl = (got == 0) ? dl_first : dl_gap;
             if (esp_timer_get_time() >= dl || got >= NUVOTON_BUF - 1) break;
             uint8_t ch;

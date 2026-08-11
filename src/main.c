@@ -152,24 +152,40 @@ static void rs485_set_8e1_9600(void) {
 
 /* ── Build identifiers ────────────────────────────────────────────────── */
 static void build_hw_ids(void) {
+    /* Auto-assigned HW_ID suffixes are numeric and collision-free even at full
+     * capacity: dispensers use their unit number (01..06); Ztech radars 21..24
+     * and Pantech radars 31..34 (tens digit = type, ones digit = tank number);
+     * the genset uses its gensetSlave (default 10); and DI is fixed at 40. None
+     * of these ranges overlap, so a fully-loaded gateway (6 dispensers, 4 Ztech,
+     * 4 Pantech, genset, DI) never produces a duplicate. An explicit sfx* from
+     * setconfig always overrides; validate_suffixes() computes the identical auto
+     * values so the uniqueness check stays in sync with what is published here. */
     for (int i = 0; i < DU_BLUESKY_MAX; i++) {
         if (g_cfg.sfx_bs[i][0])
             snprintf(g_hw_bs[i], sizeof(g_hw_bs[i]), "%s%s", g_imei, g_cfg.sfx_bs[i]);
         else
-            snprintf(g_hw_bs[i], sizeof(g_hw_bs[i]), "%sB%d", g_imei, i + 1);
+            snprintf(g_hw_bs[i], sizeof(g_hw_bs[i]), "%s%02d", g_imei, i + 1);              /* 01..06 (unit no.) */
     }
     for (int i = 0; i < RADAR_MAX; i++) {
         if (g_cfg.sfx_ztech[i][0])
             snprintf(g_hw_ztech[i], sizeof(g_hw_ztech[i]), "%s%s", g_imei, g_cfg.sfx_ztech[i]);
         else
-            snprintf(g_hw_ztech[i], sizeof(g_hw_ztech[i]), "%sZ%d", g_imei, i + 1);
+            snprintf(g_hw_ztech[i], sizeof(g_hw_ztech[i]), "%s%02d", g_imei, 20 + i + 1);   /* 21..24 (Ztech tank no.) */
         if (g_cfg.sfx_pantech[i][0])
             snprintf(g_hw_pantech[i], sizeof(g_hw_pantech[i]), "%s%s", g_imei, g_cfg.sfx_pantech[i]);
         else
-            snprintf(g_hw_pantech[i], sizeof(g_hw_pantech[i]), "%sP%d", g_imei, i + 1);
+            snprintf(g_hw_pantech[i], sizeof(g_hw_pantech[i]), "%s%02d", g_imei, 30 + i + 1); /* 31..34 (Pantech tank no.) */
     }
-    snprintf(g_hw_genset, sizeof(g_hw_genset), "%s%s", g_imei, g_cfg.sfx_genset);
-    snprintf(g_hw_di,     sizeof(g_hw_di),     "%s%s", g_imei, g_cfg.sfx_di);
+    if (g_cfg.sfx_genset[0])
+        snprintf(g_hw_genset, sizeof(g_hw_genset), "%s%s", g_imei, g_cfg.sfx_genset);
+    else if (g_cfg.genset_slave <= 99)
+        snprintf(g_hw_genset, sizeof(g_hw_genset), "%s%02d", g_imei, g_cfg.genset_slave);   /* = slave, default 10 */
+    else
+        snprintf(g_hw_genset, sizeof(g_hw_genset), "%s10", g_imei);                         /* slave >99 can't be a 2-char suffix */
+    if (g_cfg.sfx_di[0])
+        snprintf(g_hw_di, sizeof(g_hw_di), "%s%s", g_imei, g_cfg.sfx_di);
+    else
+        snprintf(g_hw_di, sizeof(g_hw_di), "%s40", g_imei);                                 /* 40 (not on the Modbus bus) */
 }
 
 static void build_topics(void) {
@@ -293,9 +309,9 @@ static const char * const s_setcfg_known_keys[] = {
 };
 
 /* Every active piece of equipment's *effective* HW_ID suffix (custom if set,
- * else the auto-generated B<n>/Z<n>/P<n> pattern from build_hw_ids())
- * must be unique, or two pieces of equipment publish under the same HW_ID
- * and become indistinguishable downstream. */
+ * else the numeric auto value from build_hw_ids()) must be unique, or two
+ * pieces of equipment publish under the same HW_ID and become
+ * indistinguishable downstream. */
 static bool validate_suffixes(const DeviceConfig *c, char *err, size_t err_size) {
     /* Static rather than stack-local: this trio is ~770 bytes, and this
      * function sits at the bottom of a deep call chain (app_main -> ... ->
@@ -309,32 +325,41 @@ static bool validate_suffixes(const DeviceConfig *c, char *err, size_t err_size)
     static char        auto_sfx[32][8];
     int         n = 0;
 
+    /* Auto values mirror build_hw_ids() exactly: dispensers 01..06, Ztech
+     * 21..24, Pantech 31..34, genset = its slave (default 10), DI 40. These
+     * ranges never overlap, so the auto values alone can't collide; computing
+     * them here is what lets the uniqueness check below catch a CUSTOM suffix
+     * that collides with another unit's auto value (e.g. a dispenser manually
+     * set to "10" while a genset is active). */
     for (int i = 0; i < c->du_bluesky_count; i++) {
         snprintf(label[n], sizeof(label[n]), "BlueSky%d", i + 1);
         if (c->sfx_bs[i][0]) sfx[n] = c->sfx_bs[i];
-        else { snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "B%d", i + 1); sfx[n] = auto_sfx[n]; }
+        else { snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "%02d", i + 1); sfx[n] = auto_sfx[n]; }
         n++;
     }
     for (int i = 0; i < c->ztech_count; i++) {
         snprintf(label[n], sizeof(label[n]), "Ztech%d", i + 1);
         if (c->sfx_ztech[i][0]) sfx[n] = c->sfx_ztech[i];
-        else { snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "Z%d", i + 1); sfx[n] = auto_sfx[n]; }
+        else { snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "%02d", 20 + i + 1); sfx[n] = auto_sfx[n]; }
         n++;
     }
     for (int i = 0; i < c->pantech_count; i++) {
         snprintf(label[n], sizeof(label[n]), "Pantech%d", i + 1);
         if (c->sfx_pantech[i][0]) sfx[n] = c->sfx_pantech[i];
-        else { snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "P%d", i + 1); sfx[n] = auto_sfx[n]; }
+        else { snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "%02d", 30 + i + 1); sfx[n] = auto_sfx[n]; }
         n++;
     }
     if (c->genset_type != GENSET_OFF) {
         snprintf(label[n], sizeof(label[n]), "Genset");
-        sfx[n] = c->sfx_genset;  /* may be "" -> bare IMEI */
+        if (c->sfx_genset[0]) sfx[n] = c->sfx_genset;
+        else if (c->genset_slave <= 99) { snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "%02d", c->genset_slave); sfx[n] = auto_sfx[n]; }
+        else { snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "10"); sfx[n] = auto_sfx[n]; }
         n++;
     }
     if (c->di_enable) {
         snprintf(label[n], sizeof(label[n]), "DI");
-        sfx[n] = c->sfx_di;      /* may be "" -> bare IMEI */
+        if (c->sfx_di[0]) sfx[n] = c->sfx_di;
+        else { snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "40"); sfx[n] = auto_sfx[n]; }
         n++;
     }
 
@@ -353,8 +378,10 @@ static bool validate_suffixes(const DeviceConfig *c, char *err, size_t err_size)
         }
     }
 
-    /* Two active items both left blank both mean "bare IMEI" -> collides
-     * just as much as sharing an explicit suffix. */
+    /* Defensive: every equipment type now has a numeric auto-fallback (above),
+     * so no effective suffix should be empty. This still guards the case of a
+     * future equipment type added without a fallback — two empties would both
+     * resolve to the bare IMEI and collide with the device-level messages. */
     int empty_count = 0;
     for (int i = 0; i < n; i++) if (!sfx[i][0]) empty_count++;
     if (empty_count > 1) {
@@ -462,11 +489,23 @@ static void parse_setconfig(const char *json) {
     if (json_get_str(json, "cmd", cmdbuf, sizeof(cmdbuf))) {
         if (strcmp(cmdbuf, "restart") == 0) {
             ESP_LOGI(TAG, "Remote restart");
+            /* ACK before we vanish — mqtt_publish is synchronous (waits for the
+             * QMTPUBEX result), so the cloud sees the command was accepted
+             * rather than just watching the device drop off and reappear. */
+            char ack[128];
+            snprintf(ack, sizeof(ack),
+                     "{\"HW_ID\":\"%s\",\"status\":\"restarting\"}", g_imei);
+            mqtt_publish(t_data, ack);
             vTaskDelay(pdMS_TO_TICKS(500));
             esp_restart();
         }
         if (strcmp(cmdbuf, "factory_reset") == 0) {
             ESP_LOGI(TAG, "Factory reset");
+            /* ACK before wiping NVS + rebooting, same reasoning as restart. */
+            char ack[128];
+            snprintf(ack, sizeof(ack),
+                     "{\"HW_ID\":\"%s\",\"status\":\"factory_resetting\"}", g_imei);
+            mqtt_publish(t_data, ack);
             nvs_config_factory_reset();
             vTaskDelay(pdMS_TO_TICKS(500));
             esp_restart();
@@ -970,13 +1009,27 @@ static void check_post_ota(void) {
  * queued setconfig/FOTA/rsp command is serviced within about one nozzle read
  * of arriving. */
 static void poll_dispensers(void) {
-    /* One nozzle with all 4 fields at DU_RESP_MAX=32 bytes each is ~500 bytes
-     * worst case, so 1024 keeps ~2x headroom on top of the clamp_pos guard in
-     * du_build_nozzle_payload() and stays well under the modem's ~1400-byte
-     * QMTPUBEX ceiling (MQTT_MODEM_PAYLOAD_SAFE_MAX). */
+    /* One nozzle with its 3 fields at DU_RESP_MAX=32 bytes each is ~400 bytes
+     * worst case, so 1024 keeps well over 2x headroom on top of the clamp_pos
+     * guard in du_build_nozzle_payload() and stays well under the modem's
+     * ~1400-byte QMTPUBEX ceiling (MQTT_MODEM_PAYLOAD_SAFE_MAX). */
     static char       payload[1024];
     static DuNozzle_t nz;
     char ts[32];
+
+    /* K-factor is a near-constant calibration value, so it is read only every
+     * KFACTOR_POLL_INTERVAL_S; on every other round du_poll_bluesky_nozzle
+     * carries the last good value forward. Gated here once per round (applied
+     * to every nozzle this round) so the tight per-nozzle totalizer cadence is
+     * not spent re-reading it. 0 = never read yet, so the first round after
+     * boot reads it. esp_timer_get_time() is a monotonic microsecond counter,
+     * so plain subtraction needs no wrap handling (same pattern as the radar/
+     * genset rate limits in run_poll_cycle). */
+    static int64_t last_kfactor_us = 0;
+    int64_t now_us = esp_timer_get_time();
+    bool read_kf = (last_kfactor_us == 0 ||
+                    now_us - last_kfactor_us >= (int64_t)KFACTOR_POLL_INTERVAL_S * 1000000LL);
+    if (read_kf) last_kfactor_us = now_us;
 
     /* AND across every nozzle polled THIS cycle rather than last-one-wins — a
      * dead nozzle hidden behind a healthy one would otherwise report ok. */
@@ -993,7 +1046,7 @@ static void poll_dispensers(void) {
              * Setting it here keeps this loop correct without depending on
              * what that path happened to leave behind. */
             rs485_set_8e1_9600();
-            du_poll_bluesky_nozzle(addr, &nz);
+            du_poll_bluesky_nozzle(addr, &nz, read_kf);
             rs485_set_8n1(9600);
 
             rtc_timestamp(ts, sizeof(ts));   /* stamped at the read, not the cycle */
@@ -1022,8 +1075,18 @@ static bool poll_one_tank(int tank_idx, bool is_ztech, const char *ts) {
     uint8_t rx[64];
     char    payload[512];
     int  rx_len = 0;
-    bool ok = is_ztech ? radar_ztech_read(tank_idx, rx, &rx_len)
-                        : radar_pantech_read(tank_idx, rx, &rx_len);
+    /* Up to RADAR_READ_RETRIES attempts before giving up this cycle. Radar is
+     * polled infrequently (RADAR_POLL_INTERVAL_S) and its level changes slowly,
+     * so a short retry burst costs almost nothing and recovers a reading lost
+     * to a single bus collision / line-noise frame instead of publishing 404.
+     * Uniform across Ztech/Pantech (and any future radar type) since the retry
+     * wraps the type dispatch, not a specific driver. */
+    bool ok = false;
+    for (int attempt = 1; attempt <= RADAR_READ_RETRIES && !ok; attempt++) {
+        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(100));
+        ok = is_ztech ? radar_ztech_read(tank_idx, rx, &rx_len)
+                      : radar_pantech_read(tank_idx, rx, &rx_len);
+    }
     const char *hw = is_ztech ? g_hw_ztech[tank_idx] : g_hw_pantech[tank_idx];
 
     if (!ok || rx_len == 0) {
@@ -1063,9 +1126,22 @@ static void poll_radar(const char *ts) {
 /* ── Poll genset ──────────────────────────────────────────────────────── */
 static void poll_genset(const char *ts) {
     static GensetData_t gd;
-    static char payload[4096];  /* genset with all alarms can exceed 2 KB */
+    /* Raw genset payloads are small — the largest (SGC120: 62 registers + 12
+     * alarms + status) is ~550 bytes — but the buffer is left at 4096 so the
+     * builder's own ceiling check (MQTT_MODEM_PAYLOAD_SAFE_MAX), not the buffer,
+     * is what bounds the payload, and a future wider register block can't
+     * silently truncate here. */
+    static char payload[4096];
     rs485_set_8n1(g_cfg.genset_baud);
-    bool ok = genset_poll(g_cfg.genset_slave, g_cfg.genset_model, &gd);
+    /* Up to GENSET_READ_RETRIES attempts before giving up this cycle.
+     * genset_poll() memsets gd on entry, so a failed attempt leaves it cleared
+     * and a later success fully repopulates it; if every attempt fails, gd.valid
+     * stays false and genset_build_payload() emits the standard 404 shape. */
+    bool ok = false;
+    for (int attempt = 1; attempt <= GENSET_READ_RETRIES && !ok; attempt++) {
+        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(100));
+        ok = genset_poll(g_cfg.genset_slave, g_cfg.genset_model, &gd);
+    }
     genset_build_payload(&gd, g_hw_genset, ts, payload, sizeof(payload));
     rs485_set_8e1_9600();
     bool pub = mqtt_publish(t_data, payload);
@@ -1100,10 +1176,10 @@ static int ts_hour(const char *ts) {
 static bool s_reboot_armed = false;
 
 static void check_daily_reboot(const char *ts) {
-    int h = ts_hour(ts);
-    if (h < 0) return;
-    if (h >= 3) s_reboot_armed = true;          /* re-arm once per day after 3 AM */
-    if (h == 2 && s_reboot_armed) {
+    int h = ts_hour(ts);                         /* UTC hour (RTC holds UTC) */
+    if (h < 0) return;                           /* unsynced clock -> never reboot */
+    if (h >= DAILY_REBOOT_REARM_HOUR) s_reboot_armed = true;  /* re-arm once/day */
+    if (h == DAILY_REBOOT_UTC_HOUR && s_reboot_armed) {
         s_reboot_armed = false;
         ESP_LOGI(TAG, "Scheduled daily reboot");
         vTaskDelay(pdMS_TO_TICKS(500));

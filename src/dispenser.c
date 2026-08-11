@@ -21,7 +21,7 @@
 #define BS_CMD_TOTAL  0xC5
 #define BS_CMD_RSP    0xB6
 #define BS_CMD_KFACT  0xE2
-#define BS_CMD_RFID   0xD7
+/* BS_CMD_RFID (0xD7) intentionally removed — RFID is no longer polled. */
 
 static void bluesky_frame(uint8_t addr, uint8_t cmd_byte, uint8_t *out /* 5 bytes */) {
     out[0] = 0xF5;
@@ -152,8 +152,33 @@ static void log_raw_frame(uint8_t addr, const char *what, const uint8_t *buf, in
     ESP_LOGI(TAG, "BlueSky nz%u %s: [%s]", addr, what, hex);
 }
 
+/* Read one BlueSky data field (totalizer / RSP / k-factor) into buf, retrying
+ * up to max_tries times, and return the VALIDATED response length (0 if every
+ * attempt failed or returned an invalid frame). Consolidates the read + raw
+ * log + header/addr validation the individual field blocks used to repeat
+ * inline, and adds the retry the sale-critical reads now need. Each attempt
+ * flushes the RS485 RX inside rs485_xfer(), so a stale reply from a prior
+ * attempt can't be mistaken for this one. */
+static int du_read_field(uint8_t addr, uint8_t cmd_byte, uint8_t *buf,
+                         int max_tries, const char *what) {
+    uint8_t cmd[5];
+    bluesky_frame(addr, cmd_byte, cmd);
+    for (int attempt = 1; attempt <= max_tries; attempt++) {
+        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(DU_STATUS_RETRY_MS));
+        int len = rs485_xfer(cmd, 5, buf, DU_RESP_MAX);
+        esp_task_wdt_reset();
+        log_raw_frame(addr, what, buf, len);
+        if (len > 0 && bluesky_resp_valid(buf, len, addr, what))
+            return len;
+        if (attempt < max_tries)
+            ESP_LOGW(TAG, "BlueSky nz%u %s: no valid frame (attempt %d/%d) — retrying",
+                     addr, what, attempt, max_tries);
+    }
+    return 0;
+}
+
 /* ── BlueSky polling ──────────────────────────────────────────────────── */
-void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz) {
+void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz, bool read_kfactor) {
     memset(nz, 0, sizeof(*nz));
     nz->present = false;
 
@@ -198,7 +223,7 @@ void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz) {
     }
 
     /* Nothing ever answered — physically absent or a dead link. Skipping the
-     * four data reads keeps an unpopulated slot at one status cost, not five. */
+     * data reads keeps an unpopulated slot at one status transaction's cost. */
     if (!nz->present) return;
 
     /* Answered, but still fuelling. Leave the totalizer alone until the sale
@@ -211,48 +236,51 @@ void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz) {
 
     vTaskDelay(pdMS_TO_TICKS(30));
 
-    /* Data reads — reached only with the nozzle confirmed idle. An invalid
-     * frame zeroes that field's length, so the payload builder reports "404"
-     * for it instead of forwarding noise. */
+    /* ── Data reads — reached only with the nozzle confirmed idle ──────────
+     * Each read validates its own frame; an unanswered or invalid read leaves
+     * that field's length at 0, so the payload builder reports "404" for it
+     * instead of forwarding noise. RFID is deliberately not read at all. */
 
-    /* Totalizer */
-    bluesky_frame(addr, BS_CMD_TOTAL, cmd);
-    nz->total_len = rs485_xfer(cmd, 5, nz->total, DU_RESP_MAX);
-    esp_task_wdt_reset();
-    log_raw_frame(addr, "total", nz->total, nz->total_len);
-    if (nz->total_len > 0 &&
-        !bluesky_resp_valid(nz->total, nz->total_len, addr, "total"))
-        nz->total_len = 0;
+    /* Totalizer — THE sale-critical value, so it is retried up to
+     * DU_TOTAL_RETRIES times before giving up on this cycle. */
+    nz->total_len = du_read_field(addr, BS_CMD_TOTAL, nz->total, DU_TOTAL_RETRIES, "total");
     vTaskDelay(pdMS_TO_TICKS(30));
 
-    /* RSP */
-    bluesky_frame(addr, BS_CMD_RSP, cmd);
-    nz->rsp_len = rs485_xfer(cmd, 5, nz->rsp, DU_RESP_MAX);
-    esp_task_wdt_reset();
-    log_raw_frame(addr, "rsp", nz->rsp, nz->rsp_len);
-    if (nz->rsp_len > 0 &&
-        !bluesky_resp_valid(nz->rsp, nz->rsp_len, addr, "rsp"))
-        nz->rsp_len = 0;
+    /* RSP — single read, unchanged cadence (kept short to protect the round). */
+    nz->rsp_len = du_read_field(addr, BS_CMD_RSP, nz->rsp, 1, "rsp");
     vTaskDelay(pdMS_TO_TICKS(30));
 
-    /* K-Factor */
-    bluesky_frame(addr, BS_CMD_KFACT, cmd);
-    nz->kfact_len = rs485_xfer(cmd, 5, nz->kfact, DU_RESP_MAX);
-    esp_task_wdt_reset();
-    log_raw_frame(addr, "kfact", nz->kfact, nz->kfact_len);
-    if (nz->kfact_len > 0 &&
-        !bluesky_resp_valid(nz->kfact, nz->kfact_len, addr, "kfact"))
-        nz->kfact_len = 0;
-    vTaskDelay(pdMS_TO_TICKS(30));
+    /* ── K-Factor: read only when due, carried forward otherwise ───────────
+     * Per-address cache of the last successfully-read k-factor, indexed by the
+     * 1-based nozzle address (1..DU_BLUESKY_MAX*2; slot 0 unused). On a
+     * non-due round — or a due round whose retries all fail — the last good
+     * value is copied back into nz->kfact, so every published message carries
+     * a stable k-factor without spending bus time re-reading a value that
+     * changes only on recalibration. Zero-length until the first good read,
+     * which the payload builder renders as "404". */
+    static uint8_t kf_cache[DU_BLUESKY_MAX * 2 + 1][DU_RESP_MAX];
+    static int     kf_cache_len[DU_BLUESKY_MAX * 2 + 1];
+    bool addr_cacheable = (addr >= 1 && addr <= DU_BLUESKY_MAX * 2);
 
-    /* RFID */
-    bluesky_frame(addr, BS_CMD_RFID, cmd);
-    nz->rfid_len = rs485_xfer(cmd, 5, nz->rfid, DU_RESP_MAX);
-    esp_task_wdt_reset();
-    log_raw_frame(addr, "rfid", nz->rfid, nz->rfid_len);
-    if (nz->rfid_len > 0 &&
-        !bluesky_resp_valid(nz->rfid, nz->rfid_len, addr, "rfid"))
-        nz->rfid_len = 0;
+    if (read_kfactor) {
+        nz->kfact_len = du_read_field(addr, BS_CMD_KFACT, nz->kfact, DU_KFACTOR_RETRIES, "kfact");
+        if (nz->kfact_len > 0) {
+            if (addr_cacheable) {
+                memcpy(kf_cache[addr], nz->kfact, nz->kfact_len);
+                kf_cache_len[addr] = nz->kfact_len;
+            }
+        } else if (addr_cacheable && kf_cache_len[addr] > 0) {
+            /* Due, but every attempt failed — keep the last good value rather
+             * than regress a known k-factor to 404 on a transient miss. */
+            memcpy(nz->kfact, kf_cache[addr], kf_cache_len[addr]);
+            nz->kfact_len = kf_cache_len[addr];
+            ESP_LOGW(TAG, "BlueSky nz%u kfact: read failed — carrying last good value forward", addr);
+        }
+    } else if (addr_cacheable && kf_cache_len[addr] > 0) {
+        memcpy(nz->kfact, kf_cache[addr], kf_cache_len[addr]);
+        nz->kfact_len = kf_cache_len[addr];
+    }
+    /* RFID intentionally not read. */
 }
 
 /* ── Hex helpers ──────────────────────────────────────────────────────── */
@@ -271,6 +299,9 @@ void du_bytes_to_hex(const uint8_t *data, int len, char *out, size_t out_size) {
  * a truncated field into an out-of-bounds write. Same pattern already fixed
  * in genset.c; applied here since this function chains snprintf the same way. */
 static inline int clamp_pos(int pos, size_t buf_size) {
+    if (pos < 0) return 0;   /* snprintf returns <0 on encoding error — never let
+                              * `pos` go negative, or buf+pos / buf_size-pos below
+                              * would address outside the buffer. */
     return (pos > (int)buf_size - 1) ? (int)buf_size - 1 : pos;
 }
 
@@ -278,12 +309,14 @@ static inline int clamp_pos(int pos, size_t buf_size) {
  * The "nozzles" wrapper is deliberately retained so the cloud parser sees the
  * exact structure it already consumes; only the number of nozzles inside drops
  * to one:
- *   {"HW_ID":"..","nozzles":{"1":{"data":"..","rsp":"..","kfact":"..","rfid":".."}},"TS":".."}
+ *   {"HW_ID":"..","nozzles":{"1":{"data":"..","rsp":"..","kfact":".."}},"TS":".."}
  *
  * This is also what the BlueSky protocol doc specifies (one message per
  * nozzle), and it halves the payload: worst case ~500 B instead of ~920 B,
  * putting every dispenser message comfortably under the modem's ~1400-byte
- * QMTPUBEX ceiling (MQTT_MODEM_PAYLOAD_SAFE_MAX) rather than near it. */
+ * QMTPUBEX ceiling (MQTT_MODEM_PAYLOAD_SAFE_MAX) rather than near it. The
+ * "rfid" field is gone (RFID is no longer read); "kfact" is the last value
+ * read on the 15-min k-factor cadence, carried forward in between. */
 void du_build_nozzle_payload(const DuNozzle_t *nz, int label,
                              const char *hw_id, const char *ts,
                              char *buf, size_t buf_size) {
@@ -309,19 +342,15 @@ void du_build_nozzle_payload(const DuNozzle_t *nz, int label,
         char h_tot[128];
         char h_rsp[128];
         char h_kf [128];
-        char h_rf [128];
         if (nz->total_len > 0) du_bytes_to_hex(nz->total, nz->total_len, h_tot, sizeof(h_tot));
         else strcpy(h_tot, "404");
         if (nz->rsp_len > 0)   du_bytes_to_hex(nz->rsp,   nz->rsp_len,   h_rsp, sizeof(h_rsp));
         else strcpy(h_rsp, "404");
         if (nz->kfact_len > 0) du_bytes_to_hex(nz->kfact, nz->kfact_len, h_kf,  sizeof(h_kf));
         else strcpy(h_kf, "404");
-        if (nz->rfid_len > 0)  du_bytes_to_hex(nz->rfid,  nz->rfid_len,  h_rf,  sizeof(h_rf));
-        else strcpy(h_rf, "404");
         pos += snprintf(buf + pos, buf_size - pos,
-                        "\"%d\":{\"data\":\"%s\",\"rsp\":\"%s\","
-                        "\"kfact\":\"%s\",\"rfid\":\"%s\"}",
-                        label, h_tot, h_rsp, h_kf, h_rf);
+                        "\"%d\":{\"data\":\"%s\",\"rsp\":\"%s\",\"kfact\":\"%s\"}",
+                        label, h_tot, h_rsp, h_kf);
         pos = clamp_pos(pos, buf_size);
     }
 
