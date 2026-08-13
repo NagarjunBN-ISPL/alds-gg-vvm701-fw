@@ -83,13 +83,13 @@
  * RADAR_CYCLE_INTERVAL=2 was nominally "every 60 s" but measured ~168 s in the
  * field once dispenser polling stretched the cycle. Anchoring to elapsed
  * microseconds makes "every 3 minutes" mean exactly that. */
-#define RADAR_POLL_INTERVAL_S   600   /* tanks:  every 10 min */
+        #define RADAR_POLL_INTERVAL_S   600  /* tanks:  every 10 min */
 #define GENSET_POLL_INTERVAL_S  300   /* DG:     every 5 min  */
 /* BlueSky k-factor is a near-constant calibration value; read it only this
  * often and carry the last good reading forward on every other dispenser round
  * (see du_poll_bluesky_nozzle) so the tight totalizer cadence isn't spent
  * re-reading it. */
-#define KFACTOR_POLL_INTERVAL_S 900   /* k-factor: every 15 min */
+    #define KFACTOR_POLL_INTERVAL_S 900   /* k-factor: every 15 min */
 
 /* ── RTC discipline ─────────────────────────────────────────────────────────
  * Network time sets the ESP32 RTC at boot and is refreshed on this interval to
