@@ -447,6 +447,20 @@ static int64_t s_last_sync_us  = 0;
  * strchr('-'): a '-' can legitimately appear nowhere else in these formats
  * today, but anchoring to the seconds field keeps that from becoming a silent
  * trap if the modem ever emits a different date separator. */
+/* Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian UTC date,
+ * per Howard Hinnant's days_from_civil algorithm. Self-contained so the UTC
+ * conversion in parse_and_set_rtc() needs neither mktime()+tzset() (which
+ * mutates the global TZ state) nor timegm() (not declared in ESP-IDF's newlib
+ * headers). Exact for every date this firmware sees (validated to 2020–2099). */
+static int64_t days_from_civil(int y, unsigned m, unsigned d) {
+    y -= (m <= 2);
+    const int64_t  era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);                       /* [0, 399]    */
+    const unsigned doy = (153u * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1; /* [0, 365]    */
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;           /* [0, 146096] */
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
 static bool parse_and_set_rtc(const char *s, bool two_digit_year) {
     int Y, Mo, D, h, m, sec;
     if (sscanf(s, "%d/%d/%d,%d:%d:%d", &Y, &Mo, &D, &h, &m, &sec) != 6)
@@ -477,21 +491,11 @@ static bool parse_and_set_rtc(const char *s, bool two_digit_year) {
         h < 0 || h > 23 || m < 0 || m > 59 || sec < 0 || sec > 60)
         return false;
 
-    struct tm t = {0};
-    t.tm_year  = Y - 1900;
-    t.tm_mon   = Mo - 1;
-    t.tm_mday  = D;
-    t.tm_hour  = h;
-    t.tm_min   = m;
-    t.tm_sec   = sec;
-    t.tm_isdst = 0;
-
-    /* mktime() interprets struct tm in the process timezone; pin it to UTC so
-     * the conversion is exact regardless of what TZ happens to be set to. */
-    setenv("TZ", "UTC0", 1);
-    tzset();
-    time_t epoch = mktime(&t);
-    if (epoch == (time_t)-1) return false;
+    /* Convert the validated UTC calendar fields to epoch seconds directly — no
+     * struct tm, no mktime()/tzset() global-TZ mutation, and no timegm() (which
+     * ESP-IDF's newlib headers don't declare). See days_from_civil() above. */
+    int64_t epoch = days_from_civil(Y, (unsigned)Mo, (unsigned)D) * 86400LL
+                  + (int64_t)h * 3600 + (int64_t)m * 60 + sec;
 
     long off = (long)tz_qh * 15 * 60;
     epoch = (tz_sign == '+') ? epoch - off : epoch + off;

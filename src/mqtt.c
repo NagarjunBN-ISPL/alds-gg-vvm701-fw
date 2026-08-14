@@ -30,8 +30,14 @@ typedef struct {
     char payload[PAYLOAD_MAX];
 } MqttMsg_t;
 
+/* Inbound-command queue as a circular buffer: push at (head + cnt) % STASH_MAX,
+ * pop at head. Avoids the O(n) array shift a linear queue does on every pop —
+ * each MqttMsg_t is ~2.3 KB, so draining a full 16-deep stash the linear way
+ * memmoved ~34 KB per pop. Single-task access (parse_qmtrecv pushes, mqtt_poll
+ * pops, both on the main task), so no locking is needed. */
 static MqttMsg_t g_stash[STASH_MAX];
-static int       g_stash_cnt  = 0;
+static int       g_stash_head = 0;   /* index of the oldest queued message */
+static int       g_stash_cnt  = 0;   /* number of messages queued          */
 static int       g_msgid      = 1;
 static bool      g_connected  = false;
 static char      g_client_id[80];
@@ -214,7 +220,8 @@ static void parse_qmtrecv(const char *buf) {
         size_t pl_len = (size_t)(content_end - content_start);
         if (pl_len > 0 && content_start[pl_len - 1] == '\r') pl_len--;
 
-        MqttMsg_t *m = &g_stash[g_stash_cnt++];
+        MqttMsg_t *m = &g_stash[(g_stash_head + g_stash_cnt) % STASH_MAX];
+        g_stash_cnt++;
         size_t tl = (topic_len < TOPIC_MAX - 1)   ? topic_len : TOPIC_MAX - 1;
         size_t pl = (pl_len   < PAYLOAD_MAX - 1)  ? pl_len   : PAYLOAD_MAX - 1;
         memcpy(m->topic,   topic_start,   tl); m->topic[tl]   = '\0';
@@ -293,7 +300,8 @@ static void drain_recv(int timeout_ms) {
 
 bool mqtt_init(const char *imei) {
     snprintf(g_client_id, sizeof(g_client_id), "iotronics-%s", imei);
-    g_stash_cnt = 0;
+    g_stash_head = 0;
+    g_stash_cnt  = 0;
     g_connected = false;
     g_msgid     = 1;
     /* Rescue +QMTRECV: URCs that would otherwise be silently discarded by
@@ -532,28 +540,26 @@ bool mqtt_publish(const char *topic, const char *payload) {
     return pub_result(pub_ok, topic);
 }
 
+/* Pop the oldest queued message into the caller's buffers. O(1): advances the
+ * ring-buffer head rather than shifting the array. Returns false if empty. */
+static bool stash_pop(char *topic_out, size_t topic_size,
+                      char *payload_out, size_t payload_size) {
+    if (g_stash_cnt == 0) return false;
+    const MqttMsg_t *m = &g_stash[g_stash_head];
+    strncpy(topic_out,   m->topic,   topic_size - 1);
+    topic_out[topic_size - 1] = '\0';
+    strncpy(payload_out, m->payload, payload_size - 1);
+    payload_out[payload_size - 1] = '\0';
+    g_stash_head = (g_stash_head + 1) % STASH_MAX;
+    g_stash_cnt--;
+    return true;
+}
+
 bool mqtt_poll(char *topic_out, size_t topic_size,
                char *payload_out, size_t payload_size) {
-    if (g_stash_cnt > 0) {
-        strncpy(topic_out,   g_stash[0].topic,   topic_size - 1);
-        topic_out[topic_size - 1] = '\0';
-        strncpy(payload_out, g_stash[0].payload, payload_size - 1);
-        payload_out[payload_size - 1] = '\0';
-        for (int i = 1; i < g_stash_cnt; i++) g_stash[i - 1] = g_stash[i];
-        g_stash_cnt--;
-        return true;
-    }
+    if (stash_pop(topic_out, topic_size, payload_out, payload_size)) return true;
     drain_recv(100);
-    if (g_stash_cnt > 0) {
-        strncpy(topic_out,   g_stash[0].topic,   topic_size - 1);
-        topic_out[topic_size - 1] = '\0';
-        strncpy(payload_out, g_stash[0].payload, payload_size - 1);
-        payload_out[payload_size - 1] = '\0';
-        for (int i = 1; i < g_stash_cnt; i++) g_stash[i - 1] = g_stash[i];
-        g_stash_cnt--;
-        return true;
-    }
-    return false;
+    return stash_pop(topic_out, topic_size, payload_out, payload_size);
 }
 
 void mqtt_disconnect(void) {

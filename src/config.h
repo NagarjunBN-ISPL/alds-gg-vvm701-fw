@@ -66,7 +66,7 @@
 /* GPIO 35/36/37 are used by 8MB PSRAM — must not be touched */
 
 /* ── Diagnostics ────────────────────────────────────────────────────────── */
-#define DIAG_CYCLE_INTERVAL  45       /* publish diagnostics + sysmon every N poll cycles (~15 min at 20 s/cycle) */
+#define DIAG_CYCLE_INTERVAL  45       /* publish the combined diagnostics report every N poll cycles (~15 min at 20 s/cycle) */
 #define DIAG_BOOT_GRACE_MS   60000    /* ignore loop_max during boot warmup  */
 
 /* ── Secondary-equipment cadence (wall-clock, not cycle counts) ─────────────
@@ -100,15 +100,23 @@
  * read used to cost. */
 #define TIME_RESYNC_INTERVAL_S  21600  /* 6 hours */
 
-/* ── Daily maintenance reboot ────────────────────────────────────────────────
- * A once-a-day reboot clears any slow creep before it matters. The hour is UTC
- * (the RTC holds UTC — see modem.c). 20:00 UTC = 01:30 IST, a deliberately quiet
- * window at Indian fuel stations; the previous 02:00 UTC landed at 07:30 IST, in
- * the morning rush. REARM_HOUR must be LATER than REBOOT_HOUR so the device
- * doesn't reboot twice in the same window (see check_daily_reboot). A unit whose
- * RTC never synced (stuck at 1970) simply never triggers this — which is fine. */
-#define DAILY_REBOOT_UTC_HOUR    20   /* 20:00 UTC = 01:30 IST */
-#define DAILY_REBOOT_REARM_HOUR  21   /* re-arm once per day after this UTC hour */
+/* ── Maintenance reboot ───────────────────────────────────────────────────
+ * There is deliberately NO on-device scheduled reboot. It used to fire on a
+ * fixed local RTC hour (20:00 UTC / 01:30 IST), but that meant every gateway
+ * in the fleet re-attached to the cellular network and the MQTT broker at the
+ * same instant — a synchronised load spike that only gets worse as the fleet
+ * grows, for a mechanism this firmware doesn't actually need (there is no
+ * malloc anywhere, so heap fragmentation cannot occur, and esp_restart() does
+ * not power-cycle the modem, so it cannot clear a wedged SIM/PDP either — see
+ * the existing low-heap guard in run_poll_cycle() and the L1-L4 ladder in
+ * mqtt_reconnect_if_needed() for the guards that actually matter).
+ *
+ * Maintenance reboots are now entirely cloud-driven: push {"cmd":"restart"}
+ * to a device's own <base>/<imei>/setconfig topic (see parse_setconfig() in
+ * main.c). This lets the cloud stagger a fleet-wide reboot across a schedule
+ * of its choosing (e.g. 10% of the fleet per time slot) instead of every unit
+ * doing it at once. See CLOUD_INTEGRATION_GUIDE.md section 7 for the batching
+ * guidance given to the cloud team. */
 
 /* ── GPS/GNSS cadence ──────────────────────────────────────────────────────
  * Controls how often poll_gps() re-reads AT+QGPSLOC and publishes. The GNSS
@@ -204,31 +212,29 @@
 #define GENSET_SLAVE_DEFAULT 10   /* DG default Modbus slave ID */
 #define GENSET_READ_RETRIES  3    /* attempts per DG poll before reporting 404 (total, not extra) */
 
-/* Genset model — selects the driver in genset.c (see the g_drivers table).
- * Every model uses the RAW single-command path (firmware ships raw register
- * integers, the cloud owns the register map + all scaling). Each raw model has
- * its OWN map — do not assume two share one just because the family name is
- * close (GC902 differs from the GC1201/02/03 it is often sold with). Register
- * offsets below are Modbus protocol offsets:
- *   GC1211                 → Sedemac, RAW FC04, offsets 1..68:
- *                            "registers"[1..36] + "alarms"[57..66] +
- *                            "status"(67) + "commandStatus"(68).
- *   GC1111                 → Sedemac, RAW FC04, offsets 1..68 — shares GC1211's
- *                            driver+map (confirmed against field hardware). Its
- *                            own manual documents a different, non-contiguous map
- *                            (measurements at reg 1024.., alarms at 39425..) that
- *                            can't be read in one command and that field units
- *                            don't actually use; the GC1211 map is correct here.
- *   SGC120                 → DEIF SGC 120 Mk II, RAW FC03, offsets 0..78:
- *                            "registers"[0..61] + "alarms"[65..76] + "status"(78).
- *   GC1201/1202/1203       → Ashok Leyland "Nel Botl", RAW FC04, offsets 1..67:
- *                            "registers"[1..36] + "status"(67). One shared map.
- *   GC902                  → Sedemac, RAW FC04, offsets 0..69 (its OWN map):
- *                            "registers"[0..46] + "alarms"[58..66] +
- *                            "auxDiag"(67) + "status"(68) + "commandStatus"(69).
- * Adding a raw model: add a genset_read_raw() wrapper (fc/start/count + a static
- * GensetRawSlice_t[] slice list) + a g_drivers row. Adding a decoded model:
- * write a driver that fills GensetData_t + a row. Bump GENSET_MODEL_MAX. */
+/* Genset model — selects the Modbus read set (see g_models[] in genset.c). Per
+ * the DG integration spec each poll issues up to TWO reads, and each is
+ * published as its OWN message: a measurement block under "registers" and a DG
+ * status block under "status". Both carry the read's DATA bytes as a
+ * comma-separated hex string (Modbus header and CRC stripped) — the same shape
+ * radar uses. The firmware never interprets a genset register; the cloud owns
+ * every register map and all scaling. Reads per model (all CRC-verified against
+ * the spec's documented captures):
+ *   GC1211        → Mahindra, FC04: registers 1..36 (72 B), status 67..68 (4 B)
+ *   GC1111        → Mahindra, FC03: registers 1..36 (72 B), status 67..68 (4 B)
+ *                   Identical to GC1211 apart from the function code — the spec
+ *                   documents FC03 for this model explicitly.
+ *   SGC120        → FC03: one overall read, registers 1..78 (156 B). No status
+ *                   command; the single block already covers it.
+ *   GC1201/02/03  → Ashok Leyland ("Bottling Plant DG"), FC04: registers 1..36
+ *                   (72 B), status 67 (2 B — one register, unlike the Mahindras)
+ *   GC902         → NOT covered by the spec; mapped to the Ashok Leyland read
+ *                   set, which the vendor register map lists as one shared
+ *                   family map. Verify on real GC902 hardware before relying.
+ * The separate alarm command the spec lists for GC1211/GC1111 is deliberately
+ * NOT issued — alarm state is carried inside the blocks above, and skipping it
+ * keeps the genset off the shared RS485 bus for one fewer transaction.
+ * Adding a model: add one g_models[] row. Bump GENSET_MODEL_MAX. */
 #define GENSET_MODEL_GC1211  0
 #define GENSET_MODEL_GC1111  1
 #define GENSET_MODEL_SGC120  2

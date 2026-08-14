@@ -297,7 +297,18 @@ static bool fota_flash(char *reason, size_t reason_size) {
             if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
             uint8_t ch;
             if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(20)) > 0) {
-                if (hi < (int)sizeof(hdr) - 1) hdr[hi++] = ch;
+                /* Compact instead of freezing a full buffer: if an interleaved
+                 * URC (+QMTSTAT/+QIURC/…) or line noise fills hdr before CONNECT
+                 * arrives, a fixed accumulator would stop appending and the
+                 * CONNECT that follows would never match. Keep only the last
+                 * KEEP bytes — comfortably more than a whole "CONNECT <len>\r\n"
+                 * — so the header can always still be matched. */
+                if (hi >= (int)sizeof(hdr) - 1) {
+                    const int KEEP = 24;
+                    memmove(hdr, hdr + hi - KEEP, KEEP);
+                    hi = KEEP;
+                }
+                hdr[hi++] = ch;
                 hdr[hi] = '\0';
                 if (ch == '\n' && strstr(hdr, "CONNECT")) {
                     char *pn = strstr(hdr, "CONNECT");

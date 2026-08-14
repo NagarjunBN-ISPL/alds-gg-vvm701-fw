@@ -11,7 +11,6 @@
 #include "gps.h"
 #include "tls_ca.h"
 #include "diagnostics.h"
-#include "sysmon.h"
 
 #include "nvs_flash.h"
 #include "esp_log.h"
@@ -1126,26 +1125,45 @@ static void poll_radar(const char *ts) {
 /* ── Poll genset ──────────────────────────────────────────────────────── */
 static void poll_genset(const char *ts) {
     static GensetData_t gd;
-    /* Raw genset payloads are small — the largest (SGC120: 62 registers + 12
-     * alarms + status) is ~550 bytes — but the buffer is left at 4096 so the
-     * builder's own ceiling check (MQTT_MODEM_PAYLOAD_SAFE_MAX), not the buffer,
-     * is what bounds the payload, and a future wider register block can't
+    /* Raw-hex genset payloads are small — the largest frame (SGC120: 163 bytes
+     * → ~490 hex chars) is well under 600 bytes — but the buffer is left at 4096
+     * so the builder's own ceiling check (MQTT_MODEM_PAYLOAD_SAFE_MAX), not the
+     * buffer, is what bounds the payload, and a future wider read block can't
      * silently truncate here. */
     static char payload[4096];
     rs485_set_8n1(g_cfg.genset_baud);
     /* Up to GENSET_READ_RETRIES attempts before giving up this cycle.
      * genset_poll() memsets gd on entry, so a failed attempt leaves it cleared
-     * and a later success fully repopulates it; if every attempt fails, gd.valid
-     * stays false and genset_build_payload() emits the standard 404 shape. */
+     * and a later success fully repopulates it. It returns true only when EVERY
+     * read the model defines succeeded; a partial result still publishes what it
+     * got, with "404" for the read that failed. */
     bool ok = false;
     for (int attempt = 1; attempt <= GENSET_READ_RETRIES && !ok; attempt++) {
         if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(100));
         ok = genset_poll(g_cfg.genset_slave, g_cfg.genset_model, &gd);
     }
-    genset_build_payload(&gd, g_hw_genset, ts, payload, sizeof(payload));
+    /* Restore the dispenser bus mode before publishing — the RS485 work is done
+     * and mqtt_publish() can block for a second or more per message. */
     rs485_set_8e1_9600();
+
+    /* Message 1 of up to 2: the measurement block. Each Modbus read is published
+     * as its own message per the DG integration spec, both under the genset
+     * HW_ID and sharing this cycle's timestamp. */
+    genset_build_registers_payload(&gd, g_hw_genset, ts, payload, sizeof(payload));
     bool pub = mqtt_publish(t_data, payload);
     if (pub) g_diag.pub_ok++; else g_diag.pub_fail++;
+
+    /* Message 2: the DG status block, for every model that defines one (all but
+     * the SGC 120, whose single overall read already covers it). has_status is
+     * set from the model table even when the reads failed, so a dead DG still
+     * reports a "404" status rather than silently sending nothing. */
+    if (gd.has_status) {
+        genset_build_status_payload(&gd, g_hw_genset, ts, payload, sizeof(payload));
+        bool pub_st = mqtt_publish(t_data, payload);
+        if (pub_st) g_diag.pub_ok++; else g_diag.pub_fail++;
+        pub = pub && pub_st;
+    }
+
     g_diag.genset_ok = ok && pub;
 }
 
@@ -1162,29 +1180,6 @@ static void poll_gps(const char *ts) {
     bool pub = mqtt_publish(t_data, payload);
     if (pub) g_diag.pub_ok++; else g_diag.pub_fail++;
     g_diag.gps_ok = ok && pub;
-}
-
-/* ── Timestamp hour extractor ─────────────────────────────────────────── */
-/* ts format: "2026-07-01 02:00:15"  →  returns 2 */
-static int ts_hour(const char *ts) {
-    if (!ts || strlen(ts) < 13) return -1;
-    int h = (ts[11] - '0') * 10 + (ts[12] - '0');
-    return (h >= 0 && h <= 23) ? h : -1;
-}
-
-/* ── Daily scheduled reboot at 2 AM ──────────────────────────────────── */
-static bool s_reboot_armed = false;
-
-static void check_daily_reboot(const char *ts) {
-    int h = ts_hour(ts);                         /* UTC hour (RTC holds UTC) */
-    if (h < 0) return;                           /* unsynced clock -> never reboot */
-    if (h >= DAILY_REBOOT_REARM_HOUR) s_reboot_armed = true;  /* re-arm once/day */
-    if (h == DAILY_REBOOT_UTC_HOUR && s_reboot_armed) {
-        s_reboot_armed = false;
-        ESP_LOGI(TAG, "Scheduled daily reboot");
-        vTaskDelay(pdMS_TO_TICKS(500));
-        esp_restart();
-    }
 }
 
 /* ── MQTT health check with layered recovery ─────────────────────────────
@@ -1283,9 +1278,7 @@ static void run_poll_cycle(void) {
      * carries the time of its own reading rather than the cycle's start. */
     rtc_timestamp(ts, sizeof(ts));
 
-    check_daily_reboot(ts);  /* scheduled reboot at 2 AM */
-
-    sysmon_pm_acquire();
+    diag_pm_acquire();
 
     /* Dispensers first, unconditionally, on every cycle. They are the only
      * equipment on this bus whose data can be permanently degraded by being
@@ -1368,17 +1361,14 @@ static void run_poll_cycle(void) {
 
     if (++g_diag_cycle >= DIAG_CYCLE_INTERVAL) {
         rtc_timestamp(ts, sizeof(ts));
-        /* sysmon MUST publish before diag: diag_publish() zeroes the shared
-         * pub_ok/pub_fail/loop_max_ms window counters on a successful publish,
-         * so if it ran first sysmon would read (and report) all-zero for those
-         * three fields every cycle. sysmon only reads the counters; diag is the
-         * one that reports-and-clears, so it goes last. */
-        sysmon_publish(g_imei, ts, t_data);
+        /* One combined diagnostics report (diagnostics + system monitor merged
+         * into diagnostics.c). diag_publish() reads the window counters and
+         * clears them on a confirmed publish — the single report-and-clear point. */
         diag_publish(g_imei, ts, t_data);
         g_diag_cycle = 0;
     }
 
-    sysmon_pm_release();
+    diag_pm_release();
 }
 
 /* ── Responsive 30 s sleep ────────────────────────────────────────────── */
@@ -1437,7 +1427,6 @@ void app_main(void) {
     rs485_init();
     di_uart_init();
     diag_init();
-    sysmon_init();
     nvs_config_load(&g_cfg);
     di_set_enable(g_cfg.di_enable);
     network_set_apn(g_cfg.apn, g_cfg.apn_user, g_cfg.apn_pass);

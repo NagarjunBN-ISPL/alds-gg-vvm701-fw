@@ -11,20 +11,15 @@
 static const char *TAG = "genset";
 
 /* ══════════════════════════════════════════════════════════════════════════
- * This file is a small driver framework. EVERY model now uses the RAW path:
- * one Modbus read per poll, the raw 16-bit register values are shipped to the
- * cloud as-is (as a decimal "registers" array plus named "alarms"/"status"/…
- * slices) and the cloud owns the register map and ALL scaling/bit-decoding.
- * The firmware never interprets a genset register. Nothing here decodes on
- * device any more — the previous per-model scaling/alarm-table decoder was
- * removed once the last model (GC1111) moved to raw.
+ * Genset polling, per the DG integration spec. Each model defines up to two
+ * Modbus reads — a measurement block ("registers") and a DG status block
+ * ("status") — and each read's DATA bytes are shipped to the cloud verbatim as
+ * a comma-separated hex string in its OWN MQTT message. The firmware never
+ * interprets a genset register; the cloud owns every register map and scaling.
  *
- * Pieces: Modbus RTU transport (crc16 / modbus_request), the single raw reader
- * genset_read_raw() driven by a static GensetRawSlice_t[] per model, the driver
- * table (g_drivers) mapping model id -> read function, and ONE serialiser
- * (genset_build_payload -> genset_build_raw_payload). Adding a model = write a
- * genset_read_raw() wrapper (fc/start/count + slice list) + one g_drivers row;
- * genset.h, the serialiser and main.c are untouched.
+ * Pieces: Modbus RTU transport (crc16 / modbus_request), a data-driven model
+ * table (g_models), the read helper (read_block), and the two serialisers.
+ * Adding a model = add one g_models[] row. Nothing else changes.
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /* ── CRC-16/IBM (Modbus) ──────────────────────────────────────────────── */
@@ -42,9 +37,7 @@ static uint16_t crc16(const uint8_t *data, size_t len) {
 
 /* ── Modbus RTU request / response ───────────────────────────────────────
  * Sends an FC03/FC04 read and returns the raw, CRC + slave/FC-echo validated
- * response in rx (length in *rx_len). The only caller, genset_read_raw(),
- * passes a 260-byte rx — enough for the largest read in use (SGC120: 79
- * registers = 5 + 158 = 163 bytes) and for the 125-register Modbus maximum. */
+ * response in rx (length in *rx_len). */
 #define MB_TIMEOUT_MS 500
 
 static bool modbus_request(uint8_t slave, uint8_t fc,
@@ -107,243 +100,154 @@ static bool modbus_request(uint8_t slave, uint8_t fc,
     return true;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════
- * Raw single-command path (cloud-side decode)
- * ──────────────────────────────────────────────────────────────────────────
- * One Modbus read, no scaling: the response's raw 16-bit register values are
- * stored in out->raw_regs[] and later emitted verbatim as a decimal array by
- * genset_build_payload(). The cloud owns the register map and all scaling, so
- * a model migrates to this path with just a driver row — no firmware knowledge
- * of what each register means, only which contiguous block to read and how to
- * slice it into the documented "registers" + "status" fields.
- *
- * fc/start/count       — the single Modbus command (start/count are protocol
- *                        register offsets, matching the vendor docs).
- * slices/slice_count   — how to name-slice the response into JSON fields.
- * Every slice index is relative to raw_regs[0] == register at offset `start`,
- * i.e. raw_regs[k] holds protocol offset (start + k). ═══════════════════════ */
-static bool genset_read_raw(uint8_t slave, uint8_t fc, uint16_t start, uint16_t count,
-                            const GensetRawSlice_t *slices, int slice_count,
-                            GensetData_t *out) {
-    uint8_t rx[260];   /* holds up to a 125-register (255-byte) response */
+/* ── Read one block and keep only its DATA bytes ──────────────────────────
+ * modbus_request has already validated CRC + slave/FC echo + exception bit, so
+ * rx is well-formed. We additionally require the byte-count field and the total
+ * length to match exactly what was asked for, so a valid-CRC-but-wrong-shape
+ * reply can never be forwarded as good data. The 3-byte header and 2-byte CRC
+ * are stripped — the cloud receives the register payload only. */
+static bool read_block(uint8_t slave, uint8_t fc, uint16_t start, uint16_t count,
+                       uint8_t *out_data, int out_max, int *out_len,
+                       const char *what) {
+    uint8_t rx[260];
     int rx_len = 0;
     if (!modbus_request(slave, fc, start, count, rx, sizeof(rx), &rx_len))
         return false;
 
-    /* modbus_request already validated CRC + slave/FC echo + exception bit, so
-     * rx is a well-formed reply. rx[2] is the byte count; derive the register
-     * count from it and sanity-check it against what we asked for and against
-     * the buffer we parse out of. */
-    int n = rx[2] / 2;
-    if (n <= 0 || n > GENSET_RAW_MAX_REGS || n != (int)count || rx_len < 3 + 2 * n) {
-        ESP_LOGW(TAG, "raw read: unexpected length (bytecount=%d n=%d count=%u rx_len=%d)",
-                 rx[2], n, (unsigned)count, rx_len);
+    int bytecount = rx[2];
+    if (bytecount != (int)count * 2 || rx_len != 3 + bytecount + 2 || bytecount > out_max) {
+        ESP_LOGW(TAG, "%s: unexpected shape (bytecount=%d want=%d rx_len=%d)",
+                 what, bytecount, (int)count * 2, rx_len);
         return false;
     }
-    for (int i = 0; i < n; i++)
-        out->raw_regs[i] = ((uint16_t)rx[3 + 2 * i] << 8) | rx[4 + 2 * i];
 
-    out->raw_reg_count   = n;
-    out->raw_slices      = slices;
-    out->raw_slice_count = slice_count;
-    out->is_raw = true;
-    out->valid  = true;
+    memcpy(out_data, rx + 3, (size_t)bytecount);
+    *out_len = bytecount;
     return true;
 }
 
-/* Ashok Leyland GC1201/1202/1203/GC902 (Sedemac GC1200 family, "Nel Botl") —
- * one and the same register map for all four. Single FC04 read of input-register
- * offsets 1..67: measurements (1..36) + the DG status word (offset 67). The 30
- * registers in between (37..66) are read only to keep it a single command and
- * are not emitted. Published as {"registers":[1..36],"status":<67>}, no
- * firmware scaling — the cloud converts (per the Ashok Leyland protocol doc). */
-static const GensetRawSlice_t k_gc1200_slices[] = {
-    { "registers", 0,  36, true  },   /* offsets 1..36 = measurement block */
-    { "status",    66, 1,  false },   /* offset 67     = DG status word     */
-};
-static bool sedemac_read_raw_gc1200(uint8_t slave, GensetData_t *out) {
-    return genset_read_raw(slave, 0x04, /*start*/ 1, /*count*/ 67,
-                           k_gc1200_slices,
-                           sizeof(k_gc1200_slices) / sizeof(k_gc1200_slices[0]), out);
-}
-
-/* Sedemac GC1211 — same measurement map as GC1200 (offsets 1..36) plus the
- * alarm block and command status the GC1211 protocol doc adds. Single FC04 read
- * of offsets 1..68:
- *   offsets 1..36  → "registers"     (measurements, identical to GC1200)
- *   offsets 57..66 → "alarms"        (alarm regs 1..10; doc shows the first 3)
- *   offset  67     → "status"        (DG status word: 0x2000 off / 0xC000 on)
- *   offset  68     → "commandStatus" (0 none / 1 started / 2 stopped / ...)
- * Offsets 37..56 are read only to span the block in one command. All bit/scale
- * decoding is cloud-side — the firmware ships raw register integers only. */
-static const GensetRawSlice_t k_gc1211_slices[] = {
-    { "registers",     0,  36, true  },   /* offsets 1..36  = measurements     */
-    { "alarms",        56, 10, true  },   /* offsets 57..66 = alarm regs 1..10  */
-    { "status",        66, 1,  false },   /* offset 67      = DG status word    */
-    { "commandStatus", 67, 1,  false },   /* offset 68      = command status    */
-};
-static bool sedemac_read_raw_gc1211(uint8_t slave, GensetData_t *out) {
-    return genset_read_raw(slave, 0x04, /*start*/ 1, /*count*/ 68,
-                           k_gc1211_slices,
-                           sizeof(k_gc1211_slices) / sizeof(k_gc1211_slices[0]), out);
-}
-
-/* Sedemac GC902 — its OWN map, DISTINCT from the Ashok Leyland GC1201/02/03
- * despite the same GenControl family name: measurements run to offset 46, the
- * alarm block starts at 58 (not 57), and the DG status word is at 68 (not 67).
- * Single FC04 read of offsets 0..69:
- *   0..46  → "registers"     (0 protocol rev, 1 oil pressure, .. 46 mains L3-L1)
- *   58..66 → "alarms"        (Alarm 1..9)
- *   67     → "auxDiag"       (digital input/output state bitfield)
- *   68     → "status"        (DG status word)
- *   69     → "commandStatus" (0 none / 1 started / 2 stopped / ...)
- * Offsets 47..57 are reserved, read only to span the block. Cloud decodes. */
-static const GensetRawSlice_t k_gc902_slices[] = {
-    { "registers",     0,  47, true  },   /* offsets 0..46  = measurements  */
-    { "alarms",        58, 9,  true  },   /* offsets 58..66 = Alarm 1..9     */
-    { "auxDiag",       67, 1,  false },   /* offset 67      = DI/DO states   */
-    { "status",        68, 1,  false },   /* offset 68      = DG status word */
-    { "commandStatus", 69, 1,  false },   /* offset 69      = command status */
-};
-static bool sedemac_read_raw_gc902(uint8_t slave, GensetData_t *out) {
-    return genset_read_raw(slave, 0x04, /*start*/ 0, /*count*/ 70,
-                           k_gc902_slices,
-                           sizeof(k_gc902_slices) / sizeof(k_gc902_slices[0]), out);
-}
-
-/* DEIF SGC 120 Mk II — FC03 (holding registers), one read of offsets 0..78:
- *   0..61  → "registers" (scattered measurements; cloud maps by index)
- *   65..76 → "alarms"    (12 alarm registers)
- *   78     → "status"    (DG status bitfield)
- * No command-status register on this controller. Offsets 62..64/77 are read
- * only to span the block. Cloud decodes. NOTE: Read B (regs 65..78) was never
- * captured on hardware per the DEIF decode doc — verify on a live unit. */
-static const GensetRawSlice_t k_sgc120_slices[] = {
-    { "registers", 0,  62, true  },   /* offsets 0..61  = measurements */
-    { "alarms",    65, 12, true  },   /* offsets 65..76 = alarm block  */
-    { "status",    78, 1,  false },   /* offset 78      = status word  */
-};
-static bool sgc120_read_raw(uint8_t slave, GensetData_t *out) {
-    return genset_read_raw(slave, 0x03, /*start*/ 0, /*count*/ 79,
-                           k_sgc120_slices,
-                           sizeof(k_sgc120_slices) / sizeof(k_sgc120_slices[0]), out);
-}
-
 /* ══════════════════════════════════════════════════════════════════════════
- * Driver table — add a model here (plus its GENSET_MODEL_* id in config.h and
- * the setconfig validation cap) and nothing else changes.
+ * Model table — the Modbus reads each controller answers, from the DG
+ * integration spec (all frames CRC-verified against the documented captures):
+ *
+ *   GC1211        FC04  registers 1..36 (72 B)   status 67..68 (4 B)
+ *   GC1111        FC03  registers 1..36 (72 B)   status 67..68 (4 B)
+ *   SGC120        FC03  registers 1..78 (156 B)  — single overall read
+ *   GC1201/02/03  FC04  registers 1..36 (72 B)   status 67    (2 B)
+ *   GC902         FC04  registers 1..36 (72 B)   status 67    (2 B)
+ *
+ * NOTE on function codes: GC1211 uses FC04 and GC1111 uses FC03 — the two
+ * differ ONLY in the function code, and the spec documents both explicitly.
+ * NOTE on GC902: the spec does not cover it; it is mapped to the Ashok Leyland
+ * GC12xx read set, which the vendor register map lists as one shared family
+ * map. Verify against real GC902 hardware before relying on it.
+ *
+ * st_count == 0 means the model has no status command.
  * ══════════════════════════════════════════════════════════════════════════ */
-typedef bool (*genset_read_fn)(uint8_t slave, GensetData_t *out);
-
 typedef struct {
-    uint8_t        model_id;
-    const char    *name;
-    genset_read_fn read;
-} GensetDriver_t;
+    uint8_t     model_id;
+    const char *name;
+    uint8_t     fc;          /* Modbus function code (0x03 / 0x04) */
+    uint16_t    reg_start;   /* command 1: measurement block       */
+    uint16_t    reg_count;
+    uint16_t    st_start;    /* command 2: DG status (0 count = none) */
+    uint16_t    st_count;
+} GensetModel_t;
 
-static const GensetDriver_t g_drivers[] = {
-    { GENSET_MODEL_GC1211, "Sedemac GC1211 (raw)",     sedemac_read_raw_gc1211 },
-    /* GC1111 field units answer the same 1..68 map as GC1211 (confirmed against
-     * hardware) — NOT the non-contiguous 1024+/39425+ map in the GC1111 manual,
-     * which cannot be read in one command. So it shares GC1211's raw driver. */
-    { GENSET_MODEL_GC1111, "Sedemac GC1111 (raw, GC1211 map)", sedemac_read_raw_gc1211 },
-    { GENSET_MODEL_SGC120, "DEIF SGC 120 Mk II (raw)", sgc120_read_raw         },
-    { GENSET_MODEL_GC1201, "Ashok Leyland GC1201 (raw)", sedemac_read_raw_gc1200 },
-    { GENSET_MODEL_GC1202, "Ashok Leyland GC1202 (raw)", sedemac_read_raw_gc1200 },
-    { GENSET_MODEL_GC1203, "Ashok Leyland GC1203 (raw)", sedemac_read_raw_gc1200 },
-    { GENSET_MODEL_GC902,  "Sedemac GC902 (raw)",        sedemac_read_raw_gc902  },
+static const GensetModel_t g_models[] = {
+    { GENSET_MODEL_GC1211, "Mahindra GC1211",       0x04, 1, 36, 67, 2 },
+    { GENSET_MODEL_GC1111, "Mahindra GC1111",       0x03, 1, 36, 67, 2 },
+    { GENSET_MODEL_SGC120, "SGC 120 Mk II",         0x03, 1, 78,  0, 0 },
+    { GENSET_MODEL_GC1201, "Ashok Leyland GC1201",  0x04, 1, 36, 67, 1 },
+    { GENSET_MODEL_GC1202, "Ashok Leyland GC1202",  0x04, 1, 36, 67, 1 },
+    { GENSET_MODEL_GC1203, "Ashok Leyland GC1203",  0x04, 1, 36, 67, 1 },
+    { GENSET_MODEL_GC902,  "Sedemac GC902",         0x04, 1, 36, 67, 1 },
 };
 
 bool genset_poll(uint8_t slave, uint8_t model, GensetData_t *out) {
     memset(out, 0, sizeof(*out));
-    for (size_t i = 0; i < sizeof(g_drivers) / sizeof(g_drivers[0]); i++) {
-        if (g_drivers[i].model_id == model)
-            return g_drivers[i].read(slave, out);
+
+    const GensetModel_t *mdl = NULL;
+    for (size_t i = 0; i < sizeof(g_models) / sizeof(g_models[0]); i++) {
+        if (g_models[i].model_id == model) { mdl = &g_models[i]; break; }
     }
-    ESP_LOGW(TAG, "Unknown genset model %u", (unsigned)model);
-    return false;
+    if (!mdl) {
+        ESP_LOGW(TAG, "Unknown genset model %u", (unsigned)model);
+        return false;
+    }
+
+    /* Set from the MODEL, not the read result, so the caller still knows a
+     * status message is expected even when every read fails. */
+    out->has_status = (mdl->st_count > 0);
+
+    out->reg_valid = read_block(slave, mdl->fc, mdl->reg_start, mdl->reg_count,
+                                out->reg_data, (int)sizeof(out->reg_data),
+                                &out->reg_len, "registers");
+
+    if (out->has_status) {
+        /* Inter-command gap: give the controller time to release the bus before
+         * the second read, matching the gap modbus_request already leaves after
+         * its own transmit. */
+        vTaskDelay(pdMS_TO_TICKS(50));
+        out->st_valid = read_block(slave, mdl->fc, mdl->st_start, mdl->st_count,
+                                   out->st_data, (int)sizeof(out->st_data),
+                                   &out->st_len, "status");
+    }
+
+    return out->reg_valid && (!out->has_status || out->st_valid);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
- * JSON serialiser — model-agnostic. Emits the raw register values verbatim per
- * the driver's slice list; it never interprets a genset register.
+ * JSON serialisers — one message per read. Data is emitted as a comma-separated
+ * lowercase hex string, the same shape radar and dispenser use.
  * ══════════════════════════════════════════════════════════════════════════ */
-
-/* snprintf returns the length it WANTED to write, not what actually fit. If a
- * section truncates, `pos` sails past buf_size and the next call's
- * (buf_size - pos) wraps to a huge size_t → out-of-bounds write. Clamp after
- * every append so truncation degrades to a cut-off payload, not corruption. */
-static inline int clamp_pos(int pos, size_t buf_size) {
-    if (pos < 0) return 0;   /* snprintf returns <0 on encoding error — never let
-                              * `pos` go negative, or buf+pos / buf_size-pos below
-                              * would address outside the buffer. */
-    return (pos > (int)buf_size - 1) ? (int)buf_size - 1 : pos;
-}
-
-/* Raw payload for the single-command models (is_raw): each configured slice
- * becomes one JSON field — an array or a scalar of raw decimal register values
- * straight from raw_regs[], with NO scaling; the cloud owns the register map
- * and converts. The chained snprintf + clamp_pos discipline keeps a truncating
- * payload from corrupting memory. Worst case (GC1211: 36 + 10 numbers + 2
- * scalars) is well under both buf_size and the modem ceiling. An out-of-range
- * slice index (shouldn't happen — slices are static per model) emits 0 rather
- * than reading past raw_regs[]. */
-static void genset_build_raw_payload(const GensetData_t *d,
-                                     const char *hw_id, const char *ts,
-                                     char *buf, size_t buf_size) {
-    int pos = 0;
-    pos += snprintf(buf + pos, buf_size - pos,
-                    "{\"HW_ID\":\"%s\",\"genset\":{", hw_id);
-    pos = clamp_pos(pos, buf_size);
-
-    for (int s = 0; s < d->raw_slice_count; s++) {
-        const GensetRawSlice_t *sl = &d->raw_slices[s];
-        if (s > 0) {
-            pos += snprintf(buf + pos, buf_size - pos, ",");
-            pos = clamp_pos(pos, buf_size);
-        }
-        if (sl->as_array) {
-            pos += snprintf(buf + pos, buf_size - pos, "\"%s\":[", sl->key);
-            pos = clamp_pos(pos, buf_size);
-            for (int i = 0; i < sl->count; i++) {
-                int idx = sl->start + i;
-                unsigned v = (idx >= 0 && idx < d->raw_reg_count) ? d->raw_regs[idx] : 0;
-                pos += snprintf(buf + pos, buf_size - pos, i ? ",%u" : "%u", v);
-                pos = clamp_pos(pos, buf_size);
-            }
-            pos += snprintf(buf + pos, buf_size - pos, "]");
-            pos = clamp_pos(pos, buf_size);
-        } else {
-            int idx = sl->start;
-            unsigned v = (idx >= 0 && idx < d->raw_reg_count) ? d->raw_regs[idx] : 0;
-            pos += snprintf(buf + pos, buf_size - pos, "\"%s\":%u", sl->key, v);
-            pos = clamp_pos(pos, buf_size);
-        }
-    }
-
-    pos += snprintf(buf + pos, buf_size - pos, "},\"TS\":\"%s\"}", ts);
-    pos = clamp_pos(pos, buf_size);
-
-    /* Fail-safe: a truncated or over-ceiling payload is broken JSON, so fall
-     * back to the guaranteed-valid 404 shape. */
-    if (pos >= (int)buf_size - 2 || pos > MQTT_MODEM_PAYLOAD_SAFE_MAX) {
-        ESP_LOGW(TAG, "raw genset payload %d/%zu bytes (ceiling %d) — publishing 404 instead",
-                 pos, buf_size, MQTT_MODEM_PAYLOAD_SAFE_MAX);
-        snprintf(buf, buf_size,
-                 "{\"HW_ID\":\"%s\",\"genset\":{\"data\":\"404\"},\"TS\":\"%s\"}",
-                 hw_id, ts);
-    }
-}
-
-void genset_build_payload(const GensetData_t *d,
+static void build_payload(const char *key, const uint8_t *data, int len, bool valid,
                           const char *hw_id, const char *ts,
                           char *buf, size_t buf_size) {
-    if (!d->valid) {
+    if (!valid || len <= 0) {
         snprintf(buf, buf_size,
-                 "{\"HW_ID\":\"%s\",\"genset\":{\"data\":\"404\"},\"TS\":\"%s\"}",
-                 hw_id, ts);
+                 "{\"HW_ID\":\"%s\",\"genset\":{\"%s\":\"404\"},\"TS\":\"%s\"}",
+                 hw_id, key, ts);
         return;
     }
 
-    genset_build_raw_payload(d, hw_id, ts, buf, buf_size);
+    /* len is bounded by the caller's buffer (GENSET_REG_DATA_MAX at most), so
+     * worst case is 160 * "xx," = 480 chars, which fits hex[]. */
+    char hex[GENSET_REG_DATA_MAX * 3 + 1];
+    int  pos = 0;
+    for (int i = 0; i < len && pos + 4 < (int)sizeof(hex); i++) {
+        if (i > 0) hex[pos++] = ',';
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", data[i]);
+    }
+    hex[pos] = '\0';
+
+    int n = snprintf(buf, buf_size,
+                     "{\"HW_ID\":\"%s\",\"genset\":{\"%s\":\"%s\"},\"TS\":\"%s\"}",
+                     hw_id, key, hex, ts);
+
+    /* A truncated or over-ceiling payload is broken JSON — fall back to the
+     * guaranteed-valid 404 shape. Even the largest block (SGC120, 156 B → ~467
+     * hex chars) sits far under both buf_size and the modem ceiling, so this is
+     * belt-and-suspenders. */
+    if (n < 0 || n >= (int)buf_size || n > MQTT_MODEM_PAYLOAD_SAFE_MAX) {
+        ESP_LOGW(TAG, "genset %s payload %d bytes over limit (buf %zu, ceiling %d) — publishing 404 instead",
+                 key, n, buf_size, MQTT_MODEM_PAYLOAD_SAFE_MAX);
+        snprintf(buf, buf_size,
+                 "{\"HW_ID\":\"%s\",\"genset\":{\"%s\":\"404\"},\"TS\":\"%s\"}",
+                 hw_id, key, ts);
+    }
+}
+
+void genset_build_registers_payload(const GensetData_t *d,
+                                    const char *hw_id, const char *ts,
+                                    char *buf, size_t buf_size) {
+    build_payload("registers", d->reg_data, d->reg_len, d->reg_valid,
+                  hw_id, ts, buf, buf_size);
+}
+
+void genset_build_status_payload(const GensetData_t *d,
+                                 const char *hw_id, const char *ts,
+                                 char *buf, size_t buf_size) {
+    build_payload("status", d->st_data, d->st_len, d->st_valid,
+                  hw_id, ts, buf, buf_size);
 }

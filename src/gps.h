@@ -47,8 +47,8 @@ bool gps_poll(GpsFix_t *out);
  * normal poll flow. */
 void gps_end(void);
 
-/* Serialise a reading to JSON in buf (includes HW_ID and TS), mirroring
- * genset_build_payload()'s contract exactly: fix->valid selects the full
+/* Serialise a reading to JSON in buf (includes HW_ID and TS), following the
+ * same contract as the other payload builders: fix->valid selects the full
  * object vs. the {"data":"404"} fallback used everywhere else in this
  * firmware for "sensor tried, no reading this cycle". hw_id is expected to
  * be the bare IMEI (GPS describes the gateway itself, not a specific piece
