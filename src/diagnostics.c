@@ -125,7 +125,7 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
         "\"heap_min_ever\":%lu,"
         "\"main_stack_hwm\":%lu,"
         "\"di_stack_hwm\":%lu,"
-        "\"rssi\":%d,"
+        "\"rss%i\":d,"
         "\"vbat_mv\":%d,"
         "\"operator\":\"%s\","
         "\"pub_ok\":%lu,"
