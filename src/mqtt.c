@@ -414,7 +414,8 @@ bool mqtt_subscribe(const char *topic) {
  * all) used to return without counting: a modem whose MQTT session died in a
  * way that rejects QMTPUBEX outright — with the +QMTSTAT URC lost — would
  * fail every publish forever while g_connected stayed true, so the reconnect
- * ladder never fired and the device went silent until the 2 AM daily reboot. */
+ * ladder never fired and the device went silent indefinitely — there is no
+ * scheduled on-device reboot to bail it out (that was removed; see config.h). */
 static bool pub_result(bool ok, const char *topic) {
     if (ok) {
         s_pub_fail_streak = 0;

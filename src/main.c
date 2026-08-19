@@ -1249,7 +1249,7 @@ static void mqtt_reconnect_if_needed(void) {
  * chance to notice an incoming publish until the cycle fully completes.
  *
  * Also executes any rsp/kfactor command handle_msg() just marked pending,
- * right here — not just once per 30s cycle. This runs every ~1s (via
+ * right here — not just once per 20s cycle. This runs every ~1s (via
  * sleep_with_poll) as well as between every poll-cycle step, so a remote
  * command now gets serviced within about a second of arriving instead of
  * waiting up to a full poll cycle. execute_pending() sets its own RS485
@@ -1371,7 +1371,7 @@ static void run_poll_cycle(void) {
     diag_pm_release();
 }
 
-/* ── Responsive 30 s sleep ────────────────────────────────────────────── */
+/* ── Responsive per-second sleep ──────────────────────────────────────── */
 static void sleep_with_poll(int seconds) {
     for (int i = 0; i < seconds; i++) {
         vTaskDelay(pdMS_TO_TICKS(1000));

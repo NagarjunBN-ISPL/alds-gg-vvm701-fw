@@ -159,7 +159,7 @@ void di_task(void *param) {
 
         /* Digital inputs are event-driven: only enqueue when the reading
          * actually changes from the last one queued. This captures every
-         * transition (e.g. a pulse between 30s publish cycles) without
+         * transition (e.g. a pulse between 20s publish cycles) without
          * flooding the cloud with dozens of identical steady-state messages
          * — which was also starving the modem UART of time to receive
          * inbound commands like setconfig. */
