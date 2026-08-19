@@ -32,7 +32,6 @@ idf_component_register(
         "${CMAKE_SOURCE_DIR}/src/network.c"
         "${CMAKE_SOURCE_DIR}/src/nvs_config.c"
         "${CMAKE_SOURCE_DIR}/src/radar.c"
-        "${CMAKE_SOURCE_DIR}/src/sysmon.c"
         "${CMAKE_SOURCE_DIR}/src/tls_ca.c"
     INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/src"
 )
