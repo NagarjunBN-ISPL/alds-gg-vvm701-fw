@@ -1,8 +1,7 @@
 # Target chip. Pinning it here means `idf.py build` auto-selects the ESP32-S3
 # without a separate `idf.py set-target esp32s3` step — plain `idf.py build`
-# just works. PlatformIO also derives esp32s3 from the board, so the two agree
-# and neither fights the other. (This is the fix for the GPIO_NUM_40..44
-# "undeclared" errors, which mean the build was targeting the classic ESP32.)
+# just works. (This is the fix for the GPIO_NUM_40..44 "undeclared" errors,
+# which mean the build was targeting the classic ESP32.)
 CONFIG_IDF_TARGET="esp32s3"
 
 # Console: move from UART0 to USB Serial JTAG so UART0 is free for Nuvoton MS51
