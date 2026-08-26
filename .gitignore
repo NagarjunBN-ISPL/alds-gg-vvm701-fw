@@ -1,9 +1,5 @@
 # ── Build output ─────────────────────────────────────────────────────────
-# PlatformIO is the single canonical build path (see platformio.ini).
-.pio/
-# Native ESP-IDF (idf.py) output — the project does NOT use this path; it is
-# ignored so an accidental `idf.py build` can't commit a second, divergent
-# set of binaries.
+# ESP-IDF (idf.py) is the single canonical build path.
 build/
 
 # ── Tool-generated sdkconfig ─────────────────────────────────────────────
