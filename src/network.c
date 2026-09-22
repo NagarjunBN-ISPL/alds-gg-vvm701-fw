@@ -59,10 +59,23 @@ static bool wait_registered(int timeout_ms) {
         int cereg = parse_reg_stat(r1, "+CEREG:");
         int cgreg = parse_reg_stat(r2, "+CGREG:");
         ESP_LOGI(TAG, "CEREG=%d CGREG=%d (%ds)", cereg, cgreg, tick * 3);
-        if (cereg == 3) { ESP_LOGE(TAG, "Registration denied (CEREG=3)"); return false; }
-        if (cgreg == 3) { ESP_LOGE(TAG, "Registration denied (CGREG=3)"); return false; }
+        /* Registered on EITHER access tech is registered — check the positive
+         * case FIRST. An LTE-only SIM (Jio 4G, private enterprise APN with no 2G
+         * roaming) commonly comes up CEREG=1 (LTE) while the tower returns
+         * CGREG=3 (2G/GPRS denied); returning false on CGREG==3 alone stranded
+         * exactly those SIMs at tick 0. stat 1 = home, 5 = roaming. */
         if (cereg == 1 || cereg == 5) return true;
         if (cgreg == 1 || cgreg == 5) return true;
+        /* Give up early ONLY when BOTH techs are explicitly DENIED (stat 3).
+         * A lone 3 with the other tech still 0/2/4 (not registered / searching /
+         * unknown) is not terminal — keep polling until the timeout, during
+         * which the searching tech may still attach. stat 0/2 must never be read
+         * as "denied" (that was the flaw in one proposed fix): 0 is the normal
+         * state at tick 0 before the scan has even started. */
+        if (cereg == 3 && cgreg == 3) {
+            ESP_LOGE(TAG, "Registration denied on BOTH LTE and 2G (CEREG=3, CGREG=3)");
+            return false;
+        }
         vTaskDelay(pdMS_TO_TICKS(3000));
         tick++;
     }
@@ -109,7 +122,7 @@ bool network_init(void) {
     /* Signal strength */
     memset(resp, 0, sizeof(resp));
     modem_at("AT+CSQ", "+CSQ:", 3000, resp, sizeof(resp));
-    char *p = strstr(resp, "+CSQ:");
+    const char *p = strstr(resp, "+CSQ:");
     if (p) {
         int rssi = atoi(p + 5);
         if (rssi == 99) ESP_LOGW(TAG, "Signal: unknown — check antenna");
@@ -164,6 +177,19 @@ bool network_init(void) {
     modem_at("AT+CGPADDR=1", "+CGPADDR:", 5000, resp, sizeof(resp));
     ESP_LOGI(TAG, "IP: %s", resp);
 
+    /* Confirm the data bearer is genuinely up before declaring success. If
+     * QIACT=1 above failed, the modem is registered but cannot open a socket;
+     * returning true anyway lets boot bring-up skip the modem-hard-reset
+     * escalation and march straight into an mqtt_connect() that cannot work.
+     * Re-query with the same "+QIACT: 1,1" marker the runtime bearer check uses
+     * (a bare OK is printed even with NO context active, so test for the
+     * marker, never its absence). */
+    memset(resp, 0, sizeof(resp));
+    modem_at("AT+QIACT?", "OK", 3000, resp, sizeof(resp));
+    if (!strstr(resp, "+QIACT: 1,1")) {
+        ESP_LOGE(TAG, "PDP context 1 not active after bring-up — network_init failed");
+        return false;
+    }
     return true;
 }
 
@@ -176,4 +202,23 @@ bool network_check(void) {
     modem_at("AT+CGREG?", "+CGREG:", 3000, resp, sizeof(resp));
     s = parse_reg_stat(resp, "+CGREG:");
     return (s == 1 || s == 5);
+}
+
+bool network_data_bearer_up(void) {
+    /* Registration first: it is the cheaper question, and a modem that has
+     * stopped answering AT at all fails it — which is what lets the ladder tell
+     * a wedged modem from a broker outage. */
+    if (!network_check()) return false;
+
+    /* Then the bearer itself. Same parse as network_init() above: with no
+     * context active the modem answers a bare OK and prints no "+QIACT:" line
+     * at all, so the ABSENCE of the marker is the negative case — never test
+     * for a "0" that is not printed. */
+    char resp[128] = {0};
+    modem_at("AT+QIACT?", "OK", 3000, resp, sizeof(resp));
+    if (strstr(resp, "+QIACT: 1,1")) return true;
+
+    ESP_LOGW(TAG, "registered, but PDP context 1 is DOWN — no socket can be "
+                  "opened until it is reactivated");
+    return false;
 }

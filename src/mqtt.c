@@ -14,14 +14,23 @@
 
 static const char *TAG = "mqtt";
 
+/* esp_timer time of the most recent successful mqtt_connect(). 0 = never
+ * connected this boot. See mqtt_connected_s(). */
+static int64_t s_connected_since_us = 0;
+
 /* Inbound-command queue depth. Quectel auto-ACKs a QoS-1 message to the broker
  * when it emits the +QMTRECV URC, so a message dropped here (stash full) is NOT
  * redelivered — it's gone at the MQTT layer (the cloud can still retry at the
  * app layer, e.g. re-sending an rsp/kfactor that got no response). 16 covers a
- * realistic worst-case burst (a fleet k-factor push hitting all 12 nozzles at
- * once) with margin; parse_qmtrecv logs if it ever fills. Each slot is
- * TOPIC_MAX+PAYLOAD_MAX ≈ 2.3 KB of BSS. */
-#define STASH_MAX    16
+ * realistic worst-case burst and parse_qmtrecv logs if it ever fills.
+ *
+ * Each slot is TOPIC_MAX+PAYLOAD_MAX = 2304 bytes of BSS, so this define is
+ * really a DRAM budget: the true worst case is 6 BlueSky x (rsp+kfactor) +
+ * 5 Yenen rsp + setconfig + FOTA = 18 messages in one cycle, and 32 covers
+ * that with 78% headroom for 72 KB. 64 would cost 144 KB — over a third of
+ * the chip's free heap spent on a queue that is never more than a fifth
+ * full, and heap is what the 20 KB low-heap reboot guard is protecting. */
+#define STASH_MAX    32
 #define TOPIC_MAX    256
 #define PAYLOAD_MAX  2048
 
@@ -235,21 +244,67 @@ static void parse_qmtrecv(const char *buf) {
     }
 }
 
+/* Drop every COMPLETE +QMTRECV that parse_qmtrecv() just stashed out of `buf`,
+ * shifting whatever follows (an incomplete URC, or an unrelated still-arriving
+ * line such as the +QMTPUBEX ack) down to the front. Returns the new length.
+ *
+ * The publish ack-wait loop appends UART bytes one at a time and re-runs the
+ * URC rescue on every byte; without this, a complete +QMTRECV sitting in `buf`
+ * is re-parsed from the head and re-stashed on each subsequent byte, filling
+ * the stash with duplicates of one command and dropping genuine later ones. It
+ * uses the exact walk drain_recv() uses for its resume point, so it consumes
+ * precisely what parse_qmtrecv() consumed — and deliberately keeps any trailing
+ * bytes, so a partial +QMTPUBEX ack is preserved (a plain memset would lose
+ * it). */
+static int mqtt_drop_stashed_urcs(char *buf) {
+    const char *search_from = buf;
+    const char *last_end    = NULL;
+    for (;;) {
+        const char *pstart = qmtrecv_payload_start(search_from, NULL, NULL);
+        if (!pstart) break;                  /* no more URC headers               */
+        const char *pend = qmtrecv_payload_end(pstart);
+        if (!pend) break;                     /* header present, payload streaming */
+        last_end    = pend;                   /* this URC was complete and stashed */
+        search_from = pend;
+    }
+    if (!last_end) return (int)strlen(buf);   /* nothing complete to remove        */
+    size_t keep = strlen(last_end);
+    memmove(buf, last_end, keep + 1);
+    return (int)keep;
+}
+
+/* The cross-call accumulator for drain_recv(), lifted to file scope so
+ * mqtt_connect() can reset it when a session is rebuilt — see the note there
+ * and in drain_recv(). */
+static char s_recv_buf[PAYLOAD_MAX + 300];
+static int  s_recv_total = 0;
+
+/* Discard any half-received +QMTRECV fragment. Call when the modem session is
+ * torn down and rebuilt (mqtt_connect after a hard reset): the bytes in
+ * s_recv_buf belong to the OLD TCP session, and prepending them to the NEW
+ * session's first read would splice two unrelated byte streams into one bogus
+ * URC. */
+static void drain_recv_reset(void) {
+    s_recv_total = 0;
+    s_recv_buf[0] = '\0';
+}
+
 static void drain_recv(int timeout_ms) {
-    static char buf[PAYLOAD_MAX + 300];
-    /* Persists across calls — see the resume-point logic at the end of this
-     * function. Resetting this to 0 on every call (as it used to be) meant a
-     * "+QMTRECV:" header split across two drain_recv() calls by unlucky UART
-     * timing (e.g. the 9-byte marker starts arriving right as the soft
-     * deadline below fires) had its already-read prefix silently overwritten
-     * by the next call's fresh reads, permanently losing that remote command —
+    char       *buf     = s_recv_buf;
+    const size_t buf_sz = sizeof(s_recv_buf);   /* buf is a pointer now — size the array */
+    /* s_recv_total persists across calls — see the resume-point logic at the
+     * end of this function. Resetting it to 0 on every call (as it used to be)
+     * meant a "+QMTRECV:" header split across two drain_recv() calls by unlucky
+     * UART timing (e.g. the 9-byte marker starts arriving right as the soft
+     * deadline below fires) had its already-read prefix silently overwritten by
+     * the next call's fresh reads, permanently losing that remote command —
      * uart_read_bytes() consumes bytes from the driver's ring buffer, so
-     * there's no way to "re-read" them once dropped here. */
-    static int total = 0;
+     * there's no way to "re-read" them once dropped here. It is cleared only by
+     * drain_recv_reset() when the whole session is rebuilt. */
     int64_t dl      = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     int64_t hard_dl = esp_timer_get_time() + 2000000LL;  /* absolute safety cap */
 
-    while (total < (int)sizeof(buf) - 1) {
+    while (s_recv_total < (int)buf_sz - 1) {
         int64_t now      = esp_timer_get_time();
         const char *pstart = qmtrecv_payload_start(buf, NULL, NULL);
         if (pstart && qmtrecv_payload_end(pstart)) break;  /* full URC captured */
@@ -261,11 +316,11 @@ static void drain_recv(int timeout_ms) {
          * dropped is worse than a slightly late one. */
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
-            buf[total++] = ch;
-            buf[total]   = '\0';
+            buf[s_recv_total++] = ch;
+            buf[s_recv_total]   = '\0';
         }
     }
-    if (total > 0) parse_qmtrecv(buf);
+    if (s_recv_total > 0) parse_qmtrecv(buf);
 
     /* Determine the resume point exactly the way parse_qmtrecv() itself walks
      * the buffer: skip over every COMPLETE URC it already consumed, and if
@@ -286,13 +341,13 @@ static void drain_recv(int timeout_ms) {
     }
 
     size_t keep = incomplete_start ? strlen(incomplete_start) : 0;
-    if (incomplete_start && keep < sizeof(buf) - 100) {
+    if (incomplete_start && keep < buf_sz - 100) {
         /* Genuinely incomplete and still comfortably within capacity —
          * preserve it so the next call resumes accumulating from here. */
         memmove(buf, incomplete_start, keep + 1);
-        total = (int)keep;
+        s_recv_total = (int)keep;
     } else {
-        total = 0;
+        s_recv_total = 0;
     }
 }
 
@@ -312,6 +367,12 @@ bool mqtt_init(const char *imei) {
 
 bool mqtt_connect(void) {
     static char cmd[512], resp[512];
+
+    /* New session from here — drop any half-received URC fragment left over
+     * from a previous session (esp. one torn down by modem_hard_reset() in the
+     * L3 recovery ladder). Prepending old-session bytes to the new session's
+     * first read would parse into a garbage command. */
+    drain_recv_reset();
 
     modem_at("AT+QMTCLOSE=0", "OK", 5000, NULL, 0);
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -391,8 +452,19 @@ bool mqtt_connect(void) {
 
     g_connected = true;
     s_pub_fail_streak = 0;
+    /* Stamped here rather than in the callers so every path that establishes a
+     * session — boot, and recovery levels L1/L2/L3 — is covered by one line.
+     * Reported as link.connected_s, which is what distinguishes a gateway that
+     * has held its session for days from one that silently reconnects every
+     * few minutes; both otherwise publish identical diagnostics. */
+    s_connected_since_us = esp_timer_get_time();
     ESP_LOGI(TAG, "MQTT connected, client=%s", g_client_id);
     return true;
+}
+
+uint32_t mqtt_connected_s(void) {
+    if (!g_connected || s_connected_since_us == 0) return 0;
+    return (uint32_t)((esp_timer_get_time() - s_connected_since_us) / 1000000LL);
 }
 
 bool mqtt_subscribe(const char *topic) {
@@ -518,12 +590,31 @@ bool mqtt_publish(const char *topic, const char *payload) {
                 p = strchr(p, ','); if (p) p++;  /* skip link_id */
                 if (p) p = strchr(p, ',');
                 if (p) p++;  /* skip msgid */
-                pub_ok = (p && atoi(p) == 0);
+                /* Result field: 0 = delivered, 1 = retransmitting, 2 = failed.
+                 * strtol + endptr, NOT atoi. atoi("") and atoi("\r") both
+                 * return 0, so a QMTPUBEX line that arrived with an EMPTY or
+                 * non-numeric result field ("+QMTPUBEX: 0,5,\r\n") would read
+                 * as SUCCESS — and success is what tells the caller to discard
+                 * the record from the offline FIFO. A false success there is
+                 * silent sale loss on the replay path. Require an actual digit
+                 * that parses to exactly 0; treat anything else as failure,
+                 * which at worst re-sends (a duplicate the cloud dedupes). */
+                pub_ok = false;
+                if (p) {
+                    while (*p == ' ') p++;
+                    char *endp = NULL;
+                    long rc = strtol(p, &endp, 10);
+                    pub_ok = (endp != p && rc == 0);   /* a real "0", not garbage */
+                }
                 parse_qmtrecv(buf);
                 break;
             }
             if (strstr(buf, "+QMTRECV:")) {
                 parse_qmtrecv(buf);
+                /* Remove the stashed URC(s) so the next byte cannot re-stash the
+                 * same command; any partial +QMTPUBEX tail is preserved so the
+                 * ack below is still detected. */
+                bi = mqtt_drop_stashed_urcs(buf);
                 /* continue waiting for QMTPUBEX */
             }
             check_qmtstat(buf);          /* link dropped mid-publish? */

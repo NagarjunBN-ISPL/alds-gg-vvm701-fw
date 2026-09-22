@@ -47,18 +47,23 @@ void modem_set_flush_rescue(void (*cb)(const char *data)) {
 }
 
 void modem_flush(void) {
-    /* Bound the drain: "read until silent" never terminates if the modem
-     * streams continuously (URC storm / firmware fault) — cap total bytes
-     * so flush can never wedge the calling task. */
+    /* Bound the drain TWO ways: "read until silent" never terminates if the
+     * modem streams continuously (URC storm / firmware fault), so total bytes
+     * are capped — and, because a pathological trickle of one byte every
+     * ~30 ms would take ~245 s to reach that cap (past the 120 s task WDT), a
+     * wall-clock deadline ends it too, with the WDT fed meanwhile. Either bound
+     * alone leaves a way for a faulty modem to turn a flush into a reboot. */
     uint8_t tmp[64];
     int drained = 0;
-    const int drain_cap = 8192;
+    const int     drain_cap = 8192;
+    const int64_t deadline  = esp_timer_get_time() + 2000000LL;   /* 2 s */
 
     if (!s_flush_rescue) {
         int n;
         while ((n = uart_read_bytes(MODEM_UART, tmp, sizeof(tmp), pdMS_TO_TICKS(30))) > 0) {
             drained += n;
-            if (drained > drain_cap) break;
+            if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+            if (drained > drain_cap || esp_timer_get_time() > deadline) break;
         }
         return;
     }
@@ -82,7 +87,8 @@ void modem_flush(void) {
             total += n;
         }
         drained += n;
-        if (drained > drain_cap) break;
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+        if (drained > drain_cap || esp_timer_get_time() > deadline) break;
     }
     if (total > 0) {
         acc[total] = '\0';
@@ -461,6 +467,13 @@ static int64_t days_from_civil(int y, unsigned m, unsigned d) {
     return era * 146097 + (int64_t)doe - 719468;
 }
 
+/* Consecutive >24h re-sync rejections tolerated before we stop trusting the
+ * stored clock and re-anchor to network time — see the guard in
+ * parse_and_set_rtc(). At the ~6h resync cadence this bounds a wrong-clock
+ * lock-in to ~18h instead of forever (the failure mode where a bad value
+ * latched at the first sync rejects every later CORRECT time permanently). */
+#define RTC_RESYNC_REANCHOR_AFTER 3
+
 static bool parse_and_set_rtc(const char *s, bool two_digit_year) {
     int Y, Mo, D, h, m, sec;
     if (sscanf(s, "%d/%d/%d,%d:%d:%d", &Y, &Mo, &D, &h, &m, &sec) != 6)
@@ -487,7 +500,13 @@ static bool parse_and_set_rtc(const char *s, bool two_digit_year) {
 
     if (two_digit_year || Y < 100) Y += 2000;
 
-    if (Y < 2020 || Y > 2099 || Mo < 1 || Mo > 12 || D < 1 || D > 31 ||
+    /* Upper bound 2050, not 2099: an un-synced modem's CCLK placeholder is
+     * "80/01/06" (Quectel's epoch), which two-digit-year handling turns into
+     * 2080 — inside a 2099 cap, and on the INITIAL sync there is nothing to
+     * compare against, so the RTC would be set 54 years ahead and every
+     * payload stamped with it until the re-anchor logic below caught up
+     * (~18 h). Found in cng-cpil; the range check is the only guard here. */
+    if (Y < 2020 || Y > 2050 || Mo < 1 || Mo > 12 || D < 1 || D > 31 ||
         h < 0 || h > 23 || m < 0 || m > 59 || sec < 0 || sec > 60)
         return false;
 
@@ -500,8 +519,48 @@ static bool parse_and_set_rtc(const char *s, bool two_digit_year) {
     long off = (long)tz_qh * 15 * 60;
     epoch = (tz_sign == '+') ? epoch - off : epoch + off;
 
+    /* ── Sanity-gate a RE-sync against a wild jump ────────────────────────
+     * The calendar-field validation above rejects nonsense, but a garbled
+     * response can still parse into a plausible WRONG time (say a corrupted
+     * year or day). On the INITIAL sync we have nothing to compare against and
+     * must accept it — that is the jump from 1970 to real time. But once the
+     * clock has been set, real network time only ever drifts by seconds
+     * between syncs, so anything more than a day of movement is a mis-parse,
+     * not reality. Accepting it would stamp every payload with a wrong TS until
+     * the next good sync (up to 6 h), and the cloud orders sales by TS — a
+     * clock that jumps backwards makes totalizer deltas go negative, i.e.
+     * phantom transactions. Reject and keep the last good time instead. */
+    static int s_resync_rejects = 0;
+    if (s_time_synced) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        int64_t delta = (int64_t)epoch - (int64_t)now.tv_sec;
+        if (delta < 0) delta = -delta;
+        if (delta > 24 * 3600) {
+            /* Normally a >24h jump is a garbled response — reject and keep the
+             * last good sync. But if the FIRST sync latched a wrong value (e.g.
+             * the modem's own un-network-synced RTC via the CCLK fallback),
+             * every later CORRECT time is also >24h away and would be rejected
+             * forever. So after RTC_RESYNC_REANCHOR_AFTER consecutive
+             * rejections, stop trusting the stored clock and accept the network
+             * time as the new truth. */
+            if (++s_resync_rejects < RTC_RESYNC_REANCHOR_AFTER) {
+                ESP_LOGW(TAG, "RTC re-sync rejected: proposed time jumps %lld s from current "
+                              "(likely a garbled response) — keeping last good sync "
+                              "(reject %d/%d)",
+                         (long long)delta, s_resync_rejects, RTC_RESYNC_REANCHOR_AFTER);
+                return false;
+            }
+            ESP_LOGW(TAG, "RTC re-sync: %d consecutive >24h rejections — the stored clock "
+                          "was likely wrong; re-anchoring to network time",
+                     s_resync_rejects);
+            /* fall through and accept the proposed time */
+        }
+    }
+
     struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
     if (settimeofday(&tv, NULL) != 0) return false;
+    s_resync_rejects = 0;   /* clock is tracking again — reset the reject streak */
     return true;
 }
 

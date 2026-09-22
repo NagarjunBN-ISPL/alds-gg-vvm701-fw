@@ -3,6 +3,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -14,18 +15,23 @@ static const char *TAG = "radar";
  * back over RS485, before any CRC/echo validation, so a station visit can see
  * real wire data without a logic analyzer. */
 static void log_raw(const char *type, int tank_idx, const uint8_t *rx, int len) {
+    char who[16];
+    snprintf(who, sizeof(who), "tank%d", tank_idx + 1);
     if (len <= 0) {
-        ESP_LOGI(TAG, "%s tank%d RAW: no response", type, tank_idx + 1);
+        ESP_LOGI(TAG, "%s %s RAW: no response", type, who);
         return;
     }
-    char hex[64 * 3 + 1];
+    /* 96 bytes shown — enough for any Modbus reply; the payload carries the
+     * whole frame. */
+    char hex[96 * 3 + 1];
     int pos = 0;
     for (int i = 0; i < len && pos + 4 < (int)sizeof(hex); i++) {
         if (i > 0) hex[pos++] = ',';
         pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", rx[i]);
     }
     hex[pos] = '\0';
-    ESP_LOGI(TAG, "%s tank%d RAW (%d bytes): [%s]", type, tank_idx + 1, len, hex);
+    ESP_LOGI(TAG, "%s %s RAW (%d bytes%s): [%s]", type, who, len,
+             (pos + 4 >= (int)sizeof(hex)) ? ", truncated in log" : "", hex);
 }
 
 /* Standard Modbus RTU CRC16 (poly 0xA001, init 0xFFFF). Frames are built
@@ -43,15 +49,25 @@ static uint16_t modbus_crc16(const uint8_t *data, int len) {
     return crc;
 }
 
-/* FC03 (Ztech) / FC04 (Pantech), read 2 registers starting at 0 */
-static void radar_frame(uint8_t slave, uint8_t func, uint8_t *out /* 8 bytes */) {
+/* Generic Modbus RTU read request: slave + FC + start(2) + count(2) + CRC(2).
+ * Split out from radar_frame() so a future radar type whose register map is
+ * not the Ztech/Pantech "2 registers at 0" shape can reuse the identical
+ * framing and CRC instead of open-coding its own. */
+static void radar_frame_ex(uint8_t slave, uint8_t func,
+                           uint16_t start, uint16_t count,
+                           uint8_t *out /* 8 bytes */) {
     out[0] = slave;
     out[1] = func;
-    out[2] = 0x00; out[3] = 0x00;
-    out[4] = 0x00; out[5] = 0x02;
+    out[2] = (uint8_t)((start >> 8) & 0xFF); out[3] = (uint8_t)(start & 0xFF);
+    out[4] = (uint8_t)((count >> 8) & 0xFF); out[5] = (uint8_t)(count & 0xFF);
     uint16_t crc = modbus_crc16(out, 6);
     out[6] = (uint8_t)(crc & 0xFF);
     out[7] = (uint8_t)((crc >> 8) & 0xFF);
+}
+
+/* FC03 (Ztech) / FC04 (Pantech), read 2 registers starting at 0 */
+static void radar_frame(uint8_t slave, uint8_t func, uint8_t *out /* 8 bytes */) {
+    radar_frame_ex(slave, func, 0x0000, 0x0002, out);
 }
 
 /* 500 ms fixed read window for radar (no per-byte-reset needed) */
@@ -71,6 +87,9 @@ static int radar_xfer(const uint8_t *cmd, size_t cmd_len,
     int got = 0;
     int64_t dl = esp_timer_get_time() + (int64_t)RADAR_TIMEOUT_MS * 1000;
     while (esp_timer_get_time() < dl && got < (int)resp_max) {
+        /* WDT feed, same rationale as the genset/dispenser read loops: safe by
+         * construction rather than by the current value of RADAR_TIMEOUT_MS. */
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(RS485_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
             resp[got++] = ch;
@@ -93,8 +112,8 @@ static int radar_xfer(const uint8_t *cmd, size_t cmd_len,
  * Anything failing is treated exactly like no response (cloud sees 404),
  * never forwarded as real tank data. */
 static bool radar_resp_valid(const uint8_t *rx, int len, uint8_t slave, uint8_t fc,
-                             const char *type, int tank_idx) {
-    if (len < RADAR_RESP_LEN) {
+                             const char *type, int tank_idx, int min_len) {
+    if (len < min_len) {
         ESP_LOGW(TAG, "%s tank%d: short frame (%d bytes)", type, tank_idx + 1, len);
         return false;
     }
@@ -113,36 +132,34 @@ static bool radar_resp_valid(const uint8_t *rx, int len, uint8_t slave, uint8_t 
     return true;
 }
 
-bool radar_ztech_read(int tank_idx, uint8_t *rx_buf, int *rx_len) {
+bool radar_ztech_read(uint8_t slave, int tank_idx, uint8_t *rx_buf, int *rx_len) {
     if (tank_idx < 0 || tank_idx >= RADAR_MAX) { *rx_len = 0; return false; }
     uint8_t cmd[8];
-    uint8_t slave = (uint8_t)(ZTECH_SLAVE_BASE + tank_idx);
     radar_frame(slave, 0x03, cmd);
     *rx_len = radar_xfer(cmd, 8, rx_buf, 64, RADAR_RESP_LEN);
     log_raw("Ztech", tank_idx, rx_buf, *rx_len);
     if (*rx_len == 0) {
-        ESP_LOGW(TAG, "Ztech tank%d no response", tank_idx + 1);
+        ESP_LOGW(TAG, "Ztech tank%d (slave %u) no response", tank_idx + 1, slave);
         return false;
     }
-    if (!radar_resp_valid(rx_buf, *rx_len, slave, 0x03, "Ztech", tank_idx)) {
+    if (!radar_resp_valid(rx_buf, *rx_len, slave, 0x03, "Ztech", tank_idx, RADAR_RESP_LEN)) {
         *rx_len = 0;
         return false;
     }
     return true;
 }
 
-bool radar_pantech_read(int tank_idx, uint8_t *rx_buf, int *rx_len) {
+bool radar_pantech_read(uint8_t slave, int tank_idx, uint8_t *rx_buf, int *rx_len) {
     if (tank_idx < 0 || tank_idx >= RADAR_MAX) { *rx_len = 0; return false; }
     uint8_t cmd[8];
-    uint8_t slave = (uint8_t)(PANTECH_SLAVE_BASE + tank_idx);
     radar_frame(slave, 0x04, cmd);
     *rx_len = radar_xfer(cmd, 8, rx_buf, 64, RADAR_RESP_LEN);
     log_raw("Pantech", tank_idx, rx_buf, *rx_len);
     if (*rx_len == 0) {
-        ESP_LOGW(TAG, "Pantech tank%d no response", tank_idx + 1);
+        ESP_LOGW(TAG, "Pantech tank%d (slave %u) no response", tank_idx + 1, slave);
         return false;
     }
-    if (!radar_resp_valid(rx_buf, *rx_len, slave, 0x04, "Pantech", tank_idx)) {
+    if (!radar_resp_valid(rx_buf, *rx_len, slave, 0x04, "Pantech", tank_idx, RADAR_RESP_LEN)) {
         *rx_len = 0;
         return false;
     }

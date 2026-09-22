@@ -91,18 +91,34 @@ bool gps_poll(GpsFix_t *out) {
     if (!next_field(&cur, field, sizeof(field))) return false;   /* UTC time, discarded */
 
     if (!next_field(&cur, field, sizeof(field))) return false;
-    double lat = atof(field);
+    char  *endp = NULL;
+    double lat  = strtod(field, &endp);
+    if (endp == field) return false;   /* empty ",," or non-numeric latitude */
 
     if (!next_field(&cur, field, sizeof(field))) return false;
-    double lon = atof(field);
+    double lon = strtod(field, &endp);
+    if (endp == field) return false;   /* empty ",," or non-numeric longitude */
 
     /* Sanity check, not a format re-verification: a real fix's coordinates
      * must land in valid Earth-coordinate range. This catches "the field
      * order is wrong and some other field got parsed as latitude" more
      * usefully than silently publishing a bogus number. */
-    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
-        ESP_LOGW(TAG, "AT+QGPSLOC parsed out-of-range coordinates (%.6f,%.6f) — "
+    /* Positive-logic bounds so NaN/Inf are REJECTED as well as out-of-range:
+     * `NaN < -90` and `NaN > 90` are both false, so the old negative form let a
+     * non-finite value (a garbled field strtod reads as "nan"/"inf") slip
+     * through as a valid fix and publish invalid JSON. Requiring the value to
+     * fall INSIDE the range rejects NaN and Inf too. */
+    if (!(lat >= -90.0 && lat <= 90.0) || !(lon >= -180.0 && lon <= 180.0)) {
+        ESP_LOGW(TAG, "AT+QGPSLOC parsed out-of-range/non-finite coordinates (%.6f,%.6f) — "
                       "field order likely wrong, discarding", lat, lon);
+        return false;
+    }
+
+    /* Reject the exact (0,0) origin ("Null Island", Gulf of Guinea): it is
+     * never a real station and is exactly what empty/garbled coordinate fields
+     * collapse to — publishing it triggers false geo-fence/tamper alerts. */
+    if (lat == 0.0 && lon == 0.0) {
+        ESP_LOGW(TAG, "AT+QGPSLOC returned (0,0) — treating as no fix");
         return false;
     }
 

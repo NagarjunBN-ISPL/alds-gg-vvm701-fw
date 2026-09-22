@@ -27,3 +27,9 @@ bool mqtt_poll(char *topic_out, size_t topic_size,
                char *payload_out, size_t payload_size);
 void mqtt_disconnect(void);
 bool mqtt_is_connected(void);
+
+/* Seconds since the current broker session was established, or 0 if the link
+ * is down or has never come up this boot. Published as link.connected_s — the
+ * field that separates a device up for days from one reconnecting constantly,
+ * which are otherwise indistinguishable from a single diagnostics report. */
+uint32_t mqtt_connected_s(void);

@@ -3,6 +3,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -65,9 +66,24 @@ static bool modbus_request(uint8_t slave, uint8_t fc,
     int expected = 5 + count * 2; /* slave+fc+bytecount+data+CRC */
     int64_t dl = esp_timer_get_time() + (int64_t)MB_TIMEOUT_MS * 1000;
     while (esp_timer_get_time() < dl && got < (int)rx_max) {
+        /* Feed the WDT inside the read loop, matching every other UART loop in
+         * the firmware. Today the arithmetic is safe (MB_TIMEOUT_MS 500 ms x a
+         * handful of reads/retries << 120 s), but the dispenser/radar loops
+         * learned the hard way that "safe by arithmetic" silently breaks the
+         * moment a timeout or retry constant is raised. This makes it safe by
+         * construction instead. */
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(RS485_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
             rx[got++] = ch;
+            /* A Modbus exception reply is exactly 5 bytes (slave, fc|0x80,
+             * code, CRC, CRC). Without shrinking the target the loop waits the
+             * full MB_TIMEOUT_MS for `expected` data bytes that never arrive —
+             * up to 500 ms x retries of the shared RS485 bus held idle, which
+             * directly starves the dispenser polls waiting on that lock. Detect
+             * the exception the instant the FC byte lands and stop at the true
+             * length. A normal reply clears bit 7, so `expected` is unchanged. */
+            if (got == 2 && (rx[1] & 0x80)) expected = 5;
             if (got >= expected) break;
         }
     }

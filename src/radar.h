@@ -3,8 +3,9 @@
 #include <stdbool.h>
 
 /* RS485 must be in 8N1 mode before calling these.
-   tank_idx is 0-based and independent per type: Ztech uses Modbus slave
-   ZTECH_SLAVE_BASE+tank_idx (4,5), Pantech uses PANTECH_SLAVE_BASE+tank_idx
-   (6,7). Returns raw response bytes; len set to 0 on failure. */
-bool radar_ztech_read(int tank_idx, uint8_t *rx_buf, int *rx_len);
-bool radar_pantech_read(int tank_idx, uint8_t *rx_buf, int *rx_len);
+   slave is the Modbus slave address — the tank's numeric HW_ID suffix (or the
+   field-convention fallback: Ztech from ZTECH_SLAVE_BASE, Pantech continuing
+   after the last Ztech tank). See get_radar_slave() in main.c.
+   Returns raw response bytes; len set to 0 on failure. */
+bool radar_ztech_read(uint8_t slave, int tank_idx, uint8_t *rx_buf, int *rx_len);
+bool radar_pantech_read(uint8_t slave, int tank_idx, uint8_t *rx_buf, int *rx_len);

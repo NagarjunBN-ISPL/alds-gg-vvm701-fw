@@ -3,9 +3,11 @@
 #include "network.h"
 #include "tls_ca.h"
 #include "config.h"
+#include "store.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "esp_app_format.h"
 #include "esp_partition.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
@@ -31,15 +33,16 @@ static void fota_set_reason(char *reason, size_t size, const char *fmt, ...) {
 }
 
 #define FOTA_FILE      "UFS:vvm_fw.bin"
-#define FOTA_CHUNK     4096
+#define FOTA_CHUNK     2048
 #define FOTA_SSL_CTX   1     /* FOTA HTTPS uses SSL ctx 1; MQTT uses ctx 2 */
 /* Wall-clock ceiling on the whole UFS->OTA flash loop. The loop is already
  * bounded (each UART read has its own deadline; esp_ota_write fails when the
  * partition fills) and the reads are LOCAL to the modem's UFS, so a real
  * flash finishes in ~1-2 min even for a large image. This cap only exists as
- * belt-and-suspenders for a driver/hardware-level UART hang while the task
- * WDT is intentionally detached for FOTA — abort cleanly instead of tying up
- * an unattended station indefinitely. */
+ * belt-and-suspenders for a driver/hardware-level UART hang: the task WDT
+ * stays armed through FOTA and each read loop below feeds it, but this
+ * wall-clock cap bounds the whole flash independently so a stall aborts
+ * cleanly instead of tying up an unattended station indefinitely. */
 #define FOTA_FLASH_MAX_MS  300000
 
 /* ── HTTPS download → EC200U UFS ──────────────────────────────────────────
@@ -52,6 +55,14 @@ static void fota_set_reason(char *reason, size_t size, const char *fmt, ...) {
 /* Ensure the PDP data context is active — MQTT teardown (QMTCLOSE) can
  * leave it in a state where QHTTPGET fails to connect. Mirrors
  * OTA_Integration's pdp_refresh(). */
+static void ufs_cleanup(int fh);
+
+/* Set by fota_flash() when the image it just staged is another product's
+ * (see image_is_foreign). main.c reads it after fota_perform() returns to
+ * decide whether the RAM queue may be spilled to flash before the restart. */
+static bool s_last_image_foreign = false;
+bool fota_last_image_foreign(void) { return s_last_image_foreign; }
+
 static void fota_pdp_refresh(void) {
     char resp[128];
     modem_at("AT+QIACT?", "OK", 3000, resp, sizeof(resp));
@@ -124,9 +135,12 @@ static bool fota_download(const char *url, char *reason, size_t reason_size) {
     snprintf(cmd, sizeof(cmd), "AT+QHTTPCFG=\"sslctxid\",%d", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
 
-    /* Reset any prior HTTP session state (ignore errors). */
-    modem_at("AT+QHTTPSTOP",   "OK", 3000, NULL, 0);
-    modem_at("AT+QHTTPDISCON", "OK", 5000, NULL, 0);
+    /* Reset any prior HTTP session state (ignore errors). QHTTPSTOP is the
+     * EC200U's only HTTP teardown command — a former QHTTPDISCON call here just
+     * returned "+CME ERROR: invalid command line" every FOTA (verified on the
+     * live 1.0.1 update, 2026-08-21) because that command does not exist on this
+     * modem; removed to keep the priority path clean. */
+    modem_at("AT+QHTTPSTOP", "OK", 3000, NULL, 0);
     vTaskDelay(pdMS_TO_TICKS(300));
 
     /* Remove old file */
@@ -205,8 +219,66 @@ static bool fota_download(const char *url, char *reason, size_t reason_size) {
         fota_set_reason(reason, reason_size, "readfile_err_%d", dl_result);
         return false;
     }
+
+    /* VERIFY WHAT ACTUALLY LANDED IN UFS. "+QHTTPREADFILE: 0" means the modem
+     * finished its transfer, NOT that the whole body reached its filesystem:
+     * cng-cpil saw a 462848-byte image report 0 here and then stop delivering
+     * at ~303 KB, mid-chunk — that was all the file held. Without this check it
+     * presents as a "short chunk" a minute into flashing, after the OTA slot has
+     * been part-written, and the retry loop burns four more passes on a file
+     * that will never be complete. Free space is logged alongside because "the
+     * file is short" and "the filesystem is full" want different answers. */
+    modem_at("AT+QFLDS=\"UFS\"", "OK", 5000, resp, sizeof(resp));
+    ESP_LOGI(TAG, "UFS space: %s", resp);
+    snprintf(cmd, sizeof(cmd), "AT+QFLST=\"%s\"", FOTA_FILE);
+    if (modem_at(cmd, "+QFLST:", 5000, resp, sizeof(resp))) {
+        int stored = -1;
+        p = strstr(resp, "+QFLST:");                /* +QFLST: "UFS:vvm_fw.bin",<size> */
+        const char *comma = p ? strchr(p, ',') : NULL;
+        if (comma) stored = atoi(comma + 1);
+        ESP_LOGI(TAG, "UFS holds %d bytes, HTTP delivered %d", stored, g_len);
+        if (stored >= 0 && stored != g_len) {
+            ESP_LOGE(TAG, "UFS file is SHORT — %d of %d bytes; refusing to flash a partial image",
+                     stored, g_len);
+            fota_set_reason(reason, reason_size, "ufs_short_%d", stored);
+            return false;
+        }
+    }
     ESP_LOGI(TAG, "UFS download OK — flashing ...");
     return true;
+}
+
+/* ── Cross-product handover ───────────────────────────────────────────────
+ * The same VVM701 board moves between LPG and CNG stations and is switched
+ * to the other product's firmware by FOTA alone — the partition table, the
+ * NVS partition and the littlefs `storage` partition are shared and
+ * byte-compatible by design (partitions.csv). What must NOT be shared is the
+ * offline queue: records buffered here belong to this station and this
+ * product's topic tree, and the incoming firmware would republish every one
+ * of them as its own. The image's project_name (CMakeLists project()) is the
+ * identity that distinguishes the two products' binaries. */
+static bool image_is_foreign(const esp_partition_t *part) {
+    const esp_app_desc_t *mine = esp_app_get_description();
+    esp_app_desc_t theirs;
+
+    if (mine == NULL || part == NULL ||
+        esp_ota_get_partition_description(part, &theirs) != ESP_OK) {
+        ESP_LOGW(TAG, "cannot read the new image's identity - assuming it is "
+                      "this product and keeping the queued records");
+        return false;
+    }
+
+    const bool foreign = strncmp(mine->project_name, theirs.project_name,
+                                 sizeof(theirs.project_name)) != 0;
+
+    if (foreign) {
+        ESP_LOGW(TAG,
+                 "the new image is '%.*s', this one is '%.*s' - a "
+                 "cross-product handover",
+                 (int)sizeof(theirs.project_name), theirs.project_name,
+                 (int)sizeof(mine->project_name), mine->project_name);
+    }
+    return foreign;
 }
 
 /* ── UFS → OTA partition ─────────────────────────────────────────────── */
@@ -238,10 +310,7 @@ static bool fota_flash(char *reason, size_t reason_size) {
     if (!update_part) {
         ESP_LOGE(TAG, "No OTA partition");
         fota_set_reason(reason, reason_size, "no_ota_partition");
-        snprintf(cmd, sizeof(cmd), "AT+QFCLOSE=%d", fh);
-        modem_at(cmd, "OK", 5000, NULL, 0);
-        snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s\"", FOTA_FILE);
-        modem_at(cmd, "OK", 5000, NULL, 0);
+        ufs_cleanup(fh);
         return false;
     }
 
@@ -249,10 +318,7 @@ static bool fota_flash(char *reason, size_t reason_size) {
     if (esp_ota_begin(update_part, OTA_SIZE_UNKNOWN, &ota_hdl) != ESP_OK) {
         ESP_LOGE(TAG, "OTA begin failed");
         fota_set_reason(reason, reason_size, "ota_begin_failed");
-        snprintf(cmd, sizeof(cmd), "AT+QFCLOSE=%d", fh);
-        modem_at(cmd, "OK", 5000, NULL, 0);
-        snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s\"", FOTA_FILE);
-        modem_at(cmd, "OK", 5000, NULL, 0);
+        ufs_cleanup(fh);
         return false;
     }
 
@@ -363,10 +429,7 @@ static bool fota_flash(char *reason, size_t reason_size) {
     }
 
     /* Close and delete file */
-    snprintf(cmd, sizeof(cmd), "AT+QFCLOSE=%d", fh);
-    modem_at(cmd, "OK", 5000, NULL, 0);
-    snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s\"", FOTA_FILE);
-    modem_at(cmd, "OK", 5000, NULL, 0);
+    ufs_cleanup(fh);
 
     if (!ok) {
         esp_ota_abort(ota_hdl);
@@ -382,16 +445,63 @@ static bool fota_flash(char *reason, size_t reason_size) {
         fota_set_reason(reason, reason_size, "image_verify_failed");
         return false;
     }
+
     if (esp_ota_set_boot_partition(update_part) != ESP_OK) {
         ESP_LOGE(TAG, "Set boot partition failed");
         fota_set_reason(reason, reason_size, "set_boot_failed");
         return false;
     }
+
+    /* Only once the boot slot is committed — a purge before a failed
+     * set_boot would throw away a backlog for an update that never happens. */
+    s_last_image_foreign = image_is_foreign(update_part);
+    if (s_last_image_foreign) {
+        /* HAND OVER AN EMPTY, UNCLAIMED QUEUE. store_disown() drops the owner
+         * marker so that when this gateway comes back to this product — by
+         * whichever firmware performs that trip — store_init() discards what
+         * the other product left rather than republishing it. du_task keeps
+         * polling until the restart; main.c purges once more right before
+         * esp_restart() and skips its usual RAM->flash spill for that reason. */
+        if (store_purge())
+            ESP_LOGW(TAG, "cross-product handover — discarded the offline queue; those "
+                          "readings belong to this deployment, not the incoming firmware's");
+        else
+            ESP_LOGE(TAG, "cross-product handover — could NOT purge the offline queue");
+        store_disown();
+    }
     ESP_LOGI(TAG, "OTA flash complete");
     return true;
 }
 
-#define FOTA_MAX_RETRIES 3
+/* ── Retry policy ─────────────────────────────────────────────────────────
+ * BOTH stages retry, and the flash stage is inside the loop. alds-sr's first
+ * field update took four attempts: two socket failures on the download, then
+ * one short read and one corrupt image on the transfer back out of the modem
+ * — all transient, a further try succeeded with nothing changed. So a
+ * `read_short` or a failed esp_ota_end() costs one more pass, not an operator
+ * noticing fota_failed and re-pushing the URL. Re-downloading rather than
+ * re-flashing the file already in UFS is deliberate: a corrupt transfer does
+ * not say WHERE the corruption came from, and re-reading a file that is
+ * itself wrong fails identically every time.
+ *
+ * modem_hard_reset() before attempt 3 AND the last: it costs ~20 s and tears
+ * down the PDP context, so it is not worth doing after the first hiccup, but
+ * in-modem faults (err=729 memory allocation, err=716 socket) persist across
+ * HTTP sessions and only clear with a baseband restart.
+ *
+ * Two things bound the whole thing. FOTA_TOTAL_BUDGET_MS caps the wall clock:
+ * MQTT is torn down for the duration, du_task is buffering to flash, and the
+ * queue needs the broker back more than this update needs a fifth try on a
+ * link that has failed four times. And a reason that cannot change between
+ * attempts — no OTA partition, an over-long QFREAD command — aborts at once;
+ * everything else (network, HTTP status, short read, verify) is retried. */
+#define FOTA_ATTEMPTS        5
+#define FOTA_TOTAL_BUDGET_MS (15 * 60 * 1000)
+
+static bool fota_reason_is_final(const char *reason) {
+    return reason && (strcmp(reason, "no_ota_partition")  == 0 ||
+                      strcmp(reason, "read_cmd_too_long") == 0);
+}
 
 /* Strip leading/trailing whitespace, quotes and CR/LF from the URL.
  * MQTT publishers (dashboards, scripts, MQTT Explorer) often append a
@@ -415,11 +525,23 @@ static void sanitize_url(char *url) {
     }
 }
 
+static void ufs_cleanup(int fh) {
+    char cmd[128];
+    if (fh >= 0) {
+        snprintf(cmd, sizeof(cmd), "AT+QFCLOSE=%d", fh);
+        modem_at(cmd, "OK", 5000, NULL, 0);
+    }
+    snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s\"", FOTA_FILE);
+    modem_at(cmd, "OK", 5000, NULL, 0);
+}
+
 bool fota_perform(const char *url, const char *pub_topic,
                   char *reason, size_t reason_size) {
     if (reason && reason_size) reason[0] = '\0';
 
-    static char clean_url[512];
+    /* Sized from FOTA_URL_MAX so the cap the caller enforces and the buffer
+     * that enforces it can never drift apart. */
+    static char clean_url[FOTA_URL_MAX + 1];
     strncpy(clean_url, url, sizeof(clean_url) - 1);
     clean_url[sizeof(clean_url) - 1] = '\0';
     sanitize_url(clean_url);
@@ -436,31 +558,49 @@ bool fota_perform(const char *url, const char *pub_topic,
     }
     ESP_LOGI(TAG, "FOTA start URL=[%s] topic=%s", clean_url, pub_topic);
 
-    /* The download can fail transiently on cellular (err=716 socket connect)
-     * — plain retries cover that. But in-modem failures like err=729 (memory
-     * allocation) persist across HTTP sessions and only clear with a baseband
-     * restart, so before the FINAL attempt escalate: PWRKEY power-cycle the
-     * modem and rebuild the network, then try once more. */
-    bool downloaded = false;
-    for (int attempt = 1; attempt <= FOTA_MAX_RETRIES; attempt++) {
-        if (attempt == FOTA_MAX_RETRIES) {
-            ESP_LOGW(TAG, "FOTA: escalating — power-cycling modem before final attempt");
+    s_last_image_foreign = false;
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)FOTA_TOTAL_BUDGET_MS * 1000LL;
+
+    for (int attempt = 1; attempt <= FOTA_ATTEMPTS; attempt++) {
+        if (attempt > 1 && esp_timer_get_time() > deadline_us) {
+            ESP_LOGE(TAG, "FOTA: giving up after %d min — the queue needs the broker back "
+                          "more than this update needs another try", FOTA_TOTAL_BUDGET_MS / 60000);
+            fota_set_reason(reason, reason_size, "budget_exhausted");
+            break;
+        }
+        if (attempt == 3 || attempt == FOTA_ATTEMPTS) {
+            ESP_LOGW(TAG, "FOTA: escalating — power-cycling modem before attempt %d", attempt);
             modem_hard_reset();
+            esp_task_wdt_reset();
             if (!network_init()) {
                 ESP_LOGE(TAG, "FOTA: network rebuild failed after modem reset");
                 fota_set_reason(reason, reason_size, "network_rebuild_failed");
                 break;
             }
+            /* The download verifies S3's certificate against the CA file in
+             * the modem's UFS. Re-provisioning after a power-cycle is cheap
+             * insurance against a module that came back without it. */
+            tls_ca_provision();
+            esp_task_wdt_reset();
         }
-        /* fota_download overwrites reason on each failed attempt, so the
-         * buffer ends up holding the LAST attempt's cause — the relevant one.*/
-        if (fota_download(clean_url, reason, reason_size)) { downloaded = true; break; }
-        ESP_LOGW(TAG, "FOTA download attempt %d/%d failed", attempt, FOTA_MAX_RETRIES);
-        if (attempt < FOTA_MAX_RETRIES)
-            vTaskDelay(pdMS_TO_TICKS(attempt * 5000));
-    }
-    if (!downloaded) return false;
 
-    if (!fota_flash(reason, reason_size)) return false;
-    return true;  /* Caller publishes fota_success then calls esp_restart() */
+        if (fota_download(clean_url, reason, reason_size) &&
+            fota_flash(reason, reason_size))
+            return true;
+
+        ESP_LOGW(TAG, "FOTA attempt %d/%d failed (%s)", attempt, FOTA_ATTEMPTS,
+                 (reason && reason[0]) ? reason : "?");
+        if (fota_reason_is_final(reason)) {
+            ESP_LOGE(TAG, "FOTA: '%s' cannot change between attempts — not retrying", reason);
+            break;
+        }
+        if (attempt < FOTA_ATTEMPTS) {
+            /* Sliced so the WDT is fed through the back-off. */
+            for (int w = 0; w < attempt * 5; w++) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                esp_task_wdt_reset();
+            }
+        }
+    }
+    return false;
 }

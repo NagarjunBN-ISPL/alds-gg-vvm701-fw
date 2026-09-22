@@ -1,0 +1,11 @@
+## IDF Component Manager manifest.
+##
+## littlefs is NOT bundled with ESP-IDF (checked against 6.0.1: there is no
+## components/esp_littlefs, only examples/storage/littlefs which pulls this
+## same dependency). It is fetched from the component registry at build time,
+## so the first build after adding this needs network access.
+##
+## Used by store.c for the offline record queue on the `storage` partition
+## (data/littlefs, 0xe20000, 0x1e0000 = 1920K — see partitions.csv).
+dependencies:
+  joltwallet/littlefs: "~=1.20.0"

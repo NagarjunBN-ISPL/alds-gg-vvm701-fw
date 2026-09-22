@@ -3,10 +3,37 @@
 #include <stdbool.h>
 #include "config.h"
 
+/* Dispenser make at a station-list position. Stored as a uint8_t in the
+ * config blob, so the values are part of the NVS contract: never renumber. */
+typedef enum {
+    DU_MAKE_BLUESKY = 0,
+    DU_MAKE_YENEN   = 1,
+    DU_MAKE_MAX     = DU_MAKE_YENEN   /* highest valid value — clamp target */
+} du_make_t;
+
+/* ── LAYOUT IS A FLASH CONTRACT ─────────────────────────────────────────────
+ * nvs_config_save() writes this struct to NVS as ONE raw blob and
+ * nvs_config_load() reads it back through the same layout. A blob written by
+ * an older build of this product is accepted when it is SHORTER than the
+ * current struct: the stored prefix is copied in and every field past its end
+ * keeps its default. That is what makes adding a field FOTA-safe — but only
+ * if the new field is APPENDED. Inserting one in the middle shifts every
+ * later field by its size, and a provisioned unit then reads its APN, broker
+ * and credentials through the wrong offsets on the first boot of the new
+ * image. New fields go at the END, after cred_fp. If a field ever has to move
+ * or change size, bump the "/N" in PRODUCT_ID (config.h) so the product guard
+ * treats the old blob as foreign and wipes it instead of misreading it. */
 typedef struct {
-    uint8_t  du_bluesky_count;  /* 0-6 (DU_BLUESKY_MAX)              */
-    uint8_t  ztech_count;       /* 0-4 alone (slaves 4-7); 0-2 if pantech_count>0 (slaves 4,5) */
-    uint8_t  pantech_count;     /* 0-4 (slaves 6-9); ztech capped to 2 whenever this is >0 */
+    uint8_t  du_count;                        /* 0-6 */
+    uint8_t  du_make[DU_MAX_DISPENSERS];      /* du_make_t per entry */
+    char     du_sfx[DU_MAX_DISPENSERS][3];    /* 2-digit dispenser number + NUL;
+                                               * "" = the entry's position. See
+                                               * du_number_of() below. */
+    uint8_t  ztech_count;       /* 0-4 — slave per tank = its suffix (auto 4..) */
+    uint8_t  pantech_count;     /* 0-4 — auto slaves continue after Ztech      */
+    uint8_t  reserved_u8;       /* was masibus_count (alds-ggy). Kept as a byte
+                                 * so the blob layout ahead of cred_fp is
+                                 * unchanged; always 0 here. */
     uint8_t  genset_type;       /* 0=Off,1=SEDEMAC                  */
     uint8_t  genset_model;      /* GENSET_MODEL_* in config.h: 0=GC1211 1=GC1111
                                  * 2=SGC120 3=GC1201 4=GC1202 5=GC1203 6=GC902 */
@@ -15,11 +42,12 @@ typedef struct {
     uint8_t  di_enable;         /* bitmask: bit0=DI1..bit3=DI4      */
     char     sfx_genset[3];     /* 2-char suffix + NUL              */
     char     sfx_di[3];
-    /* Per-unit HW_ID suffixes (2-char + NUL). Empty = fall back to the
-     * auto-generated B<n>/Z<n>/P<n> pattern in build_hw_ids(). */
-    char     sfx_bs[DU_BLUESKY_MAX][3];
+    /* Per-unit HW_ID suffixes (2 digits + NUL). Empty = fall back to the
+     * auto value in build_hw_ids(), which for a radar tank is also its Modbus
+     * slave. */
     char     sfx_ztech[RADAR_MAX][3];
     char     sfx_pantech[RADAR_MAX][3];
+    char     reserved_sfx[RADAR_MAX][3];   /* was sfx_masibus (alds-ggy); layout keeper, always "" */
 
     /* GNSS via the modem's built-in GPS (see gps.c) — default false. Most
      * gateways stay disabled since not every unit has the GNSS antenna
@@ -62,15 +90,95 @@ typedef struct {
     bool     mqtt_tls_bak;
     bool     conn_pending;           /* trying new connectivity this boot    */
     bool     conn_rollback_notify;   /* announce a just-happened rollback    */
+
+    /* Fingerprint of the COMPILED credential set that last wrote the fields
+     * above (see the note in config.h). 0 = never stamped, which is what every
+     * gateway provisioned before this field existed reads back — their stored
+     * blob is shorter than this struct, so nvs_config_load() leaves this at its
+     * default and the first boot of a firmware carrying this feature adopts the
+     * compiled credentials once, then stamps them. */
+    uint32_t cred_fp;
 } DeviceConfig;
 
+/* ── Dispenser number ──────────────────────────────────────────────────────
+ * Station-list entry i (0-based) names dispenser N: its suffix as a number if
+ * one is set, else its position (i+1). N IS the bus address (BlueSky nozzles
+ * 2N-1 and 2N, Yenen head N) and the HW_ID suffix ("%02d") — this is the ONE
+ * place a suffix becomes a number, so the label the cloud sees and the address
+ * the bus is asked cannot disagree. Returns 0 for a suffix that is set but not
+ * a valid number (never after nvs_config_load(), which clears such a suffix;
+ * possible on a setconfig candidate, where the validator refuses it). Pure —
+ * no ESP-IDF, so the host tests compile it. */
+int du_number_of(const DeviceConfig *c, int i);
+
 void nvs_config_defaults(DeviceConfig *cfg);
+
+/* Call BEFORE nvs_config_load() when the bootloader has just rolled back an
+ * image of ANOTHER product (main.c reads the otadata state; this file stays
+ * free of esp_ota so the host tests can compile it). That image ran far
+ * enough to stamp its product tag over ours but never became the running
+ * product, so the tag is a lie about who owns this configuration: the guard
+ * restamps ours and keeps everything, instead of wiping a good station plan
+ * because a swap attempt failed. NULL/absent = no hint = normal guard. */
+void nvs_config_note_reverted_foreign_image(const char *project_name);
+
 bool nvs_config_load(DeviceConfig *cfg);
 bool nvs_config_save(const DeviceConfig *cfg);
 void nvs_config_factory_reset(void);
+
+/* True if nvs_config_load() found NVS stamped with a DIFFERENT product and
+ * erased it — i.e. this gateway is running a build for other hardware than the
+ * configuration it was carrying. The caller comes up on defaults (so it reports
+ * "unconfigured"), and must also purge the offline queue: those records describe
+ * the previous product's equipment. Valid only after nvs_config_load(). */
+bool nvs_config_product_wiped(void);
+
+/* Fingerprint of this build's compiled-in credentials. Never 0 — 0 is the
+ * "no stamp in NVS" sentinel. */
+uint32_t nvs_config_compiled_cred_fp(void);
+
+/* Force the compiled-in connectivity credentials over whatever NVS holds, if
+ * and only if the stored fingerprint says they came from a DIFFERENT build.
+ * Call once, straight after nvs_config_load() and before the APN and broker
+ * are handed to the modem. Equipment configuration is untouched.
+ *
+ * Returns true if the credentials were replaced (the caller should announce it
+ * and persist), false when NVS already matches this build — the normal path.
+ *
+ * *destination_changed is set true only when the broker the device publishes to
+ * actually moved (host, port or base topic). That is the case where anything
+ * still buffered in the offline queue belongs to the PREVIOUS deployment and
+ * must be purged rather than delivered to the new one. An APN-only change
+ * leaves it false: the destination is the same, so the backlog is still valid.
+ * Safe to pass NULL. */
+bool nvs_config_enforce_firmware_creds(DeviceConfig *cfg, bool *destination_changed);
 
 /* Persistent power-on counter — incremented once per boot and returned. Lets
  * the fleet spot a station silently reboot-looping (flaky modem, NVS
  * corruption, brownout) that telemetry gaps alone wouldn't reveal. Stored
  * separately from DeviceConfig so a setconfig save never disturbs it. */
 uint32_t nvs_boot_count_bump(void);
+
+/* ── FOTA URL memory ─────────────────────────────────────────────────────
+ * Which firmware URL this gateway last APPLIED, and whether the image it
+ * produced stayed or was rolled back by the bootloader. Kept as a 32-bit
+ * FNV-1a of the URL under its own NVS keys (not in the config blob — a
+ * setconfig save must never disturb it, and it has to survive a config wipe
+ * so a re-delivered retained URL is still recognised after a product swap).
+ *
+ * This is the guard that stops a RETAINED update message from re-flashing
+ * the same image on every boot, fleet-wide: the URL that succeeded is
+ * remembered across the restart it triggers, and the image that boots next
+ * (same NVS) recognises and skips it. A URL whose image was later REVERTED is
+ * remembered too, so a retained URL cannot loop download -> boot -> rollback.
+ * A different URL always clears the record. */
+typedef enum {
+    FOTA_URL_NONE     = 0,   /* nothing recorded                            */
+    FOTA_URL_APPLIED  = 1,   /* the image from this URL is what is running  */
+    FOTA_URL_REVERTED = 2,   /* that image failed to confirm and was undone */
+} fota_url_state_t;
+
+uint32_t nvs_fota_url_fp(const char *url);                 /* never 0 */
+fota_url_state_t nvs_fota_url_get(uint32_t *fp_out);       /* fp_out may be NULL */
+bool nvs_fota_url_set(uint32_t fp, fota_url_state_t st);
+void nvs_fota_url_clear(void);
