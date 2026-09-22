@@ -13,4 +13,23 @@ void network_set_apn(const char *apn, const char *user, const char *pass);
 void network_build_qicsgp(char *out, size_t out_size);
 
 bool network_init(void);
+
+/* Registration only: CEREG/CGREG says the modem is attached to a network.
+ * Answers "is the modem alive and attached", NOT "can it open a socket" —
+ * see network_data_bearer_up() for why those are different questions. */
 bool network_check(void);
+
+/* Registration AND an active PDP context ("+QIACT: 1,1").
+ *
+ * THIS is the question the connectivity recovery ladder must ask, and asking
+ * the other one was a real field failure mode: when the network tears the PDP
+ * context down (a "+QIURC: \"pdpdeact\"", which a pulled SIM also produces) the
+ * modem stays REGISTERED but can no longer open a socket. Every QMTOPEN then
+ * fails in a way that looks exactly like a broker outage, so a ladder gated on
+ * registration concludes "not our fault", refuses to escalate, and never
+ * reaches the level that runs AT+QIACT=1 — the one thing that would fix it. The
+ * gateway stays offline indefinitely while reporting a healthy network.
+ *
+ * Costs one extra AT round-trip over network_check(), and only on the failure
+ * path. Ported from the same fix in cng-cpil-vvm701-fw. */
+bool network_data_bearer_up(void);

@@ -52,10 +52,36 @@ void du_build_nozzle_payload(const DuNozzle_t *nz, int label,
 /* Convert raw bytes to comma-separated hex string. */
 void du_bytes_to_hex(const uint8_t *data, int len, char *out, size_t out_size);
 
-/* Raw hex passthrough — cmd_hex carries its own target address, so this
-   is protocol/unit-agnostic. Puts response hex into resp_buf.
-   Returns false on no reply. */
-bool du_exec_bluesky_rsp(const char *cmd_hex, char *resp_buf, size_t resp_size);
-
-/* Execute a BlueSky K-Factor command (same passthrough as above). */
-bool du_exec_bluesky_kfactor(const char *cmd_hex, char *resp_buf, size_t resp_size);
+/* ── rsp / kfactor passthrough, hardened ─────────────────────────────────
+ * The cloud builds the BlueSky frame (it owns the write command set and its
+ * checksum); the device puts it on the bus and returns the pump's raw reply as
+ * hex. What the device DOES check before a byte goes out, because each of
+ * these was a way to change the price of the wrong pump, or of a pump mid-sale:
+ *
+ *   1. it is a BlueSky frame — F5, self-describing length (byte[2] = 0xA<n>)
+ *      matching the byte count; anything else is refused ("bad_frame");
+ *   2. its target address is one of THIS dispenser's two nozzles (addr_a /
+ *      addr_b — the topic it arrived on names the dispenser), else
+ *      "addr_not_this_dispenser". The passthrough is per-dispenser precisely
+ *      so a frame cannot reach a pump the operator did not select;
+ *   3. the target nozzle answers its status poll and reports IDLE — the same
+ *      gate every poll-round read uses. A write landing mid-delivery is the
+ *      one outcome nobody can undo, so a busy nozzle is "nozzle_busy" and a
+ *      silent one "nozzle_absent"; the operator re-sends when the sale ends.
+ *
+ * Then the frame is sent, retried ONCE if the pump did not answer with a valid
+ * frame echoing its address ("no_reply" if it never does). On success resp_buf
+ * holds the reply as comma-hex, and when the frame carried data (a write) the
+ * pump's current value is read back with `readback_cmd` (BS_CMD_RSP or
+ * BS_CMD_KFACT) into readback_buf as comma-hex so the operator can see what the
+ * pump now holds. readback_buf is "" when nothing was read back.
+ *
+ * The caller owns the RS485 bus lock and line mode. `reason` is a stable token
+ * for the refusal, set only when false is returned. */
+#define BS_CMD_RSP    0xB6
+#define BS_CMD_KFACT  0xE2
+bool du_exec_bluesky_passthrough(const char *cmd_hex, uint8_t addr_a, uint8_t addr_b,
+                                 uint8_t readback_cmd,
+                                 char *resp_buf, size_t resp_size,
+                                 char *readback_buf, size_t readback_size,
+                                 char *reason, size_t reason_size);

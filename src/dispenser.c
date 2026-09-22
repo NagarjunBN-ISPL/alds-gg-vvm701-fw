@@ -19,9 +19,9 @@
  */
 #define BS_CMD_STATUS 0xD5
 #define BS_CMD_TOTAL  0xC5
-#define BS_CMD_RSP    0xB6
-#define BS_CMD_KFACT  0xE2
-/* BS_CMD_RFID (0xD7) intentionally removed — RFID is no longer polled. */
+/* BS_CMD_RSP (0xB6) and BS_CMD_KFACT (0xE2) live in dispenser.h — the
+ * passthrough caller names its read-back command with them.
+ * BS_CMD_RFID (0xD7) intentionally removed — RFID is no longer polled. */
 
 static void bluesky_frame(uint8_t addr, uint8_t cmd_byte, uint8_t *out /* 5 bytes */) {
     out[0] = 0xF5;
@@ -246,21 +246,21 @@ void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz, bool read_kfactor) {
     nz->total_len = du_read_field(addr, BS_CMD_TOTAL, nz->total, DU_TOTAL_RETRIES, "total");
     vTaskDelay(pdMS_TO_TICKS(30));
 
-    /* RSP — single read, unchanged cadence (kept short to protect the round). */
-    nz->rsp_len = du_read_field(addr, BS_CMD_RSP, nz->rsp, 1, "rsp");
+    /* RSP — retried like the totalizer (DU_RSP_RETRIES, config.h). */
+    nz->rsp_len = du_read_field(addr, BS_CMD_RSP, nz->rsp, DU_RSP_RETRIES, "rsp");
     vTaskDelay(pdMS_TO_TICKS(30));
 
     /* ── K-Factor: read only when due, carried forward otherwise ───────────
      * Per-address cache of the last successfully-read k-factor, indexed by the
-     * 1-based nozzle address (1..DU_BLUESKY_MAX*2; slot 0 unused). On a
+     * 1-based nozzle address (1..DU_MAX_DISPENSERS*2; slot 0 unused). On a
      * non-due round — or a due round whose retries all fail — the last good
      * value is copied back into nz->kfact, so every published message carries
      * a stable k-factor without spending bus time re-reading a value that
      * changes only on recalibration. Zero-length until the first good read,
      * which the payload builder renders as "404". */
-    static uint8_t kf_cache[DU_BLUESKY_MAX * 2 + 1][DU_RESP_MAX];
-    static int     kf_cache_len[DU_BLUESKY_MAX * 2 + 1];
-    bool addr_cacheable = (addr >= 1 && addr <= DU_BLUESKY_MAX * 2);
+    static uint8_t kf_cache[DU_MAX_DISPENSERS * 2 + 1][DU_RESP_MAX];
+    static int     kf_cache_len[DU_MAX_DISPENSERS * 2 + 1];
+    bool addr_cacheable = (addr >= 1 && addr <= DU_MAX_DISPENSERS * 2);
 
     if (read_kfactor) {
         nz->kfact_len = du_read_field(addr, BS_CMD_KFACT, nz->kfact, DU_KFACTOR_RETRIES, "kfact");
@@ -309,14 +309,21 @@ static inline int clamp_pos(int pos, size_t buf_size) {
  * The "nozzles" wrapper is deliberately retained so the cloud parser sees the
  * exact structure it already consumes; only the number of nozzles inside drops
  * to one:
- *   {"HW_ID":"..","nozzles":{"1":{"data":"..","rsp":"..","kfact":".."}},"TS":".."}
+ *   {"HW_ID":"..","nozzles":{"1":{"data":"..","rsp":"..","kfact":"..","rfid":"404"}},"TS":".."}
  *
  * This is also what the BlueSky protocol doc specifies (one message per
  * nozzle), and it halves the payload: worst case ~500 B instead of ~920 B,
  * putting every dispenser message comfortably under the modem's ~1400-byte
- * QMTPUBEX ceiling (MQTT_MODEM_PAYLOAD_SAFE_MAX) rather than near it. The
- * "rfid" field is gone (RFID is no longer read); "kfact" is the last value
- * read on the 15-min k-factor cadence, carried forward in between. */
+ * QMTPUBEX ceiling (MQTT_MODEM_PAYLOAD_SAFE_MAX) rather than near it.
+ *
+ * "rfid" IS EMITTED BUT NEVER READ. The fleet's cloud pipeline was built
+ * against the original device shape, which carried an rfid field, and the
+ * decision (2026-09-21) was to keep that key present so the ingested record
+ * is byte-for-byte the shape the cloud already stores — while NOT spending a
+ * bus transaction on it. It is therefore the constant "404", the same value a
+ * failed read would produce, so a consumer that decodes it sees "no RFID" and
+ * a consumer that ignores it is unaffected. "kfact" is the last value read on
+ * the 15-min k-factor cadence, carried forward in between. */
 void du_build_nozzle_payload(const DuNozzle_t *nz, int label,
                              const char *hw_id, const char *ts,
                              char *buf, size_t buf_size) {
@@ -349,7 +356,7 @@ void du_build_nozzle_payload(const DuNozzle_t *nz, int label,
         if (nz->kfact_len > 0) du_bytes_to_hex(nz->kfact, nz->kfact_len, h_kf,  sizeof(h_kf));
         else strcpy(h_kf, "404");
         pos += snprintf(buf + pos, buf_size - pos,
-                        "\"%d\":{\"data\":\"%s\",\"rsp\":\"%s\",\"kfact\":\"%s\"}",
+                        "\"%d\":{\"data\":\"%s\",\"rsp\":\"%s\",\"kfact\":\"%s\",\"rfid\":\"404\"}",
                         label, h_tot, h_rsp, h_kf);
         pos = clamp_pos(pos, buf_size);
     }
@@ -396,18 +403,95 @@ static int hex_str_to_bytes(const char *s, uint8_t *out, size_t out_max) {
     return n;
 }
 
-bool du_exec_bluesky_rsp(const char *cmd_hex, char *resp_buf, size_t resp_size) {
-    uint8_t cmd[32];
-    int cmd_len = hex_str_to_bytes(cmd_hex, cmd, sizeof(cmd));
-    if (cmd_len == 0) return false;
-
-    uint8_t resp[DU_RESP_MAX];
-    int rlen = rs485_xfer(cmd, cmd_len, resp, DU_RESP_MAX);
-    if (rlen == 0) return false;
-    du_bytes_to_hex(resp, rlen, resp_buf, resp_size);
-    return true;
+/* Is the target nozzle present and idle right now? One status exchange with
+ * the poll path's retry budget; the verdict is the same one
+ * du_poll_bluesky_nozzle() uses (0x80 idle, 0x00 the known-defect idle). */
+static bool bluesky_nozzle_idle(uint8_t addr, bool *present) {
+    uint8_t cmd[5], st[DU_RESP_MAX];
+    bluesky_frame(addr, BS_CMD_STATUS, cmd);
+    *present = false;
+    for (int attempt = 1; attempt <= DU_STATUS_RETRIES; attempt++) {
+        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(DU_STATUS_RETRY_MS));
+        int len = rs485_xfer(cmd, 5, st, DU_RESP_MAX);
+        esp_task_wdt_reset();
+        log_raw_frame(addr, "status(gate)", st, len);
+        if (len < 4 || !bluesky_resp_valid(st, len, addr, "status(gate)")) continue;
+        *present = true;
+        return (st[3] == 0x80 || st[3] == 0x00);
+    }
+    return false;
 }
 
-bool du_exec_bluesky_kfactor(const char *cmd_hex, char *resp_buf, size_t resp_size) {
-    return du_exec_bluesky_rsp(cmd_hex, resp_buf, resp_size);
+static void set_reason(char *reason, size_t size, const char *tok) {
+    if (reason && size) snprintf(reason, size, "%s", tok);
+}
+
+bool du_exec_bluesky_passthrough(const char *cmd_hex, uint8_t addr_a, uint8_t addr_b,
+                                 uint8_t readback_cmd,
+                                 char *resp_buf, size_t resp_size,
+                                 char *readback_buf, size_t readback_size,
+                                 char *reason, size_t reason_size) {
+    if (resp_buf && resp_size)         resp_buf[0]     = '\0';
+    if (readback_buf && readback_size) readback_buf[0] = '\0';
+
+    uint8_t cmd[32];
+    int cmd_len = hex_str_to_bytes(cmd_hex, cmd, sizeof(cmd));
+    if (cmd_len == 0) { set_reason(reason, reason_size, "bad_hex"); return false; }
+
+    /* 1. A BlueSky frame, whole. The length nibble is the same rule rs485_xfer
+     *    uses to end a reply, so a frame that violates it here would not be
+     *    parsed by the pump either — refusing it costs nothing and catches a
+     *    truncated or mis-pasted command before the bus sees it. */
+    if (cmd_len < 5 || cmd[0] != 0xF5 || (cmd[2] & 0xF0) != 0xA0 ||
+        (cmd[2] & 0x0F) + 3 != cmd_len) {
+        ESP_LOGW(TAG, "passthrough: not a BlueSky frame (%d bytes, %02x %02x %02x) — refused",
+                 cmd_len, cmd[0], cmd_len > 1 ? cmd[1] : 0, cmd_len > 2 ? cmd[2] : 0);
+        set_reason(reason, reason_size, "bad_frame");
+        return false;
+    }
+    /* 2. Addressed to one of THIS dispenser's nozzles. */
+    uint8_t addr = cmd[1];
+    if (addr != addr_a && addr != addr_b) {
+        ESP_LOGW(TAG, "passthrough: frame targets nozzle %u but this topic is dispenser "
+                      "nozzles %u/%u — refused", addr, addr_a, addr_b);
+        set_reason(reason, reason_size, "addr_not_this_dispenser");
+        return false;
+    }
+    /* 3. Idle gate. */
+    bool present = false;
+    if (!bluesky_nozzle_idle(addr, &present)) {
+        ESP_LOGW(TAG, "passthrough: nozzle %u %s — refused", addr,
+                 present ? "is delivering" : "did not answer its status poll");
+        set_reason(reason, reason_size, present ? "nozzle_busy" : "nozzle_absent");
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(30));
+
+    /* Send, with one retry on silence or a reply that is not this nozzle's. */
+    uint8_t resp[DU_RESP_MAX];
+    int rlen = 0;
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(DU_STATUS_RETRY_MS));
+        rlen = rs485_xfer(cmd, (size_t)cmd_len, resp, DU_RESP_MAX);
+        esp_task_wdt_reset();
+        log_raw_frame(addr, "passthrough", resp, rlen);
+        if (rlen > 0 && bluesky_resp_valid(resp, rlen, addr, "passthrough")) break;
+        rlen = 0;
+    }
+    if (rlen == 0) { set_reason(reason, reason_size, "no_reply"); return false; }
+    du_bytes_to_hex(resp, rlen, resp_buf, resp_size);
+
+    /* A frame longer than the 5-byte read shape carried data — it wrote
+     * something. Read the value back so the operator sees what the pump now
+     * holds, not merely that it acknowledged. Best effort: a failed read-back
+     * leaves readback_buf empty and does not fail the command, which DID go
+     * out and DID get a reply. */
+    if (cmd_len > 5 && readback_cmd && readback_buf && readback_size) {
+        vTaskDelay(pdMS_TO_TICKS(30));
+        uint8_t rb[DU_RESP_MAX];
+        int rb_len = du_read_field(addr, readback_cmd, rb, 2, "read-back");
+        if (rb_len > 0) du_bytes_to_hex(rb, rb_len, readback_buf, readback_size);
+        else ESP_LOGW(TAG, "passthrough: nozzle %u read-back failed — the write's effect is unverified", addr);
+    }
+    return true;
 }

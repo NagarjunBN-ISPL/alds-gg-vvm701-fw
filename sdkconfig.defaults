@@ -23,7 +23,70 @@ CONFIG_ESPTOOLPY_AFTER_RESET=y
 CONFIG_ESP_TASK_WDT_EN=y
 CONFIG_ESP_TASK_WDT_INIT=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
-# CONFIG_ESP_TASK_WDT_PANIC is not set
+# WITHOUT this, a TWDT timeout only prints a warning and a backtrace and then
+# CARRIES ON RUNNING — it does not reset the chip. That is the documented IDF
+# default, and it silently contradicted the block in app_main() which states
+# that "a real hang trips the WDT within 120 s and reboots". It never did: a
+# UART driver deadlock or mutex starvation left the gateway hung at a live
+# station, logging to a console nobody reads, until someone drove out to
+# power-cycle it. The task watchdog was the ONLY layer covering that fault —
+# INT_WDT catches stuck ISRs, the panic handler catches crashes, the recovery
+# ladder catches the network, and none of them can see a task that is simply
+# not progressing.
+#
+# Safe to enable here because the preconditions the app_main() block describes
+# are actually met: all four long-lived tasks subscribe (main, du_task, di_task,
+# relay) and the longest unfed stretch anywhere is modem_hard_reset()'s ~10.2 s
+# against a 120 s timeout.
+#
+# The one thing to watch in a soak: CHECK_IDLE_TASK_CPU0/1 below are both on, so
+# 120 s of idle starvation on either core now reboots too. That is the correct
+# behaviour — 120 s without an idle tick IS a hang — but it is the only path
+# that could turn a slow, non-yielding code path into a field reboot loop.
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# ── The other two watchdog layers, pinned explicitly ──────────────────────
+# These are all IDF defaults and the compiled sdkconfig already carries them,
+# so this changes NOTHING about the current build. They are written down here
+# because sdkconfig.defaults is the only file under version control that can
+# hold them: sdkconfig is generated, gitignored, and regenerating it (a clean
+# checkout, an IDF upgrade, `fullclean`) silently re-derives every value that
+# is not pinned. Losing a watchdog layer that way would be invisible.
+#
+# Three layers, each catching what the others cannot:
+#   INT_WDT   300 ms  interrupts disabled or an ISR stuck — the only one fast
+#                     enough to catch a spinlock deadlock.
+#   TASK_WDT  120 ms* a task looping without feeding (set at runtime, above).
+#   RTC_WDT   9 s     the bootloader's own watchdog, covering the window
+#                     before app_main() can arm anything. Disabled once the
+#                     app starts, which is correct: nothing in the app feeds
+#                     it, so leaving it running (BOOTLOADER_WDT_DISABLE_IN_
+#                     USER_CODE) would reset a perfectly healthy device every
+#                     9 seconds.
+CONFIG_ESP_INT_WDT=y
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=300
+CONFIG_ESP_INT_WDT_CHECK_CPU1=y
+CONFIG_BOOTLOADER_WDT_ENABLE=y
+CONFIG_BOOTLOADER_WDT_TIME_MS=9000
+# CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE is not set
+
+# ── Fault detection, pinned for the same reason as the watchdogs above ─────
+# All three are IDF defaults already present in the compiled sdkconfig; pinned
+# here so a regenerated sdkconfig cannot silently drop them on a clean build.
+#
+# Stack-overflow check: CANARY (method 2) — writes a known pattern at each
+# task's stack limit and panics with the offending task's name if it is
+# clobbered. The firmware reports stack high-water marks in diagnostics for
+# trend visibility, but the canary is what catches an actual overflow at the
+# moment it happens rather than after the corruption has spread.
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+# Brownout detector at level 7 (~2.44 V on the S3): resets the chip cleanly on
+# a supply sag instead of letting it execute unpredictably at low voltage —
+# relevant for a device that shares a fuel-station supply and rides out power
+# events. Pair with the RTC_NOINIT relay safety marker, which survives this
+# reset so the box re-locks on the way back up.
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
 
 # Power management must stay on: sysmon_init() calls esp_pm_configure() to
 # pin the CPU at a fixed 160 MHz (no DFS — see sysmon.c). Without
@@ -35,6 +98,12 @@ CONFIG_PM_ENABLE=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+# Kept at 0xC000 — NOT the default 0x8000 — for gateway interswappability.
+# All VVM701 products (alds-sr, cng-cpil, alds-ggy) share one partition layout
+# so the same physical board can be reflashed between fleets without a full
+# erase. The non-secure-boot bootloader is ~20 KB and fits easily within
+# 0xC000 (48 KB). Must stay in sync with partitions.csv.
+CONFIG_PARTITION_TABLE_OFFSET=0xC000
 
 # OTA rollback: a freshly-FOTA'd image boots as PENDING_VERIFY and is only
 # confirmed once check_post_ota() calls esp_ota_mark_app_valid_cancel_rollback()
@@ -58,5 +127,44 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 # Stack overflow detection (canary)
 CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 
-# Heap integrity checking (light — production safe)
-CONFIG_HEAP_CORRUPTION_DETECTION_LIGHT=y
+# Heap integrity checking (light — production safe).
+#
+# The symbol here used to be CONFIG_HEAP_CORRUPTION_DETECTION_LIGHT, which does
+# not exist in ESP-IDF. Kconfig silently ignores an unknown symbol, so heap
+# checking was never actually enabled on any build — sdkconfig carried
+# CONFIG_HEAP_POISONING_DISABLED=y throughout. Only visible as a "unknown
+# kconfig symbol" warning on a from-scratch configure, which an incremental
+# build never prints. Found on the 5.5.5 upgrade, 2026-09-02.
+#
+# NOTE: sdkconfig.defaults applies only when sdkconfig is first GENERATED, so
+# correcting it here is not enough on its own — sdkconfig itself was edited to
+# match. Same trap as the WDT timeout documented in app_main().
+CONFIG_HEAP_POISONING_LIGHT=y
+
+# ── UART ISR in IRAM ──────────────────────────────────────────────────────
+# REQUIRED. A flash write disables the instruction cache on BOTH cores, and
+# an ISR that lives in flash cannot run until it is re-enabled. du_task (core
+# 1) spills its RAM queue to littlefs every round while MQTT is down — which
+# is exactly the state during a FOTA — so without this the modem UART's ISR
+# is blocked for the length of each littlefs erase/program, the 128-byte RX
+# FIFO overflows mid-chunk, and the download fails "read_short" at a
+# different offset every time (cng-cpil hit this at ~29 s into every flash
+# loop until the symbol was set). Costs a few KB of IRAM. Do not turn off.
+CONFIG_UART_ISR_IN_IRAM=y
+
+# ── Secure Boot V2: DELIBERATELY OFF ──────────────────────────────────────
+# This project ships without secure boot. Gateways must be interswappable
+# across fleets (alds-sr, cng-cpil, alds-ggy) with only an app-slot reflash,
+# so the partition layout is byte-identical — but secure boot is not enabled.
+#
+# DO NOT TURN THIS ON without understanding the consequences. Enabling it
+# burns the signing key digest into eFuse on FIRST POWER-ON. That is
+# IRREVERSIBLE: from that boot onward the bootloader can never be replaced on
+# that chip and only images signed with the same key will ever run.
+#
+# The 0xC000 partition table offset above is NOT reverted to the 0x8000 default.
+# It is kept for parity with alds-sr-vvm701-fw, whose partitions.csv is
+# byte-identical. Moving the table would break that parity — the one change
+# that cannot be made after units ship.
+CONFIG_SECURE_BOOT=n
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=n

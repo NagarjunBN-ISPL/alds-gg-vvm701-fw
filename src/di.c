@@ -1,6 +1,8 @@
 #include "di.h"
+#include "forensics.h"
 #include "config.h"
 #include "mqtt.h"
+#include "ms51_bus.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -29,17 +31,11 @@ static volatile uint8_t s_di_enable = 0;
 void di_set_enable(uint8_t mask) { s_di_enable = mask; }
 
 void di_uart_init(void) {
-    uart_config_t cfg = {
-        .baud_rate = NUVOTON_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-    };
-    uart_driver_install(NUVOTON_UART, NUVOTON_BUF, NUVOTON_BUF, 0, NULL, 0);
-    uart_param_config(NUVOTON_UART, &cfg);
-    uart_set_pin(NUVOTON_UART, NUVOTON_TX_PIN, NUVOTON_RX_PIN,
-                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    /* UART0 setup moved into ms51_bus_init(): relay.c drives the panel-box
+     * lock over this same port, so ownership is shared now. The pin, baud and
+     * buffer configuration is unchanged — only the caller moved. di_mutex
+     * below is a different lock: it guards the DI FIFO, not the UART. */
+    ms51_bus_init();
 
     di_mutex = xSemaphoreCreateMutex();
 }
@@ -89,7 +85,23 @@ void di_task(void *param) {
         /* Refresh enable mask in case config was updated */
         di_enable_mask = s_di_enable;
 
-        /* Send request */
+        /* Take the MS51 bus for the whole write-then-read exchange: relay.c
+         * sends RL1ON/RL1OFF on this same UART, and an interleaved poll would
+         * consume its reply (or hand us the relay's). A failed take means the
+         * relay is mid-transaction — skip this poll rather than corrupt it;
+         * DI re-polls in ~2 s and a lock command is far more urgent. */
+        if (!ms51_bus_lock(MS51_BUS_LOCK_TIMEOUT_MS)) {
+            ESP_LOGW(TAG, "MS51 bus busy — skipping this DI poll");
+            vTaskDelay(pdMS_TO_TICKS(2000));   /* same cadence as the loop tail */
+            continue;
+        }
+
+        /* Send request. Flush any stale bytes from a previous truncated reply
+         * first, so a leftover tail cannot poison this read's parser and
+         * permanently misalign the JSON (every other bus driver flushes before
+         * writing; di_task was the sole omission). Safe under the MS51 lock
+         * held above — no relay reply can be in flight. */
+        uart_flush_input(NUVOTON_UART);
         uart_write_bytes(NUVOTON_UART, req, strlen(req));
         vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -109,6 +121,16 @@ void di_task(void *param) {
          * message. */
         int got = 0;
         int64_t dl_first = esp_timer_get_time() + (int64_t)NUVOTON_TIMEOUT_MS * 1000;
+        /* Absolute ceiling on the whole read phase. The per-byte idle-gap cutoff
+         * below ends a normal frame ~100 ms after its last byte, but a MS51 that
+         * FAULTS into dribbling a byte just under that gap would defeat it and
+         * hold the shared MS51 bus for up to NUVOTON_BUF×100 ms (~25 s) — WDT-safe
+         * (fed below) yet long enough to starve a pending relay LOCK command,
+         * whose bus wait is only MS51_BUS_LOCK_TIMEOUT_MS. This bounds that fault
+         * to ~1.5 s past the first-byte wait. Generous: a real ~105-byte reply
+         * completes within ~110 ms of its first byte, so a healthy frame is never
+         * truncated. */
+        int64_t dl_abs   = dl_first + 1500000LL;
         int64_t dl_gap    = 0;
         for (;;) {
             /* Feed the WDT inside the byte loop, not just after it. Worst case a
@@ -117,7 +139,8 @@ void di_task(void *param) {
              * if NUVOTON_BUF ever grows, matching the modem/RS485 read loops. */
             if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
             int64_t dl = (got == 0) ? dl_first : dl_gap;
-            if (esp_timer_get_time() >= dl || got >= NUVOTON_BUF - 1) break;
+            if (esp_timer_get_time() >= dl || esp_timer_get_time() >= dl_abs ||
+                got >= NUVOTON_BUF - 1) break;
             uint8_t ch;
             if (uart_read_bytes(NUVOTON_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
                 resp[got++] = ch;
@@ -125,6 +148,10 @@ void di_task(void *param) {
             }
         }
         resp[got] = '\0';
+
+        /* Bus released as soon as the exchange completes — everything below is
+         * parsing and FIFO work that must not hold the relay off the port. */
+        ms51_bus_unlock();
 
         /* Raw Nuvoton response for field debugging — shows exactly what the
          * MS51 sent every read (every 2s), before parsing. Debug-level: this
@@ -159,7 +186,7 @@ void di_task(void *param) {
 
         /* Digital inputs are event-driven: only enqueue when the reading
          * actually changes from the last one queued. This captures every
-         * transition (e.g. a pulse between 20s publish cycles) without
+         * transition (e.g. a pulse between 12 s publish cycles) without
          * flooding the cloud with dozens of identical steady-state messages
          * — which was also starving the modem UART of time to receive
          * inbound commands like setconfig. */
@@ -190,6 +217,9 @@ void di_task(void *param) {
             }
         }
 
+        /* Marks every 2 s so a stall in this task is attributable. Without
+         * it the slot would stay empty and di_task could never be named. */
+        forensics_mark(FSLOT_DI, F_POLL_DI, 0);
         esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(2000)); /* poll every 2 s */
     }

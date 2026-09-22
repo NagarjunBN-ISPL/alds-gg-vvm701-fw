@@ -1,0 +1,106 @@
+# CI - runs on GitHub's machines on every push and pull request.
+# This is the gate the Windows pre-push hook cannot be: it builds for the real
+# chip and runs the host tests on Linux, from a clean clone, with nothing left
+# over from a previous build.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch cancels the older run - saves CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1. Does the firmware still build for the real chip, from a clean clone?
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build esp32s3
+        shell: bash
+        run: |
+          # The container runs as root but checkout files are owned by
+          # another user, so git refuses to touch the repo without this.
+          git config --global --add safe.directory '*'
+          . $IDF_PATH/export.sh
+          idf.py build
+
+      - name: Report binary size
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py size
+
+      # Keeps the built firmware for 30 days so you can download and flash
+      # the exact binary a given commit produced. NOT the thing handed out for
+      # a release - CI artifacts expire, release assets do not (see release.yml).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: build/*.bin
+
+  # 2. Do the host tests still pass? This is the important one.
+  #    gg's suite is plain gcc + python3 (test/host/runall.sh), NOT an
+  #    ESP-IDF linux-target project - it compiles the REAL firmware sources
+  #    against stub headers and runs them, fault-injection suites under
+  #    ASan+UBSan. runall.sh exits non-zero if any suite fails.
+  host-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # gcc + python3 are preinstalled on the runner; libbsd-dev is cheap
+      # insurance in case a source ever pulls in strlcpy on the host.
+      - name: Install host deps
+        run: sudo apt-get update && sudo apt-get install -y libbsd-dev
+
+      - name: Build and run host tests
+        shell: bash
+        run: bash test/host/runall.sh
+
+  # 3. Static analysis - finds bugs the compiler does not.
+  #    Gate on warning/performance/portability - the categories that catch real
+  #    defects. `style` is DELIBERATELY NOT gated: this firmware is an alds-sr
+  #    fork carrying legacy style debt, cppcheck's `style` set grows with every
+  #    release (so a passing pin silently goes red on a runner upgrade), and the
+  #    findings here are cosmetic or false positives that must NOT be "fixed" -
+  #    e.g. the static last_*_us poll timers in main.c are flagged
+  #    "scope can be reduced" but are static ON PURPOSE, and struct members used
+  #    cross-file (forensics boot_count, genset name) read as "unused". Const
+  #    nags are handled in code where safe. A real bug lands in one of the gated
+  #    categories, not in `style`.
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: sudo apt-get update && sudo apt-get install -y cppcheck
+
+      - name: cppcheck
+        run: |
+          cppcheck --std=c11 --enable=warning,performance,portability \
+                   --inline-suppr --error-exitcode=1 \
+                   --suppress=missingInclude \
+                   --suppress=missingIncludeSystem \
+                   --suppress=unusedFunction \
+                   --suppress=constParameterCallback \
+                   src
+
+  # 4. Did a password, key or token get committed by accident?
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # scan the whole history, not just the last commit
+
+      - name: gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks detect --source . --redact --no-banner

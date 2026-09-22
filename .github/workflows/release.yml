@@ -1,0 +1,170 @@
+# Release - fires on a v* tag and publishes the exact binaries that tag built.
+#
+# ── WHY THIS EXISTS, AND WHY CI IS NOT ENOUGH ──────────────────────────────
+# ci.yml already builds every push and uploads build/*.bin - but those
+# artifacts EXPIRE. A gateway sealed in a panel box at a station reports
+# fw:"1.0.0" for as long as it runs, which may be years, and the question that
+# eventually gets asked is "what source is that unit running, and is the image
+# in S3 the same one the engineer flashed?".
+#
+# Rebuilding the tag and comparing hashes does not fully answer it: the release
+# binaries are built on Linux in this container while the bench builds on
+# Windows, and the toolchain/path variance means the bytes are not guaranteed
+# bit-identical across machines. So the ARTIFACT has to be kept, not just the
+# source that produced it. GitHub release assets do not expire; CI artifacts do.
+#
+# ── WHAT IT PUBLISHES ─────────────────────────────────────────────────────
+#   the four serial-flash images, at the offsets any board needs
+#   SHA256SUMS covering all of them
+#
+# NO MERGED IMAGE, DELIBERATELY. merge_bin pads the gaps between images with
+# 0xFF, and the nvs partition at 0xd000 falls inside that span - so a merged
+# file erases the station plan and broker credentials whatever the "erase
+# flash" checkbox says. Harmless on a fresh board, a site revisit on a
+# commissioned one. The four files are safe on a board in ANY state, so they
+# are the only thing shipped. See RELEASE.md.
+#
+# The app image published here is the same one FOTA downloads, so the bytes an
+# engineer flashes over USB and the bytes a unit pulls over the air are the
+# same file - the thing nobody can check by eye later.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create the release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.5
+    steps:
+      - uses: actions/checkout@v4
+
+      # The container runs as root but checkout files are owned by another
+      # user, so git refuses to touch the repo without this. Same as ci.yml.
+      - name: Trust the checkout
+        run: git config --global --add safe.directory '*'
+
+      # ── THE CHECK THAT MATTERS MOST HERE ──────────────────────────────
+      # The tag and FW_VERSION are two independent strings and nothing keeps
+      # them in step. Tagging v1.1.0 while config.h still says 1.0.0 would
+      # publish a release called 1.1.0 whose gateways all report fw:"1.0.0" -
+      # and the fleet view would then be wrong in a way no device could
+      # contradict. FW_VERSION (src/config.h) is the string every device puts
+      # in its status/diagnostics payloads, so it is the one the tag must match.
+      - name: Tag must match FW_VERSION
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(grep -oP '#define\s+FW_VERSION\s+"\K[^"]+' src/config.h | head -1)
+          echo "tag=$tag  FW_VERSION=$ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag does not match FW_VERSION $ver in src/config.h"
+            exit 1
+          fi
+
+      # A release must not be cut from a tree that fails its own tests. This is
+      # the same suite ci.yml runs; repeated here because a tag can be pushed to
+      # any commit, including one CI never saw. runall.sh is plain gcc+python3.
+      - name: Host tests
+        shell: bash
+        run: |
+          apt-get update && apt-get install -y build-essential python3 libbsd-dev
+          bash test/host/runall.sh
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py build
+          idf.py size
+
+      # Offsets come from build/flash_args, which the build itself generates -
+      # never retyped here, because a wrong partition-table offset is not a
+      # build error, it is a board that does not boot.
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          echo "--- flash_args as built ---"
+          cat build/flash_args
+          cp build/bootloader/bootloader.bin           dist/
+          cp build/partition_table/partition-table.bin dist/
+          cp build/ota_data_initial.bin                dist/
+          cp build/alds-gg-vvm701-fw.bin              "dist/alds-gg-vvm701-fw-${ver}.bin"
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Flashing a gateway
+
+            Serial flash, ESP32-S3, **DIO / 80 MHz / 16 MB** (or leave the
+            flasher on "keep" - the build already stamped these into the
+            bootloader header):
+
+            | Offset | File |
+            |---|---|
+            | `0x0` | `bootloader.bin` |
+            | `0xc000` | `partition-table.bin` |
+            | `0x12000` | `ota_data_initial.bin` |
+            | `0x20000` | `alds-gg-vvm701-fw-<version>.bin` |
+
+            **The partition table is at `0xc000`, not the ESP-IDF default
+            `0x8000`.** At `0x8000` the bootloader finds nothing and the unit
+            does not boot, with no error at flash time. Take the offsets from
+            this table, never from memory.
+
+            **Do not tick "erase all flash."** These four offsets are all that
+            needs writing. Erasing destroys the commissioned station plan and
+            credentials in NVS, and the offline queue at `0xe20000`.
+
+            There is deliberately no merged image - see RELEASE.md.
+
+            ## After flashing
+
+            A freshly flashed board comes up `unconfigured` and **polls
+            nothing**. It does connect to the compiled broker and announce
+            itself (`status:"ready"`), which is how you find it.
+
+            Flash, confirm the unit appears on the broker, report the IMEI.
+            The office then pushes a `setconfig` to `<base>/<imei>/setconfig`
+            with that station's dispenser/radar list. Flashing and provisioning
+            are one operation - a board left half done looks healthy and
+            produces no readings.
+
+            ## FOTA
+
+            `alds-gg-vvm701-fw-<version>.bin` is the app image and the only
+            file FOTA takes (an OTA writes an app slot; it cannot write a
+            bootloader or partition table). Put the version in the S3 path so a
+            later release cannot overwrite it at the same key, publish the
+            trigger **non-retained**, and use a plain public object URL -
+            `FOTA_URL_MAX` is 511 characters and a presigned URL is usually
+            longer. Re-pushing a URL already applied is skipped; a new version =
+            a new filename = a new URL that always flashes.
+
+            Verify any copy against `SHA256SUMS`.

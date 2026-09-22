@@ -7,14 +7,20 @@
 static const char *TAG = "tls_ca";
 
 /* ── Trusted root CA bundle ───────────────────────────────────────────────
- * TWO roots, concatenated into one PEM file. Both are needed — the two TLS
+ * THREE roots, concatenated into one PEM file. All are needed — the TLS
  * endpoints this firmware talks to are issued by different CAs, verified by
- * directly inspecting each one's live TLS handshake on 2026-07-17:
+ * directly inspecting each one's live TLS handshake:
  *
- *   MQTT broker (dev-fuelsense.iotronsys.com:8777, SSL ctx 2)
+ *   PROD MQTT broker (mqtt.iotronsys.com:8777, SSL ctx 2) — checked 2026-09-12
+ *     leaf -> Let's Encrypt YE1 -> ISRG Root YE -> ISRG Root X2 (ECDSA-only)
+ *   DEV  MQTT broker (dev-fuelsense.iotronsys.com:8777, SSL ctx 2) — 2026-07-17
  *     leaf -> Let's Encrypt E8 -> ISRG Root X1
  *   FOTA host  (devfota-fuelsense.s3.ap-south-1.amazonaws.com, SSL ctx 1)
  *     leaf -> Amazon RSA 2048 M01 -> Amazon Root CA 1
+ *
+ * X1 stays even though the prod broker is on X2: the dev broker still uses it,
+ * S3's chain leans on the RSA hierarchy, and the prod broker's X2 is
+ * cross-signed by X1 so either anchor resolves it.
  *
  * Shipping only the ISRG root (the first cut of this file) is what broke
  * FOTA with "HTTPS GET failed (err=732 http=-1)" — the S3 certificate was
@@ -65,6 +71,33 @@ static const char *k_ca_bundle =
 "4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA\n"
 "mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d\n"
 "emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=\n"
+"-----END CERTIFICATE-----\n"
+/* ISRG Root X2 — Let's Encrypt's ECDSA hierarchy, which is what the PRODUCTION
+ * broker mqtt.iotronsys.com:8777 actually chains to (checked live 2026-09-12):
+ *     leaf -> Let's Encrypt YE1 -> ISRG Root YE -> ISRG Root X2
+ * The X2 the server sends is CROSS-SIGNED BY X1, so a store holding only X1 can
+ * still reach a trust anchor — openssl does, confirmed against this host — but
+ * that is a four-hop walk ending in a cross-signature, and the EC200U's TLS
+ * stack is not openssl. With X2 present the modem terminates at the second cert
+ * the server sends and the cross-signature never has to be resolved. Purely
+ * additive: X1 stays for the dev broker's RSA hierarchy and for S3's roots.
+ * Fetched from https://letsencrypt.org/certs/isrg-root-x2.pem (self-signed,
+ * valid until 2040-09-17); SHA-256 69:72:9B:8E:...:CB:14:70 (same block the
+ * field-proven cng-cpil-vvm701-fw ships). The broker offers NO RSA cert — an
+ * RSA-only client is refused — so this root is not optional for production. */
+"-----BEGIN CERTIFICATE-----\n"
+"MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw\n"
+"CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg\n"
+"R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00\n"
+"MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT\n"
+"ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw\n"
+"EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW\n"
+"+1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9\n"
+"ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T\n"
+"AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI\n"
+"zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW\n"
+"tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1\n"
+"/q4AaOeMSQ+2b1tbFfLn\n"
 "-----END CERTIFICATE-----\n"
 /* Amazon Root CA 1 — trust anchor for AWS S3 (the FOTA host).
  * Fetched 2026-07-17 from https://www.amazontrust.com/repository/AmazonRootCA1.pem

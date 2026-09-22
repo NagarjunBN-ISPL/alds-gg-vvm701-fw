@@ -1,6 +1,28 @@
 # Name,   Type, SubType, Offset,   Size,    Flags
-nvs,      data, nvs,     0x9000,   0x5000,
-otadata,  data, ota,     0xe000,   0x2000,
-app0,     app,  ota_0,   0x10000,  0x700000,
-app1,     app,  ota_1,   0x710000, 0x700000,
-spiffs,   data, spiffs,  0xe10000, 0x1F0000,
+#
+# Flash layout for the VVM701 gateway — IDENTICAL to alds-sr-vvm701-fw and
+# cng-cpil-vvm701-fw DELIBERATELY. The same physical VVM701 board moves
+# between fleets and is reflashed with a different product's firmware in the
+# field. When all products share ONE flash map, a swap only has to rewrite
+# the app slot (and otadata) — nvs and the littlefs storage partition sit at
+# the same offset and size whichever firmware is loaded, so a partial/app-only
+# reflash can never land an image whose idea of where NVS or the queue lives
+# disagrees with the table already on the chip. Diverging tables would make
+# every swap a full erase-and-reflash and turn any app-only flash into a brick.
+#
+# THIS TABLE IS NOT OTA-UPDATABLE. Changing it means reflashing every unit
+# over serial. It is effectively permanent once the first unit ships.
+#
+# CONFIG_PARTITION_TABLE_OFFSET in sdkconfig.defaults MUST match 0xC000:
+# a mismatch is not a build error — it is a device that does not boot.
+#
+# Bootloader has 0xC000 (48 KB) of space. The non-secure-boot bootloader is
+# ~20 KB so this is ample headroom.
+#
+# App slots are 64 KB aligned. Both keep their full 7 MB.
+# nvs keeps 0x5000 (20 KB) — NVS needs at least 3 sectors to garbage-collect.
+nvs,      data, nvs,      0xd000,   0x5000,
+otadata,  data, ota,      0x12000,  0x2000,
+app0,     app,  ota_0,    0x20000,  0x700000,
+app1,     app,  ota_1,    0x720000, 0x700000,
+storage,  data, littlefs, 0xe20000, 0x1e0000,
