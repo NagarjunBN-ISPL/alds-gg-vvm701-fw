@@ -273,6 +273,59 @@
  * GPS traffic low. */
 #define GPS_POLL_INTERVAL_S  300
 
+/* The GNSS driver (gps.c/gps.h) is the one bwsr-neo-vvm701-fw uses, byte for
+ * byte, so every product runs the same GPS logic; only the cadence above and
+ * the default of gpsEnable are the product's own. The settings below are that
+ * driver's, with bwsr's values.
+ *
+ * ── AGPS (assisted GNSS) ──────────────────────────────────────────────────
+ * The slow part of a cold start is not finding satellites but copying each
+ * one's orbit data (ephemeris) out of its 50 bit/s broadcast: 30 s of clean
+ * signal per satellite, restarted by any dropout — ~35 s in the open, ~10 min
+ * measured under the office roof on 2026-09-17. apflash only spares a restart
+ * within ~2 h of the last fix; a gateway that was powered down for longer (a
+ * station power cut, a bowser parked overnight) cold-starts. With AGPS the
+ * modem fetches the current ephemeris from Quectel's assistance server over
+ * the cellular link when the engine starts, and again once the copy is ~2 h
+ * old (it checks by itself), so the sky search has nothing left to wait for:
+ * typically a fix in 5-15 s even with partial sky. If the download fails (no
+ * network yet, server unreachable, second context refused) the engine
+ * cold-starts exactly as before — nothing gets worse.
+ *
+ * The AGPS engine activates a PDP context of its own to fetch the data, and
+ * the app note warns it may DEACTIVATE that context afterwards — so it must
+ * never share context 1 with MQTT. It gets GPS_AGPS_PDP_CTX with the same APN
+ * and credentials as the data context (gps.c writes both). Server, vendor and
+ * model IDs and the password are the modem's own documented defaults (EC200U
+ * Series GNSS Application Note V1.1, 2.3.8 and 3.4) — Quectel's account with
+ * the assistance provider, not a secret. GPS_AGPS_ENABLE 0 switches AGPS off
+ * on the modem as well (the switch is saved in its NVRAM). None of this runs
+ * unless gpsEnable is on; with it off, gps_init() switches the modem's GNSS,
+ * autogps and AGPS off instead, so a disabled unit fetches nothing. */
+#define GPS_AGPS_ENABLE      1
+#define GPS_AGPS_PDP_CTX     2
+#define GPS_AGPS_URL         "http://quectel-api1.rx-networks.cn/rxn-api/locationApi/rtcm"
+#define GPS_AGPS_VENDOR_ID   "wLgWwv6JQt"
+#define GPS_AGPS_MODEL_ID    "Quectel"
+#define GPS_AGPS_PASSWORD    "aFltUERDZzZxeTY5cEp2eA=="
+
+/* One-shot antenna check: at the first fix, or GPS_ANT_CHECK_NOFIX_S after
+ * boot without one, read the satellites in view (GSV) and log how many are
+ * tracked at a usable signal level and the best C/N0. A roof antenna under a
+ * clear sky shows 35-45 dB-Hz on several satellites; under 30 on all of them
+ * means the antenna, its cable or its placement — not the engine. Console
+ * only: it is an installation check, read off the boot log. */
+#define GPS_ANT_CHECK_NOFIX_S    180
+#define GPS_ANT_CHECK_STRONG_DB  30
+
+/* BENCH ONLY. 1 = wipe the engine's assistance data at every boot
+ * (AT+QGPSDEL=0, then restart the engine) so the next fix is a true cold
+ * start — the only way to measure cold TTFF with and without AGPS without
+ * waiting hours for apflash and the AGPS file to expire. Logged at ERROR on
+ * every boot while on. Must be 0 in any build that leaves the bench; the
+ * release workflow refuses a tag while it is 1. */
+#define GPS_TEST_COLD_START  0
+
 /* ── Un-provisioned heartbeat ──────────────────────────────────────────────
  * A gateway with NO equipment configured (fresh from flash, or just
  * factory-reset) re-announces status "unconfigured" on this interval so the
@@ -507,27 +560,27 @@
 #define GENSET_READ_RETRIES  3    /* attempts per DG poll before reporting 404 (total, not extra) */
 
 /* Genset model — selects the Modbus read set (see g_models[] in genset.c). Per
- * the DG integration spec each poll issues up to TWO reads, and each is
- * published as its OWN message: a measurement block under "registers" and a DG
- * status block under "status". Both carry the read's DATA bytes as a
+ * the DG integration spec each poll issues up to THREE reads, and each is
+ * published as its OWN message: a measurement block under "registers", the
+ * alarm registers under "Alarms" (Mahindra only; the spec's capital A) and a
+ * DG status block under "status". Each carries the read's DATA bytes as a
  * comma-separated hex string (Modbus header and CRC stripped) — the same shape
  * radar uses. The firmware never interprets a genset register; the cloud owns
  * every register map and all scaling. Reads per model (all CRC-verified against
  * the spec's documented captures):
- *   GC1211        → Mahindra, FC04: registers 1..36 (72 B), status 67..68 (4 B)
- *   GC1111        → Mahindra, FC03: registers 1..36 (72 B), status 67..68 (4 B)
- *                   Identical to GC1211 apart from the function code — the spec
- *                   documents FC03 for this model explicitly.
- *   SGC120        → FC03: one overall read, registers 1..78 (156 B). No status
- *                   command; the single block already covers it.
- *   GC1201/02/03  → Ashok Leyland ("Bottling Plant DG"), FC04: registers 1..36
- *                   (72 B), status 67 (2 B — one register, unlike the Mahindras)
+ *   GC1211        → Mahindra, FC04: registers 1..36 (72 B), Alarms 57..59
+ *                   (6 B), status 67..68 (4 B)
+ *   GC1111        → Mahindra, FC03: same three reads as GC1211 — the two differ
+ *                   only in the function code, which the spec documents.
+ *   SGC120        → FC03: one overall read, registers 1..78 (156 B). No Alarms
+ *                   or status command; the single block holds both (alarms
+ *                   65..76, status word 78).
+ *   GC1201/02/03  → Ashok Leyland ("Bottling Plant DG", titled "DG 1202/03/04"
+ *                   in the spec), FC04: registers 1..36 (72 B), status 67
+ *                   (2 B — one register, unlike the Mahindras). No alarms.
  *   GC902         → NOT covered by the spec; mapped to the Ashok Leyland read
  *                   set, which the vendor register map lists as one shared
  *                   family map. Verify on real GC902 hardware before relying.
- * The separate alarm command the spec lists for GC1211/GC1111 is deliberately
- * NOT issued — alarm state is carried inside the blocks above, and skipping it
- * keeps the genset off the shared RS485 bus for one fewer transaction.
  * Adding a model: add one g_models[] row. Bump GENSET_MODEL_MAX. */
 #define GENSET_MODEL_GC1211  0
 #define GENSET_MODEL_GC1111  1
@@ -671,7 +724,8 @@
  * case", which is simply not true — measured against the real retry budgets,
  * one nozzle can hold the bus for far longer than a genset poll:
  *
- *   genset  1 attempt = 2 reads x MB_TIMEOUT_MS(500)     ~1.1 s
+ *   genset  1 attempt = 3 reads x MB_TIMEOUT_MS(500)     ~1.6 s  (Mahindra;
+ *                       the two-read models ~1.1 s)
  *   radar   1 tank    = 3 retries x (200 turnaround+500)  ~2.4 s
  *   Yenen   1 nozzle  = 3 reads x RS485_RECV_TIMEOUT_MS   ~6.6 s  (silent pump;
  *                       was ~13.2 s until Command 1 was dropped — yenen.h)

@@ -24,7 +24,13 @@ void modem_uart_init(void) {
         .stop_bits  = UART_STOP_BITS_1,
         .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
     };
-    uart_driver_install(MODEM_UART, MODEM_BUF, MODEM_BUF, 0, NULL, 0);
+    /* ESP_INTR_FLAG_IRAM matches CONFIG_UART_ISR_IN_IRAM=y (sdkconfig.defaults);
+     * with 0 here IDF set the flag itself and logged that on every boot. Called
+     * once at boot, so any error is real — log it like the other two UARTs. */
+    esp_err_t err = uart_driver_install(MODEM_UART, MODEM_BUF, MODEM_BUF, 0, NULL,
+                                        ESP_INTR_FLAG_IRAM);
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(err));
     uart_param_config(MODEM_UART, &cfg);
     uart_set_pin(MODEM_UART, MODEM_TX_PIN, MODEM_RX_PIN,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);

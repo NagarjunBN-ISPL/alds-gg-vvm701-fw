@@ -12,14 +12,15 @@
 static const char *TAG = "genset";
 
 /* ══════════════════════════════════════════════════════════════════════════
- * Genset polling, per the DG integration spec. Each model defines up to two
- * Modbus reads — a measurement block ("registers") and a DG status block
- * ("status") — and each read's DATA bytes are shipped to the cloud verbatim as
- * a comma-separated hex string in its OWN MQTT message. The firmware never
- * interprets a genset register; the cloud owns every register map and scaling.
+ * Genset polling, per the DG integration spec. Each model defines up to three
+ * Modbus reads — a measurement block ("registers"), the alarm registers
+ * ("Alarms", Mahindra only) and a DG status block ("status") — and each read's
+ * DATA bytes are shipped to the cloud verbatim as a comma-separated hex string
+ * in its OWN MQTT message. The firmware never interprets a genset register;
+ * the cloud owns every register map and scaling.
  *
  * Pieces: Modbus RTU transport (crc16 / modbus_request), a data-driven model
- * table (g_models), the read helper (read_block), and the two serialisers.
+ * table (g_models), the read helper (read_block), and the three serialisers.
  * Adding a model = add one g_models[] row. Nothing else changes.
  * ══════════════════════════════════════════════════════════════════════════ */
 
@@ -144,21 +145,34 @@ static bool read_block(uint8_t slave, uint8_t fc, uint16_t start, uint16_t count
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Model table — the Modbus reads each controller answers, from the DG
- * integration spec (all frames CRC-verified against the documented captures):
+ * integration spec (every frame CRC-verified against the documented captures,
+ * re-checked 2026-09-23 against the spec's command/response table):
  *
- *   GC1211        FC04  registers 1..36 (72 B)   status 67..68 (4 B)
- *   GC1111        FC03  registers 1..36 (72 B)   status 67..68 (4 B)
- *   SGC120        FC03  registers 1..78 (156 B)  — single overall read
- *   GC1201/02/03  FC04  registers 1..36 (72 B)   status 67    (2 B)
- *   GC902         FC04  registers 1..36 (72 B)   status 67    (2 B)
+ *   GC1211        FC04  registers 1..36 (72 B)   Alarms 57..59 (6 B)   status 67..68 (4 B)
+ *   GC1111        FC03  registers 1..36 (72 B)   Alarms 57..59 (6 B)   status 67..68 (4 B)
+ *   SGC120        FC03  registers 1..78 (156 B)  — single overall read; its alarm
+ *                                                  (65..76) and status (78) registers
+ *                                                  are inside it
+ *   GC1201/02/03  FC04  registers 1..36 (72 B)   —                     status 67    (2 B)
+ *   GC902         FC04  registers 1..36 (72 B)   —                     status 67    (2 B)
+ *
+ * Spec frames, slave 10 (the CRC here is what modbus_request computes):
+ *   GC1211  0A 04 00 01 00 24 A0 AA   0A 04 00 39 00 03 61 7D   0A 04 00 43 00 02 81 64
+ *   GC1111  0A 03 00 01 00 24 15 6A   0A 03 00 39 00 03 D4 BD   0A 03 00 43 00 02 34 A4
+ *   Ashok   0A 04 00 01 00 24 A0 AA                             0A 04 00 43 00 01 C1 65
+ *   SGC120  0A 03 00 01 00 4E 95 45
  *
  * NOTE on function codes: GC1211 uses FC04 and GC1111 uses FC03 — the two
  * differ ONLY in the function code, and the spec documents both explicitly.
+ * NOTE on the Ashok Leyland rows: the spec titles them "DG 1202/03/04
+ * (Bottling Plant DG)"; all three ids share one read set, so the label is all
+ * that differs.
  * NOTE on GC902: the spec does not cover it; it is mapped to the Ashok Leyland
  * GC12xx read set, which the vendor register map lists as one shared family
- * map. Verify against real GC902 hardware before relying on it.
+ * map. The 2026-08-11 driver (5f7b940) instead gave it its own map (status at
+ * 68, alarms from 58). Verify against real GC902 hardware before relying on it.
  *
- * st_count == 0 means the model has no status command.
+ * al_count / st_count == 0 means the model has no such command.
  * ══════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     uint8_t     model_id;
@@ -166,51 +180,73 @@ typedef struct {
     uint8_t     fc;          /* Modbus function code (0x03 / 0x04) */
     uint16_t    reg_start;   /* command 1: measurement block       */
     uint16_t    reg_count;
-    uint16_t    st_start;    /* command 2: DG status (0 count = none) */
+    uint16_t    al_start;    /* command 2: alarms   (0 count = none) */
+    uint16_t    al_count;
+    uint16_t    st_start;    /* command 3: DG status (0 count = none) */
     uint16_t    st_count;
 } GensetModel_t;
 
 static const GensetModel_t g_models[] = {
-    { GENSET_MODEL_GC1211, "Mahindra GC1211",       0x04, 1, 36, 67, 2 },
-    { GENSET_MODEL_GC1111, "Mahindra GC1111",       0x03, 1, 36, 67, 2 },
-    { GENSET_MODEL_SGC120, "SGC 120 Mk II",         0x03, 1, 78,  0, 0 },
-    { GENSET_MODEL_GC1201, "Ashok Leyland GC1201",  0x04, 1, 36, 67, 1 },
-    { GENSET_MODEL_GC1202, "Ashok Leyland GC1202",  0x04, 1, 36, 67, 1 },
-    { GENSET_MODEL_GC1203, "Ashok Leyland GC1203",  0x04, 1, 36, 67, 1 },
-    { GENSET_MODEL_GC902,  "Sedemac GC902",         0x04, 1, 36, 67, 1 },
+    /* model                name                     fc    registers  Alarms   status */
+    { GENSET_MODEL_GC1211, "Mahindra GC1211",       0x04, 1, 36,     57, 3,   67, 2 },
+    { GENSET_MODEL_GC1111, "Mahindra GC1111",       0x03, 1, 36,     57, 3,   67, 2 },
+    { GENSET_MODEL_SGC120, "SGC 120 Mk II",         0x03, 1, 78,      0, 0,    0, 0 },
+    { GENSET_MODEL_GC1201, "Ashok Leyland GC1201",  0x04, 1, 36,      0, 0,   67, 1 },
+    { GENSET_MODEL_GC1202, "Ashok Leyland GC1202",  0x04, 1, 36,      0, 0,   67, 1 },
+    { GENSET_MODEL_GC1203, "Ashok Leyland GC1203",  0x04, 1, 36,      0, 0,   67, 1 },
+    { GENSET_MODEL_GC902,  "Sedemac GC902",         0x04, 1, 36,      0, 0,   67, 1 },
 };
+
+static const GensetModel_t *find_model(uint8_t model) {
+    for (size_t i = 0; i < sizeof(g_models) / sizeof(g_models[0]); i++)
+        if (g_models[i].model_id == model) return &g_models[i];
+    return NULL;
+}
+
+void genset_expect(uint8_t model, GensetData_t *out) {
+    const GensetModel_t *mdl = find_model(model);
+    out->has_alarms = mdl && mdl->al_count > 0;
+    out->has_status = mdl && mdl->st_count > 0;
+}
 
 bool genset_poll(uint8_t slave, uint8_t model, GensetData_t *out) {
     memset(out, 0, sizeof(*out));
 
-    const GensetModel_t *mdl = NULL;
-    for (size_t i = 0; i < sizeof(g_models) / sizeof(g_models[0]); i++) {
-        if (g_models[i].model_id == model) { mdl = &g_models[i]; break; }
-    }
+    const GensetModel_t *mdl = find_model(model);
     if (!mdl) {
         ESP_LOGW(TAG, "Unknown genset model %u", (unsigned)model);
         return false;
     }
 
-    /* Set from the MODEL, not the read result, so the caller still knows a
-     * status message is expected even when every read fails. */
-    out->has_status = (mdl->st_count > 0);
+    /* Set from the MODEL, not the read result, so the caller still knows an
+     * Alarms / status message is expected even when every read fails. */
+    genset_expect(model, out);
 
     out->reg_valid = read_block(slave, mdl->fc, mdl->reg_start, mdl->reg_count,
                                 out->reg_data, (int)sizeof(out->reg_data),
                                 &out->reg_len, "registers");
 
+    /* The follow-up reads run in the spec's order (Alarms, then status), each
+     * after an inter-command gap that gives the controller time to release
+     * the bus, matching the gap modbus_request already leaves after its own
+     * transmit. A failed read does not skip the next one: each is published
+     * on its own, so a partial poll still delivers what it got. */
+    if (out->has_alarms) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        out->al_valid = read_block(slave, mdl->fc, mdl->al_start, mdl->al_count,
+                                   out->al_data, (int)sizeof(out->al_data),
+                                   &out->al_len, "Alarms");
+    }
     if (out->has_status) {
-        /* Inter-command gap: give the controller time to release the bus before
-         * the second read, matching the gap modbus_request already leaves after
-         * its own transmit. */
         vTaskDelay(pdMS_TO_TICKS(50));
         out->st_valid = read_block(slave, mdl->fc, mdl->st_start, mdl->st_count,
                                    out->st_data, (int)sizeof(out->st_data),
                                    &out->st_len, "status");
     }
 
-    return out->reg_valid && (!out->has_status || out->st_valid);
+    return out->reg_valid &&
+           (!out->has_alarms || out->al_valid) &&
+           (!out->has_status || out->st_valid);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -258,6 +294,15 @@ void genset_build_registers_payload(const GensetData_t *d,
                                     const char *hw_id, const char *ts,
                                     char *buf, size_t buf_size) {
     build_payload("registers", d->reg_data, d->reg_len, d->reg_valid,
+                  hw_id, ts, buf, buf_size);
+}
+
+/* "Alarms" with a capital A: the DG integration spec's spelling, which the
+ * cloud parses verbatim. Do not "fix" it to match the lowercase keys. */
+void genset_build_alarms_payload(const GensetData_t *d,
+                                 const char *hw_id, const char *ts,
+                                 char *buf, size_t buf_size) {
+    build_payload("Alarms", d->al_data, d->al_len, d->al_valid,
                   hw_id, ts, buf, buf_size);
 }
 

@@ -403,6 +403,11 @@ static int json_get_int(const char *json, const char *key, int def) {
     if (!p) return def;
     p += strlen(search);
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    /* A number sent as a string ("duCount":"2") is taken as that number. It
+     * used to read as absent: the key kept its old value and the push was
+     * still acked config_successful, so a dashboard that quotes every value
+     * could never change a count, a genset field or the MQTT port. */
+    if (*p == '"') p++;
     /* atoi() cannot distinguish a real 0 from "unparseable" — it returns 0 for
      * "", "}", "abc" and a stray comma alike. Treat a 0 that did not come from
      * an actual digit as absent and hand back the caller's current value, so a
@@ -464,6 +469,89 @@ static bool json_has_key(const char *json, const char *key) {
     char search[64];
     snprintf(search, sizeof(search), "\"%s\":", key);
     return strstr(json, search) != NULL;
+}
+
+/* ── setconfig field readers (pure: json in, staged config out) ──────────
+ * Each refuses a value that would otherwise be quietly turned into a
+ * different, valid setting — the device would then answer config_successful
+ * while polling an address, or running a switch, that nobody chose. */
+
+/* A suffix key into its char[3] field. json_get_str() CLAMPS a longer value,
+ * so "045" would arrive as "04" (another valid address) and a number sent
+ * without quotes would read as absent: both are refused here, naming the key.
+ * The format itself (digits, 01..99) is judged by validate_suffixes() on the
+ * merged plan. Key absent: the field is left untouched. */
+static bool setcfg_get_sfx(const char *json, const char *key, char *out, size_t out_size,
+                           char *err, size_t err_size) {
+    if (!json_has_key(json, key)) return true;
+    char wide[16];
+    if (!json_get_str(json, key, wide, sizeof(wide)) || strlen(wide) > out_size - 1) {
+        snprintf(err, err_size, "%s must be 2 digits as a string, e.g. 05", key);
+        return false;
+    }
+    memcpy(out, wide, strlen(wide) + 1);
+    return true;
+}
+
+/* An int key that switches equipment. Out of lo..hi it is REFUSED rather than
+ * clamped: the loader clamps a stored gensetType or diEnable out of range to
+ * OFF on the next boot, so a typo became a DG or DI silently switched off
+ * after a config_successful ack. Key absent: *io is left as is. */
+static bool setcfg_int_in_range(const char *json, const char *key, int lo, int hi,
+                                int *io, char *err, size_t err_size) {
+    if (!json_has_key(json, key)) return true;
+    int v = json_get_int(json, key, *io);
+    if (v < lo || v > hi) {
+        snprintf(err, err_size, "%s must be %d..%d", key, lo, hi);
+        return false;
+    }
+    *io = v;
+    return true;
+}
+
+/* sfxGenset and gensetSlave are ONE value — the genset's suffix is its Modbus
+ * address — so they are synced by what THIS push carries, never by what the
+ * staged copy inherited from NVS. The old sync tested the staged suffix: once
+ * the first genset setconfig had stored "10", a later {"gensetSlave":4} was
+ * overwritten back to 10 and acked config_successful, and the DG sat on the
+ * wrong address reading 404.
+ *   sfxGenset "NN" -> slave NN; a gensetSlave in the same push must agree
+ *   gensetSlave N  -> suffix "%02u" (none above 99: the HW_ID then uses "10")
+ *   sfxGenset ""   -> back to the slave's own number
+ *   neither        -> the stored pair, untouched
+ * A slave outside 1..247 is refused: an address is never guessed. */
+static bool setcfg_genset_addr(const char *json, DeviceConfig *nc, char *err, size_t err_size) {
+    bool slave_present = json_has_key(json, "gensetSlave");
+    int  slave         = json_get_int(json, "gensetSlave", nc->genset_slave);
+    if (slave_present && (slave < 1 || slave > 247)) {
+        snprintf(err, err_size, "gensetSlave must be 1..247");
+        return false;
+    }
+    bool sfx_present = json_has_key(json, "sfxGenset");
+    char sfx[sizeof(nc->sfx_genset)] = "";
+    if (!setcfg_get_sfx(json, "sfxGenset", sfx, sizeof(sfx), err, err_size)) return false;
+
+    if (sfx_present && sfx[0]) {
+        memcpy(nc->sfx_genset, sfx, sizeof(sfx));
+        if (isdigit((unsigned char)sfx[0]) && isdigit((unsigned char)sfx[1])) {
+            int gs = atoi(sfx);
+            if (slave_present && slave != gs) {
+                snprintf(err, err_size, "sfxGenset %s and gensetSlave %d disagree, send one of them",
+                         sfx, slave);
+                return false;
+            }
+            if (gs > 0) nc->genset_slave = (uint8_t)gs;   /* "00": validate_suffixes() refuses */
+        }
+        return true;   /* not 2 digits: validate_suffixes() refuses it with its own reason */
+    }
+    if (slave_present || sfx_present) {
+        nc->genset_slave = (uint8_t)slave;
+        if (nc->genset_slave <= 99)
+            snprintf(nc->sfx_genset, sizeof(nc->sfx_genset), "%02u", (unsigned)(nc->genset_slave % 100));
+        else
+            nc->sfx_genset[0] = '\0';
+    }
+    return true;
 }
 
 /* True if a setconfig payload carries any connectivity credential (broker or
@@ -950,6 +1038,7 @@ static void parse_setconfig(const char *json) {
      * on an implementation detail. */
     DeviceConfig nc;
     memcpy(&nc, &g_cfg, sizeof(nc));
+    char verr[128];   /* refusal reason from the field readers and validators */
 
     int du_cnt = json_get_int(json, "duCount", nc.du_count);
     if (du_cnt < 0) du_cnt = 0;
@@ -975,7 +1064,11 @@ static void parse_setconfig(const char *json) {
                 return;
             }
         }
-        json_get_str(json, key_s, nc.du_sfx[i], sizeof(nc.du_sfx[i]));
+        if (!setcfg_get_sfx(json, key_s, nc.du_sfx[i], sizeof(nc.du_sfx[i]), verr, sizeof(verr))) {
+            ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
+            setcfg_fail(verr);
+            return;
+        }
     }
     /* Which dispenser each entry names (its number = its address), whether a
      * Yenen is numbered beyond head 5, and whether two entries name the same
@@ -1039,11 +1132,23 @@ static void parse_setconfig(const char *json) {
         nc.pantech_count = (uint8_t)pantech;
     }
 
-    nc.genset_type   = (uint8_t) json_get_int(json,"gensetType", nc.genset_type);
-    nc.genset_model  = (uint8_t) json_get_int(json,"gensetModel",nc.genset_model);
-    nc.genset_slave  = (uint8_t) json_get_int(json,"gensetSlave",nc.genset_slave);
+    /* gensetType and diEnable switch equipment on and off, so out of range
+     * they are refused (setcfg_int_in_range). gensetModel and gensetBaud keep
+     * their documented clamps — on the int, before narrowing, so 258 cannot
+     * wrap onto model 2. The genset address pair is its own reader. */
+    int gtype = nc.genset_type, di_mask = nc.di_enable;
+    if (!setcfg_int_in_range(json, "gensetType", GENSET_OFF, GENSET_SEDEMAC, &gtype, verr, sizeof(verr)) ||
+        !setcfg_int_in_range(json, "diEnable", 0, 0x0F, &di_mask, verr, sizeof(verr)) ||
+        !setcfg_genset_addr(json, &nc, verr, sizeof(verr))) {
+        ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
+        setcfg_fail(verr);
+        return;
+    }
+    nc.genset_type = (uint8_t)gtype;
+    nc.di_enable   = (uint8_t)di_mask;
+    int gmodel = json_get_int(json, "gensetModel", nc.genset_model);
+    nc.genset_model  = (gmodel < 0 || gmodel > GENSET_MODEL_MAX) ? GENSET_MODEL_GC1211 : (uint8_t)gmodel;
     nc.genset_baud   = (uint32_t)json_get_int(json,"gensetBaud", (int)nc.genset_baud);
-    nc.di_enable     = (uint8_t) json_get_int(json,"diEnable",   nc.di_enable);
     nc.gps_enable    = json_get_bool(json, "gpsEnable", nc.gps_enable);
 
     /* Baud whitelist — an out-of-range value (0 in particular) reaches the
@@ -1051,28 +1156,21 @@ static void parse_setconfig(const char *json) {
      * into a reboot loop. Coerce to the Sedemac default like the counts. */
     if (nc.genset_baud != 4800 && nc.genset_baud != 9600 && nc.genset_baud != 19200)
         nc.genset_baud = 9600;
-    if (nc.genset_model > GENSET_MODEL_MAX) nc.genset_model = GENSET_MODEL_GC1211;
-    if (nc.genset_slave < 1 || nc.genset_slave > 247) nc.genset_slave = GENSET_SLAVE_DEFAULT;
-
-    json_get_str(json,"sfxGenset",nc.sfx_genset, sizeof(nc.sfx_genset));
-    /* If sfxGenset is provided as numeric, synchronize genset_slave to it;
-     * conversely if gensetSlave was provided but sfxGenset was omitted, sync suffix to slave. */
-    if (nc.sfx_genset[0] >= '0' && nc.sfx_genset[0] <= '9') {
-        int gs = atoi(nc.sfx_genset);
-        if (gs > 0 && gs <= 247) nc.genset_slave = (uint8_t)gs;
-    } else if (nc.genset_slave > 0 && nc.genset_slave <= 99 && nc.sfx_genset[0] == '\0') {
-        snprintf(nc.sfx_genset, sizeof(nc.sfx_genset), "%02u", nc.genset_slave);
-    }
-    json_get_str(json,"sfxDI",    nc.sfx_di,     sizeof(nc.sfx_di));
 
     char keybuf[16];
-    for (int i = 0; i < RADAR_MAX; i++) {
+    bool sfx_ok = setcfg_get_sfx(json, "sfxDI", nc.sfx_di, sizeof(nc.sfx_di), verr, sizeof(verr));
+    for (int i = 0; i < RADAR_MAX && sfx_ok; i++) {
         snprintf(keybuf, sizeof(keybuf), "sfxZtech%d", i + 1);
-        json_get_str(json, keybuf, nc.sfx_ztech[i], sizeof(nc.sfx_ztech[i]));
+        sfx_ok = setcfg_get_sfx(json, keybuf, nc.sfx_ztech[i], sizeof(nc.sfx_ztech[i]), verr, sizeof(verr));
     }
-    for (int i = 0; i < RADAR_MAX; i++) {
+    for (int i = 0; i < RADAR_MAX && sfx_ok; i++) {
         snprintf(keybuf, sizeof(keybuf), "sfxPantech%d", i + 1);
-        json_get_str(json, keybuf, nc.sfx_pantech[i], sizeof(nc.sfx_pantech[i]));
+        sfx_ok = setcfg_get_sfx(json, keybuf, nc.sfx_pantech[i], sizeof(nc.sfx_pantech[i]), verr, sizeof(verr));
+    }
+    if (!sfx_ok) {
+        ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
+        setcfg_fail(verr);
+        return;
     }
 
     /* ── Connectivity: APN + MQTT broker (optional — only touched if an
@@ -1182,7 +1280,6 @@ static void parse_setconfig(const char *json) {
                  apn_changed, mqtt_changed);
     }
 
-    char verr[128];
     if (!validate_suffixes(&nc, verr, sizeof(verr)) ||
         !validate_bus_addresses(&nc, verr, sizeof(verr))) {
         ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
@@ -2213,7 +2310,8 @@ static bool poll_genset(const char *ts) {
      * powered down — pinned the bus for ~3.3 s every 5 minutes, long enough to
      * push a dispenser round past its own wait. Each attempt re-asserts the
      * baud under the lock, so nothing about correctness changes; the worst-case
-     * hold just drops to one genset_poll (~1.1 s). A lock timeout mid-burst
+     * hold just drops to one genset_poll (~1.6 s for a Mahindra's three reads,
+     * ~1.1 s for the two-read models). A lock timeout mid-burst
      * abandons the remaining attempts and publishes 404 for this cycle, exactly
      * as a dead DG would. */
     bool ok = false;
@@ -2222,8 +2320,11 @@ static bool poll_genset(const char *ts) {
      * attempt below fails to get the bus, genset_poll() never runs and the
      * builder would serialise the PREVIOUS cycle's registers under this
      * cycle's timestamp — stale DG data presented as a live reading. Clearing
-     * here makes a skipped poll publish 404s, which is what it is. */
+     * here makes a skipped poll publish 404s, which is what it is — ALL of them:
+     * genset_expect() sets which messages this model sends, which the cleared
+     * struct would otherwise say is none (only the registers 404 went out). */
     memset(&gd, 0, sizeof(gd));
+    genset_expect(g_cfg.genset_model, &gd);
     for (int attempt = 1; attempt <= GENSET_READ_RETRIES && !ok; attempt++) {
         if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(100));
         if (!rs485_bus_lock(RS485_BUS_WAIT_MAIN_MS)) {
@@ -2244,14 +2345,25 @@ static bool poll_genset(const char *ts) {
     if (!got_bus)
         ESP_LOGW(TAG, "genset: RS485 bus busy for every attempt — skipped this cycle");
 
-    /* Message 1 of up to 2: the measurement block. Each Modbus read is published
-     * as its own message per the DG integration spec, both under the genset
-     * HW_ID and sharing this cycle's timestamp. */
+    /* Message 1 of up to 3: the measurement block. Each Modbus read is published
+     * as its own message per the DG integration spec, in the spec's order, all
+     * under the genset HW_ID and sharing this cycle's timestamp. */
     genset_build_registers_payload(&gd, g_hw_genset, ts, payload, sizeof(payload));
     bool pub = mqtt_publish(t_data, payload);
     if (pub) g_diag.pub_ok++; else g_diag.pub_fail++;
 
-    /* Message 2: the DG status block, for every model that defines one (all but
+    /* Message 2: the alarm registers, Mahindra GC1211/GC1111 only. has_alarms
+     * is set from the model table even when the reads failed, so a dead DG
+     * still reports a "404" Alarms message rather than silently sending
+     * nothing — same rule as the status block below. */
+    if (gd.has_alarms) {
+        genset_build_alarms_payload(&gd, g_hw_genset, ts, payload, sizeof(payload));
+        bool pub_al = mqtt_publish(t_data, payload);
+        if (pub_al) g_diag.pub_ok++; else g_diag.pub_fail++;
+        pub = pub && pub_al;
+    }
+
+    /* Message 3: the DG status block, for every model that defines one (all but
      * the SGC 120, whose single overall read already covers it). has_status is
      * set from the model table even when the reads failed, so a dead DG still
      * reports a "404" status rather than silently sending nothing. */
@@ -2273,7 +2385,7 @@ static bool poll_genset(const char *ts) {
  * like poll_genset()'s rs485_bus_set_8n1(). */
 static bool poll_gps(const char *ts) {
     static GpsFix_t fix;
-    static char payload[160];  /* {"HW_ID":..,"gps":{"lat":..,"lon":..},"TS":..} ~100 bytes worst case */
+    static char payload[192];  /* {"HW_ID":..,"gps":{"lat":..,"lon":..,"hdop":..,"nsat":..,"spd":..},"TS":..} ~135 bytes worst case */
     bool ok = gps_poll(&fix);
     gps_build_payload(&fix, g_imei, ts, payload, sizeof(payload));
     bool pub = mqtt_publish(t_data, payload);
@@ -3083,8 +3195,9 @@ void app_main(void) {
      * (network.c), and without verbose CME errors active yet, a failed
      * AT+QGPS=1 comes back as a bare, undiagnosable "+CME ERROR" with no
      * code (seen in the field on 2026-07-17 — moved here specifically to
-     * fix that). A true no-op when gps_enable is false, which is the
-     * default and normal state for most gateways. */
+     * fix that). With gps_enable false (the default) no fix is ever read or
+     * published; gps_init() then only makes sure the modem is not running
+     * GNSS or AGPS on its own (three queries, no write when already off). */
     gps_init(g_cfg.gps_enable);
 
     /* IMEI, HW_IDs, store and du_task were all brought up before network

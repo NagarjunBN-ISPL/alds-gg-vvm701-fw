@@ -38,14 +38,20 @@ python3 extract.py "$SRC/nvs_config.c" func:erase_sibling_namespaces \
     > extracted_product.inc || rc=1
 python3 extract.py "$SRC/main.c" func:validate_suffixes func:radar_slave_for \
     func:validate_bus_addresses > extracted_plan.inc || rc=1
+python3 extract.py "$SRC/main.c" func:json_get_int func:json_get_str func:json_has_key \
+    func:setcfg_get_sfx func:setcfg_int_in_range func:setcfg_genset_addr \
+    > extracted_setcfg.inc || rc=1
 python3 extract.py "$SRC/dispenser.c" func:du_bytes_to_hex func:clamp_pos \
     func:du_build_nozzle_payload > extracted_payload.inc || rc=1
+python3 extract.py "$SRC/gps.c" func:next_field func:gps_parse_loc func:add_field \
+    func:gps_build_payload func:gps_gsv_summary > extracted_gps.inc || rc=1
 
 # ── functional suites ───────────────────────────────────────────────────────
 gcc $CFLAGS test_yenen_rsp.c "$SRC/yenen.c" -o t  || rc=1   # RSP driver + noise
 gcc $CFLAGS test_main_rsp.c simnvs.c "$SRC/nvs_config.c" -o tm || rc=1   # price parse, acks
 gcc $CFLAGS test_du_plan.c  simnvs.c "$SRC/nvs_config.c" -o td || rc=1   # suffix = dispenser number
 gcc $CFLAGS test_payload.c                  -o ty || rc=1   # nozzle payload = field shape
+gcc $CFLAGS test_genset.c "$SRC/genset.c"   -o tg || rc=1   # DG reads = the spec's frames
 gcc $CFLAGS test_nvs_creds.c                -o tn || rc=1   # firmware creds win
 gcc $CFLAGS test_product_guard.c            -o tp || rc=1   # product guard
 
@@ -55,8 +61,9 @@ gcc $CFLAGS $SAN test_nvs_fuzz.c  simnvs.c "$SRC/nvs_config.c" -o tfz || rc=1
 gcc $CFLAGS $SAN -include pathmap.h -c "$SRC/store.c" -o store_host.o  || rc=1
 gcc $CFLAGS $SAN test_store_fuzz.c simfs.c store_host.o     -o tst || rc=1
 gcc $CFLAGS $SAN test_json_fuzz.c                           -o tj  || rc=1
+gcc $CFLAGS $SAN test_gps.c -lm                             -o tgps || rc=1  # AT+QGPSLOC parser + payload (bwsr's suite)
 
-for f in t tm td ty tn tp tl tfz tst tj; do
+for f in t tm td ty tg tn tp tl tfz tst tj tgps; do
     out=$(./$f 2>/dev/null)
     echo "$f: $(echo "$out" | tail -1)"
     echo "$out" | grep -q "0 failures" || rc=1

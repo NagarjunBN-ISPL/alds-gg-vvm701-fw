@@ -1,6 +1,6 @@
 # alds-gg VVM701 gateway: cloud integration guide
 
-Firmware 1.0.0, product id `alds-gg-vvm701/1`. Updated 21 September 2026.
+Firmware 1.0.0, product id `alds-gg-vvm701/1`. Updated 23 September 2026.
 
 Everything the gateway publishes and every command it accepts. Examples are
 copied from the firmware source; if a payload you receive differs, the firmware
@@ -10,6 +10,10 @@ envelope and every equipment payload shape are unchanged. Section 1 is what is n
 
 ## 1. What changed since the previous GG firmware
 
+- Genset: Mahindra GC1211/GC1111 now also send their alarm registers (57-59)
+  as a third message, `{"genset":{"Alarms":"11,10,11,11,11,11"}}`, between
+  `registers` and `status`. The key is `Alarms` with a capital A, as in the DG
+  integration spec. `registers` and `status` are unchanged. Section 6.4.
 - Dispenser payload is byte-for-byte the old shape, including `rfid`, which
   is now always the string `"404"` (the tag is no longer read).
 - Yenen dispensers alongside BlueSky: same `nozzles` envelope, `data` only.
@@ -20,8 +24,15 @@ envelope and every equipment payload shape are unchanged. Section 1 is what is n
 - Readings are buffered on flash during an outage and replayed oldest first,
   at-least-once (section 5). Expect bursts of old-`TS` records after an outage.
 - Radar, genset and GPS re-poll a failed unit after 60 s, up to 3 times.
+- GPS (when `gpsEnable` is on) adds optional `hdop`, `nsat` and `spd` next to
+  `lat`/`lon`, the bowser gateway's shape. Section 6.6.
 - Dispenser setconfig keys: `duCount` + `du<N>Make` + `du<N>Sfx` replace
   `duBlueskyCount` and `sfxBs<N>`. Suffixes are digits only.
+- setconfig now refuses, with a reason, values it used to change silently: an
+  out-of-range `gensetType`, `gensetSlave` or `diEnable`, a suffix longer than
+  2 characters, and a `gensetSlave`/`sfxGenset` pair that disagree. `gensetSlave`
+  alone now moves the genset (it used to be overridden by the stored suffix).
+  Numbers may be sent quoted. Section 8.1.
 - New topics: fleet FOTA, panel lock, Yenen price update (section 3).
 - FOTA takes a JSON form with `force`, remembers the last applied URL and
   ignores retained commands. New statuses are listed in section 8.
@@ -98,7 +109,8 @@ config (section 8.1). Status, diagnostics, GPS and lock messages use the bare IM
 - Hex is lowercase, 2 digits per byte, comma separated, and is the complete
   frame the device received (for genset: register data only, section 6.4).
 - `"404"` in a field means that read failed. A whole unit that did not answer
-  publishes a compact shape with only `"data":"404"`. DI uses the number `404`.
+  publishes a compact shape with only `"data":"404"`; a genset message keeps its
+  own key instead (`{"genset":{"Alarms":"404"}}`). DI uses the number `404`.
 - `TS` is `YYYY-MM-DD HH:MM:SS` in UTC from the device clock. Records taken
   before the clock is set are not published (BlueSky/Yenen) rather than sent
   with a 1970 timestamp.
@@ -159,24 +171,27 @@ up to `"12"`. The label is the key inside `nozzles` and the `nz` of `setrsp`.
 re-polled on its own 60 s later, up to 3 times; the 10-minute cadence itself
 does not move. Take the latest reading as current.
 
-### 6.4 Genset, every 5 min, up to two messages
+### 6.4 Genset, every 5 min, up to three messages
 
 ```json
 {"HW_ID":"86071008133255610","genset":{"registers":"01,3f,00,3e,00,22,..."},"TS":"..."}
+{"HW_ID":"86071008133255610","genset":{"Alarms":"11,10,11,11,11,11"},"TS":"..."}
 {"HW_ID":"86071008133255610","genset":{"status":"c0,00,00,00"},"TS":"..."}
 ```
 
-Register data bytes only, Modbus framing and CRC stripped. Register k is
-`data[2k]<<8 | data[2k+1]`. Both messages carry the same `TS`. A failed read
-gives `"404"` for that message and the same 60 s re-poll applies.
+One message per Modbus read, in this order, all with the same `TS`. Register
+data bytes only, Modbus framing and CRC stripped. Register k is
+`data[2k]<<8 | data[2k+1]`. `Alarms` is spelled with a capital A, exactly as
+the DG integration spec has it. A failed read gives `"404"` for that message
+(the key stays) and the same 60 s re-poll applies.
 
-| `gensetModel` | Controller | FC | `registers` | `status` |
-|---|---|---|---|---|
-| 0 | Mahindra GC1211 | 04 | offsets 1-36 | offsets 67-68 (4 B) |
-| 1 | Mahindra GC1111 | 03 | offsets 1-36 | offsets 67-68 (4 B) |
-| 2 | SGC 120 Mk II | 03 | offsets 1-78 | none (no second message) |
-| 3, 4, 5 | Ashok Leyland GC1201/02/03 | 04 | offsets 1-36 | offset 67 (2 B) |
-| 6 | Sedemac GC902 | 04 | offsets 1-36 | offset 67 (2 B) |
+| `gensetModel` | Controller | FC | `registers` | `Alarms` | `status` |
+|---|---|---|---|---|---|
+| 0 | Mahindra GC1211 | 04 | offsets 1-36 | offsets 57-59 (6 B) | offsets 67-68 (4 B) |
+| 1 | Mahindra GC1111 | 03 | offsets 1-36 | offsets 57-59 (6 B) | offsets 67-68 (4 B) |
+| 2 | SGC 120 Mk II | 03 | offsets 1-78 | none, inside `registers` | none, inside `registers` |
+| 3, 4, 5 | Ashok Leyland (spec: "DG 1202/03/04") | 04 | offsets 1-36 | none | offset 67 (2 B) |
+| 6 | Sedemac GC902 (not in the spec) | 04 | offsets 1-36 | none | offset 67 (2 B) |
 
 Register maps and scaling are in `GENSET_REGISTER_MAPS.md` in this repo.
 
@@ -192,11 +207,15 @@ change, so silence is normal. An unreadable channel is the number `404`.
 ### 6.6 GPS, every 5 min, off by default
 
 ```json
-{"HW_ID":"860710081332556","gps":{"lat":12.887630,"lon":77.641710},"TS":"..."}
+{"HW_ID":"860710081332556","gps":{"lat":12.887360,"lon":77.641840,"hdop":5.9,"nsat":8,"spd":0.0},"TS":"..."}
 ```
 
-No fix gives `{"gps":{"data":"404"}}`. Off unless `gpsEnable` is set, so do
-not expect this message.
+`lat`/`lon` in decimal degrees. `hdop`, `nsat` (satellites used) and `spd`
+(km/h) are sent whenever the modem reports them. A message without them is
+still a fix, so key on `lat`/`lon` only. `spd` 0.0 is a real reading
+(stopped), not a missing one. No fix gives `{"gps":{"data":"404"}}`. Off
+unless `gpsEnable` is set, so do not expect this message. It is the same GPS
+payload as the bowser gateway (bwsr).
 
 ## 7. Diagnostics, every 15 min
 
@@ -271,15 +290,23 @@ Publish JSON to `<base>/<imei>/setconfig`. Only the keys sent are changed.
 | `radarType` + `tankCount` | str + int | `ztech`/`pantech`/`none`, 0-4. Alternative to the counts, never mixed with them |
 | `sfxZtech1..4`, `sfxPantech1..4` | str | `01`..`99` = Modbus slave, or `""` |
 | `gensetType`, `gensetModel`, `gensetSlave`, `gensetBaud` | int | 0/1; 0-6 (table 6.4); 1-247; 4800/9600/19200 |
-| `sfxGenset` | str | kept in sync with `gensetSlave` |
-| `diEnable` | int | bitmask, bit0 = DI1 .. bit3 = DI4 |
+| `sfxGenset` | str | the genset's suffix = its `gensetSlave`; send either one, and if both are sent they must agree |
+| `diEnable` | int | bitmask 0-15, bit0 = DI1 .. bit3 = DI4 |
 | `sfxDI` | str | `01`..`99`, default `11` |
 | `gpsEnable` | bool | |
 | `apn`, `apnUser`, `apnPass` | str | `apn` non-empty |
 | `mqttHost`, `mqttPort`, `mqttUser`, `mqttPass`, `mqttBaseTopic`, `mqttTls` | str/int/bool | host and base topic non-empty, port 1-65535, no `#` or `+` in the base topic |
 
-Out-of-range numbers are clamped (`gensetModel` 7 becomes 0, a bad baud
-9600). Suffix and address errors are refused with a reason naming the units:
+Numbers may be sent quoted (`"duCount":"2"`). Counts, `gensetModel` and
+`gensetBaud` out of range are clamped (`gensetModel` 7 becomes 0, a bad baud
+9600). `gensetType`, `gensetSlave` and `diEnable` out of range are refused
+(`gensetType must be 0..1`, `gensetSlave must be 1..247`, `diEnable must be
+0..15`), because a clamp would silently switch equipment off or move it to
+another address. A suffix key that is not a 2-character string is refused
+(`sfxZtech1 must be 2 digits as a string, e.g. 05`), so `"045"` never becomes
+`04`; `sfxGenset` and `gensetSlave` sent together must agree (`sfxGenset 03
+and gensetSlave 4 disagree, send one of them`). Suffix and address errors are
+refused with a reason naming the units:
 `DU2 names dispenser 07, but a BlueSky dispenser must be 01..06`, `DU1 and DU2
 have duplicate suffix 02`, `DU4 and Ztech1 have duplicate suffix 04`, `Ztech1
 and Genset both resolve to Modbus slave 4`, `Ztech1 suffix must be exactly 2

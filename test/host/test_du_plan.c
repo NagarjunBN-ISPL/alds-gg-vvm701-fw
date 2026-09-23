@@ -8,13 +8,16 @@
  *                            patched, and the surviving prefix is intact;
  *   3. validate_suffixes() + validate_bus_addresses() (EXTRACTED verbatim
  *                            from src/main.c) — the way-in guard: what a
- *                            setconfig may and may not say.
+ *                            setconfig may and may not say;
+ *   4. the setconfig field readers (EXTRACTED) — a typo is refused, never
+ *                            quietly re-read as a different valid value.
  *
  * Every refusal reason is asserted by the token the cloud will see. */
 #include "shim.h"
 #include <ctype.h>
 #include "nvs.h"
 #include "extracted_plan.inc"
+#include "extracted_setcfg.inc"
 
 int g_log_quiet = 1;
 DeviceConfig g_cfg;
@@ -190,11 +193,95 @@ static void t_validator(void) {
     }
 }
 
+/* ── 4. setconfig field readers ────────────────────────────────────────── */
+static bool gaddr(DeviceConfig *c, const char *json, char *err, size_t n) {
+    err[0] = '\0';
+    return setcfg_genset_addr(json, c, err, n);
+}
+
+static void t_setcfg(void) {
+    printf("[4] setconfig readers: genset address, suffix length, switches\n");
+    char err[160];
+    DeviceConfig c;
+
+    /* THE bug: a stored "10" must not swallow a later gensetSlave-only push */
+    plan(&c, 0, NULL, NULL); c.genset_type = GENSET_SEDEMAC;
+    c.genset_slave = 10; snprintf(c.sfx_genset, sizeof(c.sfx_genset), "10");
+    CHECK(gaddr(&c, "{\"gensetSlave\":4}", err, sizeof(err)) && c.genset_slave == 4 &&
+          strcmp(c.sfx_genset, "04") == 0,
+          "gensetSlave 4 alone must move the DG to 4/04 (got %u/%s, '%s')", c.genset_slave, c.sfx_genset, err);
+    CHECK(gaddr(&c, "{\"sfxGenset\":\"03\"}", err, sizeof(err)) && c.genset_slave == 3 &&
+          strcmp(c.sfx_genset, "03") == 0,
+          "sfxGenset 03 alone must set slave 3 (got %u/%s)", c.genset_slave, c.sfx_genset);
+    CHECK(gaddr(&c, "{\"gensetSlave\":7,\"sfxGenset\":\"07\"}", err, sizeof(err)) && c.genset_slave == 7,
+          "an agreeing pair must apply (got %u, '%s')", c.genset_slave, err);
+    CHECK(!gaddr(&c, "{\"gensetSlave\":4,\"sfxGenset\":\"03\"}", err, sizeof(err)) &&
+          strstr(err, "disagree") && c.genset_slave == 7,
+          "a disagreeing pair must be refused, nothing changed (got '%s', slave %u)", err, c.genset_slave);
+    CHECK(gaddr(&c, "{\"gensetSlave\":\"12\"}", err, sizeof(err)) && c.genset_slave == 12 &&
+          strcmp(c.sfx_genset, "12") == 0,
+          "a quoted gensetSlave must apply (got %u/%s)", c.genset_slave, c.sfx_genset);
+
+    /* out of range is refused, never wrapped (300 used to land on slave 44) */
+    CHECK(!gaddr(&c, "{\"gensetSlave\":300}", err, sizeof(err)) && strstr(err, "1..247") && c.genset_slave == 12,
+          "gensetSlave 300 must be refused (got '%s', slave %u)", err, c.genset_slave);
+    CHECK(!gaddr(&c, "{\"gensetSlave\":0}", err, sizeof(err)), "gensetSlave 0 must be refused");
+    CHECK(!gaddr(&c, "{\"gensetSlave\":-1}", err, sizeof(err)), "gensetSlave -1 must be refused");
+
+    /* above 99: allowed, but no 2-digit suffix (the HW_ID falls back to 10) */
+    CHECK(gaddr(&c, "{\"gensetSlave\":120}", err, sizeof(err)) && c.genset_slave == 120 && !c.sfx_genset[0],
+          "gensetSlave 120 must apply with no suffix (got %u/'%s')", c.genset_slave, c.sfx_genset);
+
+    /* sfxGenset "" = back to the slave's own number; neither key = untouched */
+    c.genset_slave = 9; snprintf(c.sfx_genset, sizeof(c.sfx_genset), "09");
+    CHECK(gaddr(&c, "{\"sfxGenset\":\"\"}", err, sizeof(err)) && c.genset_slave == 9 &&
+          strcmp(c.sfx_genset, "09") == 0, "sfxGenset \"\" must fall back to the slave (got %s)", c.sfx_genset);
+    CHECK(gaddr(&c, "{\"gensetType\":1}", err, sizeof(err)) && c.genset_slave == 9 &&
+          strcmp(c.sfx_genset, "09") == 0, "a push without either key must not touch the pair");
+
+    /* lettered: copied through, and validate_suffixes() refuses it */
+    CHECK(gaddr(&c, "{\"sfxGenset\":\"G1\"}", err, sizeof(err)) && strcmp(c.sfx_genset, "G1") == 0 &&
+          c.genset_slave == 9, "a lettered sfxGenset must reach the validator untouched");
+    CHECK(!validate_suffixes(&c, err, sizeof(err)) && strstr(err, "Genset"),
+          "the validator must refuse the lettered genset suffix (got '%s')", err);
+
+    /* suffix length: "045" must not be clamped into the valid "04" */
+    char s3[3] = "07";
+    CHECK(!setcfg_get_sfx("{\"sfxZtech1\":\"045\"}", "sfxZtech1", s3, sizeof(s3), err, sizeof(err)) &&
+          strstr(err, "sfxZtech1") && strcmp(s3, "07") == 0,
+          "045 must be refused, field untouched (got '%s', field %s)", err, s3);
+    CHECK(!setcfg_get_sfx("{\"du1Sfx\":5}", "du1Sfx", s3, sizeof(s3), err, sizeof(err)) && strcmp(s3, "07") == 0,
+          "an unquoted suffix must be refused, not read as absent (got '%s')", err);
+    CHECK(setcfg_get_sfx("{\"sfxDI\":\"05\"}", "sfxDI", s3, sizeof(s3), err, sizeof(err)) && strcmp(s3, "05") == 0,
+          "05 must be taken (got %s)", s3);
+    CHECK(setcfg_get_sfx("{\"sfxDI\":\"\"}", "sfxDI", s3, sizeof(s3), err, sizeof(err)) && !s3[0],
+          "an empty suffix must clear the field (back to the default)");
+    snprintf(s3, sizeof(s3), "08");
+    CHECK(setcfg_get_sfx("{\"duCount\":1}", "sfxDI", s3, sizeof(s3), err, sizeof(err)) && strcmp(s3, "08") == 0,
+          "an absent key must leave the field untouched");
+
+    /* switches: out of range refused, quoted accepted, absent untouched */
+    int v = 1;
+    CHECK(!setcfg_int_in_range("{\"gensetType\":2}", "gensetType", 0, 1, &v, err, sizeof(err)) &&
+          v == 1 && strstr(err, "gensetType"), "gensetType 2 must be refused (got '%s')", err);
+    CHECK(!setcfg_int_in_range("{\"diEnable\":16}", "diEnable", 0, 15, &v, err, sizeof(err)) && v == 1,
+          "diEnable 16 must be refused (got '%s')", err);
+    CHECK(setcfg_int_in_range("{\"diEnable\":\"15\"}", "diEnable", 0, 15, &v, err, sizeof(err)) && v == 15,
+          "a quoted diEnable must apply (got %d)", v);
+    CHECK(setcfg_int_in_range("{\"x\":1}", "diEnable", 0, 15, &v, err, sizeof(err)) && v == 15,
+          "an absent switch must stay as it was");
+
+    /* quoted counts: used to read as absent and keep the old value */
+    CHECK(json_get_int("{\"duCount\":\"2\"}", "duCount", 0) == 2, "a quoted duCount must read as 2");
+    CHECK(json_get_int("{\"duCount\":\"x\"}", "duCount", 5) == 5, "a garbled count must keep the old value");
+}
+
 int main(void) {
     printf("== alds-gg dispenser plan: suffix = number = address ==\n");
     t_number();
     t_loader();
     t_validator();
+    t_setcfg();
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

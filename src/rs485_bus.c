@@ -26,7 +26,10 @@ void rs485_bus_init(void)
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
     };
-    esp_err_t err = uart_driver_install(RS485_UART, RS485_BUF, RS485_BUF, 0, NULL, 0);
+    /* ESP_INTR_FLAG_IRAM matches CONFIG_UART_ISR_IN_IRAM=y (sdkconfig.defaults);
+     * with 0 here IDF set the flag itself and logged that on every boot. */
+    esp_err_t err = uart_driver_install(RS485_UART, RS485_BUF, RS485_BUF, 0, NULL,
+                                        ESP_INTR_FLAG_IRAM);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
         ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(err));
     uart_param_config(RS485_UART, &cfg);

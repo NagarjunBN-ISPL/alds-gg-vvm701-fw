@@ -12,6 +12,13 @@ void network_set_apn(const char *apn, const char *user, const char *pass);
  * Shared by network_init() and fota.c so both use identical, live settings. */
 void network_build_qicsgp(char *out, size_t out_size);
 
+/* The same command for any Quectel context id ("AT+QICSGP=<cid>,1,..."). gps.c
+ * uses it to give AGPS a context of its own with the live APN settings. */
+void network_build_qicsgp_ctx(int cid, char *out, size_t out_size);
+
+/* The APN in force right now (compiled default or the NVS override). */
+const char *network_apn(void);
+
 bool network_init(void);
 
 /* Registration only: CEREG/CGREG says the modem is attached to a network.

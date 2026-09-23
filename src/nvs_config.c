@@ -377,7 +377,7 @@ bool nvs_config_load(DeviceConfig *cfg) {
         int gs = atoi(cfg->sfx_genset);
         if (gs > 0 && gs <= 247) cfg->genset_slave = (uint8_t)gs;
     } else if (cfg->genset_slave > 0 && cfg->genset_slave <= 99 && cfg->sfx_genset[0] == '\0') {
-        snprintf(cfg->sfx_genset, sizeof(cfg->sfx_genset), "%02u", cfg->genset_slave);
+        snprintf(cfg->sfx_genset, sizeof(cfg->sfx_genset), "%02u", (unsigned)(cfg->genset_slave % 100));
     }
     clamp_sfx(cfg->sfx_di);
     for (int i = 0; i < DU_MAX_DISPENSERS; i++) clamp_sfx(cfg->du_sfx[i]);

@@ -27,14 +27,20 @@ void network_set_apn(const char *apn, const char *user, const char *pass) {
     s_apn_pass[sizeof(s_apn_pass) - 1] = '\0';
 }
 
-void network_build_qicsgp(char *out, size_t out_size) {
+void network_build_qicsgp_ctx(int cid, char *out, size_t out_size) {
     /* auth type: 0=none, 3=PAP or CHAP (modem negotiates). Only send auth
      * when a username is actually set — an empty-user context with auth=3
      * is rejected by some networks. */
     int auth = (s_apn_user[0] != '\0') ? 3 : 0;
-    snprintf(out, out_size, "AT+QICSGP=1,1,\"%s\",\"%s\",\"%s\",%d",
-             s_apn, s_apn_user, s_apn_pass, auth);
+    snprintf(out, out_size, "AT+QICSGP=%d,1,\"%s\",\"%s\",\"%s\",%d",
+             cid, s_apn, s_apn_user, s_apn_pass, auth);
 }
+
+void network_build_qicsgp(char *out, size_t out_size) {
+    network_build_qicsgp_ctx(1, out, out_size);
+}
+
+const char *network_apn(void) { return s_apn; }
 
 static int parse_reg_stat(const char *resp, const char *prefix) {
     const char *p = strstr(resp, prefix);

@@ -319,7 +319,8 @@ static DuPollResult_t poll_bluesky_nozzle(const char *hw_id, int label, bool rea
 }
 
 /* ── One Yenen nozzle ─────────────────────────────────────────────────── */
-/* `head` is the dispenser NUMBER (1..DU_YENEN_MAX), never the list position. */
+/* `head` is the dispenser NUMBER (1..DU_YENEN_MAX) from du_number_of(), never
+ * the loop index. */
 static DuPollResult_t poll_yenen_nozzle(const char *hw_id, int head, int side, int label, char *payload)
 {
     static YenenNozzle_t ynz;
@@ -397,10 +398,11 @@ static void du_task_run(void *arg)
         bool any_yenen = false;                 /* decides the round pacing below */
 
         for (int i = 0; i < n_du; i++) {
-            /* THE dispenser number: its suffix, else its position. This is the
+            /* THE dispenser number, from du_number_of() (nvs_config.c) — the
+             * product's one rule for which pump a list entry is. It is the
              * address on the bus and the base of the nozzle labels — never the
              * loop index. nvs_config_load() guarantees it is valid and unique
-             * for every entry inside du_count, so the fallback is a belt. */
+             * for every entry inside du_count, so the check is a belt. */
             int n = du_number_of(&g_cfg, i);
             if (n < 1 || n > DU_MAX_DISPENSERS) {
                 ESP_LOGE(TAG, "DU entry %d resolves to no dispenser number — skipped", i + 1);

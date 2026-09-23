@@ -68,6 +68,16 @@ jobs:
             exit 1
           fi
 
+      # A bench flag left on must never reach a release: GPS_TEST_COLD_START 1
+      # wipes the GNSS assistance data at every boot.
+      - name: No bench flags
+        shell: bash
+        run: |
+          if grep -Eq '#define\s+GPS_TEST_COLD_START\s+1\b' src/config.h; then
+            echo "::error::GPS_TEST_COLD_START is 1 in src/config.h - bench-only, set it to 0"
+            exit 1
+          fi
+
       # A release must not be cut from a tree that fails its own tests. This is
       # the same suite ci.yml runs; repeated here because a tag can be pushed to
       # any commit, including one CI never saw. runall.sh is plain gcc+python3.

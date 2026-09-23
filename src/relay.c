@@ -261,11 +261,9 @@ void relay_init(void)
      * state and (for us) to confirm the UART0 link is alive BOTH ways. Relay
      * commands (RL1ON/RL1OFF) may not ack, so this is the only positive proof
      * the MS51 is actually reachable — watch this line in the boot log. */
-    if (nuvoton_txn("RSTDATA", 1500))
+    const bool rst_replied = nuvoton_txn("RSTDATA", 1500);
+    if (rst_replied)
         ESP_LOGI(TAG, "MS51 link OK (RSTDATA replied)");
-    else
-        ESP_LOGW(TAG, "MS51 link: NO reply to RSTDATA — check UART0 wiring "
-                      "(GPIO43 TXD0->MS51 RX, GPIO44 RXD0<-MS51 TX) and MS51 power");
 
     /* Boot force-lock — the single most important command. Retried, run
      * synchronously in the caller's (main) task where blocking is fine. */
@@ -278,6 +276,22 @@ void relay_init(void)
     if (!replied)
         ESP_LOGW(TAG, "Boot RL1OFF got no MS51 reply "
                       "(expected if MS51 does not ack relay cmds — verify on bench)");
+
+    /* Fallback link probe, run only AFTER the force-lock so it never delays
+     * the RL1OFF. Some MS51 builds answer the DI query but not RSTDATA (the
+     * office board, 2026-09), and the probe above then reported a dead link
+     * that di_task was using fine. GETDATA goes out here with the same CRLF
+     * framing as RL1ON/RL1OFF, whereas di.c sends "GETDATA\n" — so a reply
+     * also proves the MS51 accepts the line ending the lock commands use. */
+    if (!rst_replied) {
+        if (nuvoton_txn("GETDATA", NUVOTON_TIMEOUT_MS))
+            ESP_LOGI(TAG, "MS51 link OK (GETDATA replied; this MS51 does not answer RSTDATA)");
+        else
+            ESP_LOGW(TAG, "MS51 link: NO reply to RSTDATA or GETDATA — check UART0 wiring "
+                          "(GPIO43 TXD0->MS51 RX, GPIO44 RXD0<-MS51 TX) and MS51 power. "
+                          "If DI still reads, the MS51 is rejecting the CRLF line ending "
+                          "and the lock commands are not reaching it");
+    }
 
     s_boot_was_safety_restart = (s_safety_restart_marker == SAFETY_RESTART_MAGIC);
     s_safety_restart_marker   = 0;

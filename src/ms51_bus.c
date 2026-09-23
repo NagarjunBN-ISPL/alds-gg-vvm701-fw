@@ -26,8 +26,11 @@ void ms51_bus_init(void)
     /* Not ESP_ERROR_CHECK: a driver already installed by an earlier caller is
      * the normal path here, not a fault. Any other error is logged and left
      * non-fatal — losing the MS51 link must degrade DI and the lock, never
-     * panic a gateway whose dispenser polling is otherwise fine. */
-    esp_err_t err = uart_driver_install(NUVOTON_UART, NUVOTON_BUF, NUVOTON_BUF, 0, NULL, 0);
+     * panic a gateway whose dispenser polling is otherwise fine.
+     * ESP_INTR_FLAG_IRAM matches CONFIG_UART_ISR_IN_IRAM=y (sdkconfig.defaults);
+     * with 0 here IDF set the flag itself and logged that on every boot. */
+    esp_err_t err = uart_driver_install(NUVOTON_UART, NUVOTON_BUF, NUVOTON_BUF, 0, NULL,
+                                        ESP_INTR_FLAG_IRAM);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
         ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(err));
 

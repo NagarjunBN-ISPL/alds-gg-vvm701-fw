@@ -12,7 +12,7 @@
 #include "esp_timer.h"
 
 #define TOPIC_MAX 200
-static const char *TAG = "main";
+static const char *TAG __attribute__((unused)) = "main";
 
 extern DeviceConfig g_cfg;
 extern char g_hw_du[DU_MAX_DISPENSERS][24];
