@@ -62,8 +62,9 @@ gcc $CFLAGS $SAN -include pathmap.h -c "$SRC/store.c" -o store_host.o  || rc=1
 gcc $CFLAGS $SAN test_store_fuzz.c simfs.c store_host.o     -o tst || rc=1
 gcc $CFLAGS $SAN test_json_fuzz.c                           -o tj  || rc=1
 gcc $CFLAGS $SAN test_gps.c -lm                             -o tgps || rc=1  # AT+QGPSLOC parser + payload (bwsr's suite)
+gcc $CFLAGS $SAN test_kfactor.c "$SRC/dispenser.c"            -o tkf || rc=1   # k-factor cache vs a simulated pump
 
-for f in t tm td ty tg tn tp tl tfz tst tj tgps; do
+for f in t tm td ty tg tn tp tl tfz tst tj tgps tkf; do
     out=$(./$f 2>/dev/null)
     echo "$f: $(echo "$out" | tail -1)"
     echo "$out" | grep -q "0 failures" || rc=1

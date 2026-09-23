@@ -39,7 +39,9 @@ void du_rs485_set_bluesky_mode(void);   /* 8E1 9600 */
  * (every KFACTOR_POLL_INTERVAL_S — the caller gates this). When false, or when
  * a due read fails all its retries, the last successfully-read k-factor for
  * this address is carried forward into out->kfact so every published message
- * still carries a stable value without spending bus time re-reading it. The
+ * still carries a stable value without spending bus time re-reading it. A
+ * passthrough k-factor write refreshes that value from its read-back; if the
+ * read-back fails, the next round reads the k-factor even when not due. The
  * totalizer is always read (with retries); RFID is never read. */
 void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *out, bool read_kfactor);
 

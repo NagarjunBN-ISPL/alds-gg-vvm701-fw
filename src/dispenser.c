@@ -177,6 +177,35 @@ static int du_read_field(uint8_t addr, uint8_t cmd_byte, uint8_t *buf,
     return 0;
 }
 
+/* ── K-factor cache ───────────────────────────────────────────────────────
+ * The last k-factor known to be in each pump, indexed by the 1-based nozzle
+ * address (1..DU_MAX_DISPENSERS*2; slot 0 unused). Filled by a due poll-round
+ * read AND by the read-back after a passthrough k-factor write, so a
+ * recalibration shows in the next nozzle message instead of up to
+ * KFACTOR_POLL_INTERVAL_S later. RAM only: empty after a reboot, and the
+ * first round reads it.
+ *
+ * s_kf_stale: a k-factor write was put on the bus and its read-back has not
+ * confirmed the new value (no reply, or the read-back failed). The pump may
+ * hold the new value while the cache holds the old one, so every round reads
+ * the k-factor, due or not, until a read succeeds.
+ *
+ * Both callers — du_task's poll round and the main task's passthrough — run
+ * under the RS485 bus lock, which serialises every access to these arrays. */
+#define KF_SLOTS (DU_MAX_DISPENSERS * 2 + 1)
+static uint8_t s_kf_cache[KF_SLOTS][DU_RESP_MAX];
+static int     s_kf_cache_len[KF_SLOTS];
+static bool    s_kf_stale[KF_SLOTS];
+
+static bool kf_addr_ok(uint8_t addr) { return addr >= 1 && addr < KF_SLOTS; }
+
+static void kf_cache_put(uint8_t addr, const uint8_t *kf, int len) {
+    if (!kf_addr_ok(addr) || len <= 0 || len > DU_RESP_MAX) return;
+    memcpy(s_kf_cache[addr], kf, (size_t)len);
+    s_kf_cache_len[addr] = len;
+    s_kf_stale[addr]     = false;
+}
+
 /* ── BlueSky polling ──────────────────────────────────────────────────── */
 void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz, bool read_kfactor) {
     memset(nz, 0, sizeof(*nz));
@@ -251,34 +280,31 @@ void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz, bool read_kfactor) {
     vTaskDelay(pdMS_TO_TICKS(30));
 
     /* ── K-Factor: read only when due, carried forward otherwise ───────────
-     * Per-address cache of the last successfully-read k-factor, indexed by the
-     * 1-based nozzle address (1..DU_MAX_DISPENSERS*2; slot 0 unused). On a
-     * non-due round — or a due round whose retries all fail — the last good
-     * value is copied back into nz->kfact, so every published message carries
-     * a stable k-factor without spending bus time re-reading a value that
-     * changes only on recalibration. Zero-length until the first good read,
-     * which the payload builder renders as "404". */
-    static uint8_t kf_cache[DU_MAX_DISPENSERS * 2 + 1][DU_RESP_MAX];
-    static int     kf_cache_len[DU_MAX_DISPENSERS * 2 + 1];
-    bool addr_cacheable = (addr >= 1 && addr <= DU_MAX_DISPENSERS * 2);
+     * On a non-due round — or a due round whose retries all fail — the cached
+     * value (see s_kf_cache) is copied into nz->kfact, so every published
+     * message carries a stable k-factor without spending bus time re-reading a
+     * value that changes only on recalibration. Zero-length until the first
+     * good read, which the payload builder renders as "404". A k-factor write
+     * whose effect is unconfirmed (s_kf_stale) makes the read due every round
+     * until one succeeds. */
+    bool addr_cacheable = kf_addr_ok(addr);
+    bool stale          = addr_cacheable && s_kf_stale[addr];
 
-    if (read_kfactor) {
+    if (read_kfactor || stale) {
         nz->kfact_len = du_read_field(addr, BS_CMD_KFACT, nz->kfact, DU_KFACTOR_RETRIES, "kfact");
         if (nz->kfact_len > 0) {
-            if (addr_cacheable) {
-                memcpy(kf_cache[addr], nz->kfact, nz->kfact_len);
-                kf_cache_len[addr] = nz->kfact_len;
-            }
-        } else if (addr_cacheable && kf_cache_len[addr] > 0) {
+            kf_cache_put(addr, nz->kfact, nz->kfact_len);
+        } else if (addr_cacheable && s_kf_cache_len[addr] > 0) {
             /* Due, but every attempt failed — keep the last good value rather
              * than regress a known k-factor to 404 on a transient miss. */
-            memcpy(nz->kfact, kf_cache[addr], kf_cache_len[addr]);
-            nz->kfact_len = kf_cache_len[addr];
-            ESP_LOGW(TAG, "BlueSky nz%u kfact: read failed — carrying last good value forward", addr);
+            memcpy(nz->kfact, s_kf_cache[addr], (size_t)s_kf_cache_len[addr]);
+            nz->kfact_len = s_kf_cache_len[addr];
+            ESP_LOGW(TAG, "BlueSky nz%u kfact: read failed — carrying last good value forward%s",
+                     addr, stale ? " (a k-factor write is unconfirmed; re-reading next round)" : "");
         }
-    } else if (addr_cacheable && kf_cache_len[addr] > 0) {
-        memcpy(nz->kfact, kf_cache[addr], kf_cache_len[addr]);
-        nz->kfact_len = kf_cache_len[addr];
+    } else if (addr_cacheable && s_kf_cache_len[addr] > 0) {
+        memcpy(nz->kfact, s_kf_cache[addr], (size_t)s_kf_cache_len[addr]);
+        nz->kfact_len = s_kf_cache_len[addr];
     }
     /* RFID intentionally not read. */
 }
@@ -467,6 +493,12 @@ bool du_exec_bluesky_passthrough(const char *cmd_hex, uint8_t addr_a, uint8_t ad
     }
     vTaskDelay(pdMS_TO_TICKS(30));
 
+    /* A k-factor WRITE is about to reach the pump. From here until a read-back
+     * confirms the new value, the cached one may be out of date — including when
+     * the pump never answers, since it may have applied the write regardless. */
+    bool kf_write = (cmd_len > 5 && readback_cmd == BS_CMD_KFACT);
+    if (kf_write && kf_addr_ok(addr)) s_kf_stale[addr] = true;
+
     /* Send, with one retry on silence or a reply that is not this nozzle's. */
     uint8_t resp[DU_RESP_MAX];
     int rlen = 0;
@@ -492,6 +524,14 @@ bool du_exec_bluesky_passthrough(const char *cmd_hex, uint8_t addr_a, uint8_t ad
         int rb_len = du_read_field(addr, readback_cmd, rb, 2, "read-back");
         if (rb_len > 0) du_bytes_to_hex(rb, rb_len, readback_buf, readback_size);
         else ESP_LOGW(TAG, "passthrough: nozzle %u read-back failed — the write's effect is unverified", addr);
+        /* The read-back is the same 0xE2 read the poll round makes, so it goes
+         * straight into the cache: the next nozzle message carries the new
+         * k-factor. A failed read-back leaves the entry stale (set above), and
+         * the next round re-reads it. */
+        if (kf_write && rb_len > 0) {
+            kf_cache_put(addr, rb, rb_len);
+            ESP_LOGI(TAG, "BlueSky nz%u kfact: cache updated from the write's read-back", addr);
+        }
     }
     return true;
 }
