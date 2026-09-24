@@ -166,10 +166,10 @@ static void du_emit(const char *payload)
  * added for the absent-nozzle backoff below and answer a third, separate
  * question — "did we learn anything about this nozzle's existence this round?"
  * — which neither of the others can express: a bus-lock timeout is not evidence
- * of absence, and a busy nozzle is unhealthy but very much present. */
+ * of absence, and a busy nozzle is healthy and very much present. */
 typedef struct {
     bool built;      /* payload buffer now holds a fresh payload for this nozzle */
-    bool healthy;    /* nozzle answered and was readable (only valid if built)   */
+    bool healthy;    /* nozzle answered — busy counts (only valid if built)      */
     bool polled;     /* nozzle was actually interrogated (false = bus never won) */
     bool responded;  /* nozzle answered AT ALL — busy counts (only if polled)    */
 } DuPollResult_t;
@@ -308,13 +308,16 @@ static DuPollResult_t poll_bluesky_nozzle(const char *hw_id, int label, bool rea
     rs485_bus_unlock();
 
     /* stamped at the read, not at publish. `healthy` stays truthful even when
-     * the reading is withheld — the pump answered; only the clock is missing. */
+     * the reading is withheld — the pump answered; only the clock is missing.
+     * A nozzle mid-sale (busy) is healthy: it answered, it is just not read
+     * until the sale ends. Only a nozzle that does not answer clears du_ok —
+     * otherwise diagnostics reported a dispenser fault during every sale. */
     if (!du_ts_now(ts, sizeof(ts), label))
-        return (DuPollResult_t){ .built = false, .healthy = nz.present && !nz.busy,
+        return (DuPollResult_t){ .built = false, .healthy = nz.present,
                                  .polled = true, .responded = nz.present };
 
     du_build_nozzle_payload(&nz, label, hw_id, ts, payload, DU_PAYLOAD_MAX);
-    return (DuPollResult_t){ .built = true, .healthy = nz.present && !nz.busy,
+    return (DuPollResult_t){ .built = true, .healthy = nz.present,
                              .polled = true, .responded = nz.present };
 }
 

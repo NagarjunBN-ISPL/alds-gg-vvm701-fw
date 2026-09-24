@@ -43,7 +43,7 @@
  * fleet/ggy), the FOTA JSON "target" belt (gg vs ggy), and the distinct
  * PRODUCT_ID above (a GG<->GGY swap by FOTA wipes equipment config and comes up
  * unconfigured, which is correct — the two address dispensers differently). */
-#define MQTT_TOPIC_BASE     "fuelsense"
+#define MQTT_TOPIC_BASE     "gogas"
 /* Start-to-start pacing of one dispenser poll round on du_task. Yenen nozzles
  * are read every round (10 s); BlueSky nozzles every SECOND round (20 s), see
  * du_task.c — a BlueSky nozzle costs up to 7 RS485 reads and the site mix
@@ -77,10 +77,10 @@
  * they are shared with alds-ggy (same broker, user and base topic). Every
  * unit running this build is FORCED onto these values (see the credential
  * guard below), so a dev image reaching a production site re-points it. */
-#define MQTT_HOST   "dev-fuelsense.iotronsys.com"
+#define MQTT_HOST   "mqtt.iotronsys.com"
 #define MQTT_PORT   8777
-#define MQTT_USER   "iotrondev"
-#define MQTT_PASS   "iotrondev@1234"
+#define MQTT_USER   "gogas"
+#define MQTT_PASS   "ZA6WwzNdc0"
 #define MQTT_QOS    1
 /* Use TLS by default. Like the server address, this is baked in —
  * changing it is a credential change like any other. */
