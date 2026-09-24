@@ -264,7 +264,15 @@ static void drop_oldest_until_fits(void) {
     static char line[STORE_REC_MAX + 2];
     long dropped = 0;
     const long target = (long)STORE_MAX_BYTES - (long)STORE_TRIM_BYTES;
-    while (log_size() - s_head > target) {
+    /* Read the size ONCE. This runs under s_lock and nothing here writes the log
+     * (f is read-only; only s_head moves), so the size is invariant for the whole
+     * trim. Re-reading it per iteration was a stat() (fopen/fseek/ftell) against
+     * littlefs on EVERY record dropped — a full trim frees STORE_TRIM_BYTES
+     * (~128 KB ≈ hundreds of records), i.e. hundreds of littlefs metadata reads
+     * while holding the lock, stalling du_task's spill exactly during the long
+     * outage that triggered the trim. Ported from cng-cpil. */
+    const long size = log_size();
+    while (size - s_head > target) {
         if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         if (!fgets(line, sizeof(line), f)) break;
         s_head = ftell(f);
@@ -350,6 +358,57 @@ void store_disown(void) {
                       "discard whatever it finds here");
 }
 
+/* ── Repair a record torn in half by a power cut ───────────────────────────
+ * A power glitch mid-`fprintf("%s\n", payload)` — a compressor kick or line sag
+ * in the panel room — can commit a record's bytes WITHOUT the trailing newline.
+ * On the next boot the following append lands directly on that stump, so fgets()
+ * reads the two glued together as one line, which payload_is_one_json_object()
+ * then rejects at replay — losing the torn record AND the good record that merged
+ * with it. Shed the stump here, at mount, before anything can append behind it:
+ * the cost is only the one record the power cut had already destroyed.
+ *
+ * Cheap on every clean boot — one seek to the last byte. The scan + truncate run
+ * only after an unclean shutdown left the log without a final newline.
+ * truncate() (not the compactor's read-copy-rename): one metadata op, no second
+ * copy, so it cannot fail on the near-full partition a long outage leaves, and it
+ * does not block boot rewriting a large log. The cursor is untouched and stays
+ * valid — only bytes AFTER the last newline go, and s_head can never point past
+ * one. Ported from cng-cpil. */
+static void heal_torn_tail(void) {
+    long size = log_size();
+    if (size <= 0) return;
+
+    FILE *f = fopen(STORE_LOG, "rb");
+    if (!f) return;
+    if (fseek(f, size - 1, SEEK_SET) != 0) { fclose(f); return; }
+    int last = fgetc(f);
+    fclose(f);
+    if (last == '\n') return;              /* ends on a record boundary — nothing to do */
+
+    /* Walk to the offset just past the last complete (newline-terminated) record. */
+    long keep = 0;
+    f = fopen(STORE_LOG, "rb");
+    if (!f) return;
+    static char line[STORE_REC_MAX + 2];
+    while (fgets(line, sizeof(line), f)) {
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+        size_t got = strlen(line);
+        if (got > 0 && line[got - 1] == '\n') keep = ftell(f);
+    }
+    fclose(f);
+
+    if (keep <= 0) {
+        /* The whole log is one unterminated stump — nothing complete to keep. */
+        ESP_LOGW(TAG, "torn queue tail: no complete record — resetting (%ld bytes)", size);
+        queue_reset();
+        return;
+    }
+    if (truncate(STORE_LOG, (off_t)keep) == 0)
+        ESP_LOGW(TAG, "healed torn queue tail — dropped %ld partial byte(s)", size - keep);
+    /* else: stump stays; nothing corrupted, just unrepaired — the replay guard
+     * (payload_is_one_json_object) still drops the merged line at send time. */
+}
+
 bool store_init(void) {
     esp_vfs_littlefs_conf_t conf = {
         .base_path              = STORE_BASE,
@@ -396,6 +455,10 @@ bool store_init(void) {
      * (Found and fixed in cng-cpil's port of this file, 2026-09-01.) */
     if (s_head > 0 && s_head >= size) queue_reset();   /* fully drained last run, or torn reset */
 
+    /* Repair a record torn in half by a power cut, BEFORE anything appends behind
+     * it (and after the drained-reset above, so a healthy empty log is a no-op). */
+    heal_torn_tail();
+
     claim_the_queue();                  /* before s_ready: nothing else can race it */
     s_ready = true;
     s_pending = store_count();          /* seed the O(1) counter from the real scan */
@@ -424,11 +487,25 @@ bool store_enqueue(const char *payload) {
 
     if (!store_lock()) { ESP_LOGW(TAG, "enqueue: lock timeout — record dropped"); return false; }
 
-    /* s_head > 0 is part of the condition, not just an optimisation: with
-     * nothing consumed there is nothing to reclaim, and calling compact() to
-     * find that out is how the queue-wipe bug documented above was reached. */
-    if (s_head > 0 && log_size() > STORE_COMPACT_AT) compact();
-    if (log_size() - s_head > STORE_MAX_BYTES) drop_oldest_until_fits();
+    /* Reclaim consumed space, but only when there is a WORTHWHILE amount to
+     * reclaim. `s_head > 0` alone (and compact() early-returns on s_head <= 0, so
+     * the old queue-wipe hazard is already handled there) would rewrite the
+     * ENTIRE log to reclaim a single popped record whenever production and
+     * consumption overlap — i.e. for the whole of a recovering drain — turning
+     * every ~250-byte record into a full-file rewrite. That is thousands of times
+     * the write volume the data justifies, and NOR flash rated at 100k erase
+     * cycles will not survive it across an 8-year deployment. Requiring a quarter
+     * of STORE_COMPACT_AT (~64 KB) to have been consumed bounds it to one rewrite
+     * per ~64 KB reclaimed; the dead weight this leaves is capped by the
+     * STORE_MAX_BYTES trim below. Derived from STORE_COMPACT_AT so the two cannot
+     * drift. Ported from cng-cpil. */
+    long size = log_size();
+    const long compact_min_reclaim = (STORE_COMPACT_AT / 4 > 0) ? (long)(STORE_COMPACT_AT / 4) : 1;
+    if (s_head >= compact_min_reclaim && size > STORE_COMPACT_AT) {
+        compact();
+        size = log_size();          /* the log was rewritten — the old size is stale */
+    }
+    if (size - s_head > STORE_MAX_BYTES) drop_oldest_until_fits();
 
     FILE *f = fopen(STORE_LOG, "a");
     if (!f) { store_unlock(); ESP_LOGE(TAG, "append failed to open"); return false; }
