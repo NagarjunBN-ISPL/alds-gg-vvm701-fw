@@ -98,8 +98,26 @@ void modem_flush(void) {
     }
     if (total > 0) {
         acc[total] = '\0';
-        if (strstr(acc, "+QMTRECV:")) s_flush_rescue(acc);
+        /* +QMTSTAT (link-lost) as well as +QMTRECV: parse_qmtrecv() runs
+         * check_qmtstat() first, so a lone +QMTSTAT in the pre-command drain must
+         * reach it too or a silent link drop between commands goes unnoticed. */
+        if (strstr(acc, "+QMTRECV:") || strstr(acc, "+QMTSTAT:")) s_flush_rescue(acc);
     }
+}
+
+/* Rescue any MQTT URC (+QMTRECV inbound message, +QMTSTAT link-lost) that
+ * interleaved into a command's response buffer. Without this, a URC arriving on
+ * the wire while an UNRELATED AT command (diagnostics CSQ/CBC/COPS, time sync,
+ * GNSS) reads its reply is captured into that command's buffer and silently
+ * discarded — losing an inbound setconfig/lock/rsp/FOTA command (Quectel
+ * auto-ACKs a QoS-1 message to the broker on +QMTRECV, so it is NOT redelivered)
+ * or the one-shot link-down notification (which stalls reconnect until the slow
+ * publish-fail streak trips). parse_qmtrecv() acts only on a COMPLETE URC and is
+ * already proven safe on an arbitrary buffer (modem_flush feeds it the same
+ * way), so this is purely additive — it never changes the command's own result. */
+static void modem_rescue_urcs(const char *buf) {
+    if (s_flush_rescue && (strstr(buf, "+QMTRECV:") || strstr(buf, "+QMTSTAT:")))
+        s_flush_rescue(buf);
 }
 
 /* QMTCONN is the only AT command in this codebase carrying a plaintext
@@ -198,6 +216,7 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
                     strncpy(resp, buf, resp_size - 1);
                     resp[resp_size - 1] = '\0';
                 }
+                modem_rescue_urcs(buf);   /* a URC may have interleaved into this reply */
                 return true;
             }
             if (strstr(buf, "\r\nERROR") || strstr(buf, "+CME ERROR")) {
@@ -213,6 +232,7 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
                     strncpy(resp, buf, resp_size - 1);
                     resp[resp_size - 1] = '\0';
                 }
+                modem_rescue_urcs(buf);   /* a URC may have interleaved into this reply */
                 return false;
             }
         }
@@ -222,6 +242,7 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
         strncpy(resp, buf, resp_size - 1);
         resp[resp_size - 1] = '\0';
     }
+    modem_rescue_urcs(buf);   /* a URC may have interleaved before the timeout */
     return false;
 }
 
@@ -266,6 +287,7 @@ bool modem_read_until(const char *expect, int timeout_ms,
                     strncpy(resp, buf, resp_size - 1);
                     resp[resp_size - 1] = '\0';
                 }
+                modem_rescue_urcs(buf);   /* a URC may have interleaved into this read */
                 return true;
             }
         }
@@ -274,6 +296,7 @@ bool modem_read_until(const char *expect, int timeout_ms,
         strncpy(resp, buf, resp_size - 1);
         resp[resp_size - 1] = '\0';
     }
+    modem_rescue_urcs(buf);   /* a URC may have interleaved before the timeout */
     return false;
 }
 

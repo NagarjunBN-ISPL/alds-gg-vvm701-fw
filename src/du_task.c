@@ -224,8 +224,8 @@ static void du_absent_update(int label, bool responded)
 }
 
 /* Which nozzles are currently demoted to probe-only, as a bitmask over global
- * labels (bit 0 = label 1). DU_LABEL_MAX is 22, so a uint32_t covers every
- * nozzle a fully-loaded gateway can have.
+ * labels (bit 0 = label 1). DU_LABEL_MAX is 12 (DU_MAX_DISPENSERS × 2), so a
+ * uint32_t covers every nozzle a fully-loaded gateway can have.
  *
  * This is the difference between "du_ok:false, drive out and check all ten
  * nozzles" and "nozzle 7 has been silent". The backoff logic already knows

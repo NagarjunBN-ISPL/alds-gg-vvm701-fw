@@ -47,9 +47,25 @@ static int parse_reg_stat(const char *resp, const char *prefix) {
     if (!p) return -1;
     p += strlen(prefix);
     while (*p == ' ') p++;
-    const char *comma = strchr(p, ',');
-    if (comma) return atoi(comma + 1);
-    return atoi(p);
+    if (*p < '0' || *p > '9') return -1;
+    /* Two arities share this prefix and the old "field after the first comma"
+     * rule silently misread one of them:
+     *   query  "+CEREG: <n>,<stat>[,\"tac\",\"ci\",<AcT>]"   stat is field 2
+     *   URC    "+CEREG: <stat>[,\"tac\",\"ci\",<AcT>]"        stat is field 1
+     * The AT+CEREG=2 mode wait_registered() enables makes the modem emit the
+     * URC form on any registration change, and if one interleaves into a query
+     * reply the old code returned atoi("\"tac\"…") == 0 — a spurious "not
+     * registered" that drives a needless L2 network rebuild. Disambiguate by
+     * what follows the first field: a DIGIT means the query form (stat is next),
+     * a quote or end-of-field means the first field was already stat. */
+    int f1 = atoi(p);
+    while (*p >= '0' && *p <= '9') p++;
+    while (*p == ' ') p++;
+    if (*p != ',') return f1;                 /* single field: URC stat, or bare */
+    p++;
+    while (*p == ' ') p++;
+    if (*p >= '0' && *p <= '9') return atoi(p);   /* query form: stat is field 2 */
+    return f1;                                 /* URC form: quoted tac follows stat */
 }
 
 static bool wait_registered(int timeout_ms) {

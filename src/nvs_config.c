@@ -339,11 +339,17 @@ bool nvs_config_load(DeviceConfig *cfg) {
     nvs_close(h);
 
     /* Clamp all fields to valid ranges — guards against NVS corruption.
-     * Ztech (normally slaves 4,5) and Pantech (normally slaves 6,7) are
-     * capped independently at RADAR_MAX here, but the ranges are adjacent,
-     * not spaced apart — a stale/corrupt ztech_count >= 3 combined with any
-     * pantech_count > 0 would push Ztech's range onto Pantech tank 1's fixed
-     * slave (6). Checked explicitly below rather than assumed. */
+     * Ztech and Pantech counts are capped independently at RADAR_MAX here. Note
+     * their auto slave ranges are ADJACENT, not spaced apart: a ztech_count of 3
+     * with any pantech_count > 0 pushes an auto Ztech slave onto Pantech tank 1.
+     * Cross-unit Modbus-address and HW_ID-suffix collisions (radar↔radar,
+     * radar↔genset) are rejected on the way IN by validate_bus_addresses() /
+     * validate_suffixes() (main.c), so a blob that was ever saved by setconfig
+     * cannot hold one, and NVS's per-entry CRC guards that blob against silent
+     * corruption. This load path re-derives only the DISPENSER plan below (its
+     * numbering doubles as bus addressing); it does NOT re-run the radar/genset
+     * collision check. If a future path could persist an unvalidated plan, add
+     * that re-check here rather than trusting the way-in guard alone. */
     /* Both run BEFORE any clamp below reads a bool or a string. */
     normalize_bools(cfg);
     terminate_strings(cfg);

@@ -92,11 +92,18 @@ static void head_load(void) {
     fclose(f);
 }
 
-static void head_save(void) {
+static bool head_save(void) {
     FILE *f = fopen(STORE_HEAD, "w");
-    if (!f) { ESP_LOGW(TAG, "head write failed"); return; }
-    fprintf(f, "%ld", s_head);
-    fclose(f);
+    if (!f) { ESP_LOGW(TAG, "head write failed"); return false; }
+    int w = fprintf(f, "%ld", s_head);
+    /* fclose flushes stdio's buffer to littlefs — the actual flash write can fail
+     * HERE (ENOSPC/bad block) even though fprintf() succeeded into the in-memory
+     * buffer, the same hazard store_enqueue() guards. Report it so compact() can
+     * refuse to rename the rebased log over the old one with a cursor that never
+     * reached flash (which would skip records on the next boot). */
+    int c = fclose(f);
+    if (w < 0 || c != 0) { ESP_LOGW(TAG, "head write/flush failed"); return false; }
+    return true;
 }
 
 static long log_size(void) {
@@ -154,7 +161,7 @@ static bool compact(void) {
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         /* Feed the watchdog inside the copy loop. Compaction rewrites the whole
-         * live log — up to STORE_MAX_BYTES (1 MB) — and littlefs erase/write is
+         * live log — up to STORE_MAX_BYTES (768 KB) — and littlefs erase/write is
          * slow enough that a full rewrite can run for tens of seconds. It is
          * called from du_task, which IS watchdog-registered, so without this a
          * large compaction could trip the 120 s task WDT and reboot a gateway
@@ -167,7 +174,18 @@ static bool compact(void) {
         }
     }
     fclose(in);
-    fclose(out);
+    /* stdio buffers the tail until close, so the ACTUAL littlefs write of the
+     * final block can fail HERE (ENOSPC / bad block) even though every fwrite
+     * above succeeded — the same hazard store_enqueue() already guards at its
+     * own fclose. Installing this truncated temp over the intact log would
+     * silently drop the NEWEST queued records (the tail that never flushed) and
+     * reset the cursor to 0. Keep the old log untouched instead; s_head has not
+     * moved yet, so state stays consistent and the next enqueue retries. */
+    if (fclose(out) != 0) {
+        unlink(STORE_TMP);
+        ESP_LOGE(TAG, "compact: temp flush/close failed — old log kept");
+        return false;
+    }
 
     /* ── Power-fail ordering — the sequence here is load-bearing ───────────
      * Two files change (STORE_LOG, STORE_HEAD) and no reboot can be atomic
@@ -194,8 +212,21 @@ static bool compact(void) {
      *                      compacted one, never absent. Offset is already 0,
      *                      which is correct for the compacted file. SAFE.
      * There is no window in which a record can be skipped. */
+    long old_head = s_head;
     s_head = 0;
-    head_save();                       /* step 1 — must precede the rename */
+    /* head_save() BEFORE the rename so a power cut between them replays the old
+     * log from 0 (harmless duplicates). If the cursor cannot even be persisted,
+     * do NOT rename: installing the rebased (offset-0) log while the on-disk
+     * head still holds the old offset is the one ordering that SKIPS records on
+     * reboot — the exact failure this block's ordering exists to prevent. Keep
+     * the old log and restore the in-RAM cursor so this session keeps reading
+     * from where it was. */
+    if (!head_save()) {                /* step 1 — must precede the rename */
+        s_head = old_head;
+        unlink(STORE_TMP);
+        ESP_LOGE(TAG, "compact: head persist failed — old log kept, cursor unchanged");
+        return false;
+    }
     if (rename(STORE_TMP, STORE_LOG) != 0) {   /* step 2 — atomic replace, no unlink */
         /* Old log still intact; offset 0 just means the next read replays it
          * from the start (harmless duplicates). Leave TMP for the next
@@ -421,7 +452,15 @@ bool store_enqueue(const char *payload) {
 
 bool store_has_records(void) {
     if (!s_ready) return false;
-    if (!store_lock()) return false;
+    /* On a lock timeout answer "maybe" (true), never "no". The main task uses
+     * this to decide whether the flash backlog must drain BEFORE any live RAM
+     * record; answering false under contention (e.g. du_task mid-compaction
+     * holding the lock for the documented tens of seconds) would let a newer RAM
+     * record publish ahead of older flash records — inverting the FIFO order the
+     * cloud differences totalizers on. du_emit()'s spill guard treats true the
+     * same safe way (route the new record to flash). A spurious true only defers
+     * one live-drain cycle. */
+    if (!store_lock()) return true;
     bool any = (log_size() > s_head);
     store_unlock();
     return any;
