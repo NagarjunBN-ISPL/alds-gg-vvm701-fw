@@ -349,6 +349,12 @@
  * re-sent by the operator, who sees the ack. setconfig is exempt: its own
  * byte-identical guard handles the retained case without losing a real push. */
 #define CMD_RETAIN_GRACE_MS  15000
+/* The panel lock keeps its OWN, shorter grace to match cng-cpil's lock contract
+ * byte-for-byte (lock_cmd.h LOCK_RETAIN_GRACE_MS): a human pressing unlock and a
+ * broker re-delivering a retained one are told apart by the 5 s window, and the
+ * lock ack/refusal rides <base>/<imei>/lock/out, not <base>/data. The other
+ * one-shot commands (restart/factory_reset/FOTA) keep CMD_RETAIN_GRACE_MS. */
+#define LOCK_RETAIN_GRACE_MS  5000
 
 /* ── Connectivity recovery (layered escalation) ──────────────────────────── */
 #define MQTT_RECONNECT_RETRIES 5      /* L1: plain MQTT reconnect attempts   */

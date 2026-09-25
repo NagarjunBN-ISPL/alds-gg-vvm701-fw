@@ -58,8 +58,12 @@ static char t_update[TOPIC_MAX];
 static char t_fleet_update[TOPIC_MAX];
 static char t_setcfg[TOPIC_MAX];
 /* Panel-box lock command topic. Per-IMEI like setconfig/update — a lock
- * command must reach exactly one gateway, never the fleet. */
+ * command must reach exactly one gateway, never the fleet. The ack and every
+ * lock event ride t_lock_out (<base>/<imei>/lock/out), never <base>/data and
+ * never back onto the command topic (its "unlocked" text would re-trigger the
+ * parser) — the cng-cpil lock contract. */
 static char t_lock[TOPIC_MAX];
+static char t_lock_out[TOPIC_MAX];
 static char t_rsp_bs_in[DU_MAX_DISPENSERS][TOPIC_MAX], t_rsp_bs_out[DU_MAX_DISPENSERS][TOPIC_MAX];
 static char t_kf_bs_in[DU_MAX_DISPENSERS][TOPIC_MAX],  t_kf_bs_out[DU_MAX_DISPENSERS][TOPIC_MAX];
 /* Yenen gets the rsp passthrough only. There is no k-factor equivalent in the
@@ -271,6 +275,7 @@ static void build_topics(void) {
     snprintf(t_fleet_update,TOPIC_MAX, "%s/fleet/gg/update",  g_cfg.mqtt_base_topic);
     snprintf(t_setcfg,      TOPIC_MAX, "%s/%s/setconfig",  g_cfg.mqtt_base_topic, g_imei);
     snprintf(t_lock,        TOPIC_MAX, "%s/%s/lock",       g_cfg.mqtt_base_topic, g_imei);
+    snprintf(t_lock_out,    TOPIC_MAX, "%s/%s/lock/out",   g_cfg.mqtt_base_topic, g_imei);
     for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
         if (i < g_cfg.du_count) {
             if (g_cfg.du_make[i] == DU_MAKE_BLUESKY) {
@@ -1648,12 +1653,18 @@ static void handle_msg(const char *topic, const char *payload) {
         char msg[128];
         if (strstr(payload, "unlock")) {
             /* A retained unlock would open the panel box unattended on every
-             * reconnect. "lock" is safe to repeat and is not gated. */
-            if (cmd_in_retain_grace("unlock")) {
+             * reconnect. "lock" is safe to repeat and is not gated. The lock has
+             * its OWN LOCK_RETAIN_GRACE_MS (5 s) rather than the shared 15 s, to
+             * match cng-cpil's lock contract exactly. */
+            int64_t age_ms = (s_subscribed_at_us != 0)
+                             ? (esp_timer_get_time() - s_subscribed_at_us) / 1000
+                             : LOCK_RETAIN_GRACE_MS;
+            if (s_subscribed_at_us != 0 && age_ms < LOCK_RETAIN_GRACE_MS) {
+                ESP_LOGW(TAG, "unlock ignored — arrived %lld ms after subscribing, "
+                              "treated as a RETAINED message", (long long)age_ms);
                 snprintf(msg, sizeof(msg),
-                         "{\"HW_ID\":\"%s\",\"event\":\"lock_err\",\"reason\":\"unlock_ignored_retained\"}",
-                         g_imei);
-                mqtt_publish(t_data, msg);
+                         "{\"HW_ID\":\"%s\",\"event\":\"ignored_retained\"}", g_imei);
+                mqtt_publish(t_lock_out, msg);
                 return;
             }
             relay_unlock();
@@ -1666,10 +1677,10 @@ static void handle_msg(const char *topic, const char *payload) {
                      "{\"HW_ID\":\"%s\",\"event\":\"locked\"}", g_imei);
         } else {
             snprintf(msg, sizeof(msg),
-                     "{\"HW_ID\":\"%s\",\"event\":\"lock_err\",\"reason\":\"bad cmd\"}",
-                     g_imei);
+                     "{\"HW_ID\":\"%s\",\"event\":\"bad_command\"}", g_imei);
         }
-        mqtt_publish(t_data, msg);
+        /* /lock/out, NEVER the command topic or <base>/data — see t_lock_out. */
+        mqtt_publish(t_lock_out, msg);
         return;
     }
     for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
@@ -3388,11 +3399,10 @@ void app_main(void) {
      * it points at either a stalled relay task or an MS51 link problem, and
      * the panel may have stood unlocked for up to RELAY_UNLOCK_DEADMAN_MS. */
     if (relay_last_boot_was_safety_restart()) {
-        char lock_msg[160];
+        char lock_msg[128];
         snprintf(lock_msg, sizeof(lock_msg),
-                 "{\"HW_ID\":\"%s\",\"event\":\"relay_safety_restart\","
-                 "\"reason\":\"unlock_window_not_closed\"}", g_imei);
-        mqtt_publish(t_data, lock_msg);
+                 "{\"HW_ID\":\"%s\",\"event\":\"safety_restart\"}", g_imei);
+        mqtt_publish(t_lock_out, lock_msg);
         ESP_LOGE(TAG, "PREV BOOT: relay deadman fired — verify panel lock state");
     }
 

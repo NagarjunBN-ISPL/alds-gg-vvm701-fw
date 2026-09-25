@@ -28,8 +28,7 @@ documented in its own section:
   old-`TS` records afterwards. Section 5.
 - Also, each optional to consume: Yenen dispensers beside BlueSky (6.2), grouped
   diagnostics (7), the fleet-FOTA/lock/Yenen-price topics (3, 8.3), GPS
-  `hdop`/`nsat`/`spd` (6.6), compiled credentials overriding stored config (2),
-  and `rfid` kept but always `"404"`.
+  `hdop`/`nsat`/`spd` (6.6), compiled credentials overriding stored config (2), `rfid` always `"404"`.
 
 ## 2. Connection
 
@@ -61,6 +60,7 @@ IMEI plus a 2-digit suffix.
 | `<base>/<imei>/update` | cloud to device | FOTA for one gateway (URL string or JSON) |
 | `<base>/fleet/gg/update` | cloud to device | FOTA for every GG gateway on this base topic |
 | `<base>/<imei>/lock` | cloud to device | panel box lock: string containing `unlock` or `lock` |
+| `<base>/<imei>/lock/out` | device to cloud | lock ack/events (`unlocked`/`locked`/`ignored_retained`/`bad_command`/`safety_restart`) |
 | `<base>/setrsp/imei/<hw_id>/in` / `out` | both | Yenen price update and its ack (JSON) |
 | `<base>/rsp/imei/<hw_id>/in` / `out` | both | dispenser raw command passthrough (hex in, hex or `404` out) |
 | `<base>/kfactor/imei/<hw_id>/in` / `out` | both | BlueSky k-factor passthrough (hex in, hex or `404` out) |
@@ -257,8 +257,7 @@ All on `<base>/data`, bare IMEI unless noted, one-shot.
 | `{"status":"busy"}` | a second `rsp`/`kfactor` passthrough arrived while one was in flight; no `/out` reply follows |
 | `{"HW_ID":"<hw_id>","status":"rsp_rejected","reason":".."}` / `kfactor_rejected` | passthrough frame refused or unanswered, section 8.6 |
 | `{"HW_ID":"<hw_id>","status":"rsp_readback","data":".."}` / `kfactor_readback` | value read back after a passthrough write |
-| `{"event":"unlocked","window_ms":8000}`, `{"event":"locked"}`, `{"event":"lock_err","reason":".."}` | panel lock, section 8.4 |
-| `{"event":"relay_safety_restart","reason":"unlock_window_not_closed"}` | the lock did not re-close in time; device restarted to force it. Sent on the next boot |
+| lock events on `<base>/<imei>/lock/out` (not `<base>/data`): `unlocked` (+`window_ms`), `locked`, `ignored_retained`, `bad_command`, and `safety_restart` on the next boot if an unlock window never closed | panel lock, section 8.4 |
 
 `RSP_updated` / `RSP_update_failed` / `RSP_update_rejected` go to the
 `setrsp .../out` topic, not to `<base>/data` (section 8.5).
@@ -362,12 +361,13 @@ other product `unconfigured` with that product's compiled credentials.
 
 ### 8.4 Panel lock
 
-Publish a string containing `unlock` or `lock` to `<base>/<imei>/lock`,
-retain off. `unlock` opens the box for 8 s then re-locks itself (ack
-`{"event":"unlocked","window_ms":8000}`); `lock` closes it now (ack `locked`).
-An unlock within 15 s of subscribing is refused (`lock_err`,
-`unlock_ignored_retained`). The device cannot sense the bolt: `unlocked` means
-the command reached the relay. Every reboot re-locks.
+Publish a string with `unlock` or `lock` to `<base>/<imei>/lock`, retain off.
+Every ack/event replies on `<base>/<imei>/lock/out` (never `<base>/data` or the
+command topic): `unlock` opens the box 8 s then self-relocks
+(`{"event":"unlocked","window_ms":8000}`), `lock` closes it now (`locked`), a bad
+payload is `bad_command`, an unlock within 5 s of subscribing is `ignored_retained`,
+and a `safety_restart` next boot means an unlock window never closed (deadman
+forced a restart). `unlocked` = command reached the relay (bolt not sensed); every reboot re-locks.
 
 ### 8.5 Yenen price update
 
