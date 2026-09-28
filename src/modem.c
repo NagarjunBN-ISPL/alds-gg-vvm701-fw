@@ -334,7 +334,17 @@ bool modem_upload_file(const char *filename, const char *data, size_t len) {
         ESP_LOGE(TAG, "QFUPL: no confirmation for %s", filename);
         return false;
     }
-    ESP_LOGI(TAG, "QFUPL: uploaded %s (%d bytes)", filename, (int)len);
+    /* <size> is what the modem actually stored. The CA bundle grew to ~6.5 KB
+     * on 2026-09-28 (Root YE/YR appended last), and a cut-off upload would
+     * silently lose those roots first — so say so. Logged, not failed: the
+     * file exists either way, and the TLS handshake is the real verdict. */
+    const char *p = strstr(resp, "+QFUPL:");
+    int stored = p ? atoi(p + 7) : -1;
+    if (stored != (int)len)
+        ESP_LOGE(TAG, "QFUPL: %s — modem stored %d of %d bytes (upload cut short?)",
+                 filename, stored, (int)len);
+    else
+        ESP_LOGI(TAG, "QFUPL: uploaded %s (%d bytes)", filename, (int)len);
     return true;
 }
 
@@ -593,6 +603,50 @@ static bool parse_and_set_rtc(const char *s, bool two_digit_year) {
     return true;
 }
 
+/* The time string in an AT+QNTP result, +QNTP: <err>,"<time>" — or NULL unless
+ * <err> is exactly 0 and a quoted time follows. <time> has the QLTS layout
+ * ("YYYY/MM/DD,hh:mm:ss±zz", local time + quarter-hour offset), so it goes
+ * through parse_and_set_rtc() and its range and jump checks like any other
+ * source. */
+static const char *qntp_time(const char *resp) {
+    const char *p = resp ? strstr(resp, "+QNTP:") : NULL;
+    if (!p) return NULL;
+    p += 6;
+    while (*p == ' ') p++;
+    if (p[0] != '0' || p[1] != ',') return NULL;
+    const char *q = strchr(p, '"');
+    return q ? q + 1 : NULL;
+}
+
+/* NTP through the modem's PDP context 1 (the one network.c activates). Rate
+ * limited to one try per NTP_RETRY_INTERVAL_S, alternating servers, because an
+ * unreachable server holds the caller for up to NTP_TIMEOUT_MS. autosettime=1
+ * also sets the modem's own clock, so a later CCLK read returns real time. */
+static bool ntp_sync(void) {
+    static int64_t  s_last_try_us = 0;
+    static unsigned s_turn        = 0;
+    int64_t now = esp_timer_get_time();
+    if (s_last_try_us != 0 &&
+        now - s_last_try_us < (int64_t)NTP_RETRY_INTERVAL_S * 1000000LL)
+        return false;
+    s_last_try_us = now;
+
+    const char *server = (s_turn++ % 2) ? NTP_SERVER_2 : NTP_SERVER_1;
+    char cmd[96];
+    char resp[192] = {0};
+    snprintf(cmd, sizeof(cmd), "AT+QNTP=1,\"%s\",123,1", server);
+    if (!modem_at(cmd, "+QNTP:", NTP_TIMEOUT_MS, resp, sizeof(resp))) {
+        ESP_LOGW(TAG, "NTP %s: no result", server);
+        return false;
+    }
+    const char *t = qntp_time(resp);
+    if (!t || !parse_and_set_rtc(t, false)) {
+        ESP_LOGW(TAG, "NTP %s: unusable result", server);
+        return false;
+    }
+    return true;
+}
+
 bool modem_time_sync(void) {
     char resp[128] = {0};
 
@@ -607,6 +661,18 @@ bool modem_time_sync(void) {
             ESP_LOGI(TAG, "RTC synced from AT+QLTS — %s UTC", now);
             return true;
         }
+    }
+
+    /* No network time: ask NTP before trusting the modem's own clock, which
+     * free-runs (or sits at its 1980 placeholder) when the cell never sent
+     * time. Rate limited inside ntp_sync(). */
+    if (ntp_sync()) {
+        s_time_synced  = true;
+        s_last_sync_us = esp_timer_get_time();
+        char now[32];
+        rtc_timestamp(now, sizeof(now));
+        ESP_LOGI(TAG, "RTC synced from NTP — %s UTC", now);
+        return true;
     }
 
     /* Fallback: AT+CCLK? → "+CCLK: "26/03/22,10:30:00+22"" (2-digit year) */

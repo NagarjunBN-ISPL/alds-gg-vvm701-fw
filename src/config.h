@@ -217,7 +217,7 @@
  * dispenser round, a publish that hit a link blip — costs a whole interval of
  * missing data, and these samples are not store-and-forwarded. The
  * back-to-back retries inside a poll (RADAR_READ_RETRIES / GENSET_READ_RETRIES,
- * ~100 ms apart) only cover line noise. So a poll that did not yield a
+ * MODBUS_RETRY_GAP_MS apart) only cover noise and a slow reply. So a poll that did not yield a
  * published reading is re-tried EQUIP_RETRY_INTERVAL_S later, up to
  * EQUIP_RETRY_MAX times, and only the units that failed are re-polled (a
  * healthy tank is not re-sampled). The regular cadence is anchored to the last
@@ -240,6 +240,18 @@
  * costing 4 AT commands a day — against the ~2,900/day the per-cycle timestamp
  * read used to cost. */
 #define TIME_RESYNC_INTERVAL_S  21600  /* 6 hours */
+/* NTP fallback (modem.c ntp_sync). Network time (NITZ, AT+QLTS) stays first,
+ * but a cell that never sends it left the clock unset for good — and an unset
+ * clock holds back every dispenser reading (du_ts_now). So when QLTS gives
+ * nothing, an NTP server is asked through the modem's data context (AT+QNTP),
+ * before falling back to the modem's own free-running clock (CCLK). A try
+ * holds the main loop for up to NTP_TIMEOUT_MS, so tries are at least
+ * NTP_RETRY_INTERVAL_S apart and alternate servers. Sites whose cell sends
+ * network time never reach this. */
+#define NTP_SERVER_1          "time.google.com"
+#define NTP_SERVER_2          "pool.ntp.org"
+#define NTP_TIMEOUT_MS        15000
+#define NTP_RETRY_INTERVAL_S  900    /* 15 min */
 
 /* ── Maintenance reboot ───────────────────────────────────────────────────
  * There is deliberately NO on-device scheduled reboot. It used to fire on a
@@ -347,7 +359,8 @@
  * announcements (each a blocking publish), so the window is sized to cover a
  * slow link with margin; a genuine command that falls inside it is simply
  * re-sent by the operator, who sees the ack. setconfig is exempt: its own
- * byte-identical guard handles the retained case without losing a real push. */
+ * byte-identical guard handles the retained case without losing a real push.
+ * FOTA is exempt too since 2026-09-28 — see "FOTA must not fail" below. */
 #define CMD_RETAIN_GRACE_MS  15000
 /* The panel lock keeps its OWN, shorter grace to match cng-cpil's lock contract
  * byte-for-byte (lock_cmd.h LOCK_RETAIN_GRACE_MS): a human pressing unlock and a
@@ -355,6 +368,37 @@
  * lock ack/refusal rides <base>/<imei>/lock/out, not <base>/data. The other
  * one-shot commands (restart/factory_reset/FOTA) keep CMD_RETAIN_GRACE_MS. */
 #define LOCK_RETAIN_GRACE_MS  5000
+
+/* ── FOTA must not fail (product decision, 2026-09-28) ───────────────────────
+ * Stations are spread across the country and FOTA is the only way to reach
+ * them, so no security check may be what stops an update: a compromised
+ * gateway was judged less bad than an unreachable fleet. Hence:
+ *
+ * TLS_VERIFY_SERVER 0 — MQTT (the FOTA command channel) and the FOTA download
+ *   stay ENCRYPTED but do not check the server's certificate (QSSLCFG seclevel
+ *   0, what both paths ran on until 2026-07-17). A CA change, an expired
+ *   cross-sign, a broker moved to another CA or a missing CA file can then no
+ *   longer cut the fleet off. With 0 the CA bundle is not uploaded and no
+ *   cacert is set — the exact SSL sequence both paths ran on until July. 1
+ *   brings back the upload and the check with nothing else to change.
+ *
+ * FOTA commands are NOT dropped by the retain grace any more: an update queued
+ * while the gateway was offline runs when it reconnects. What stops a retained
+ * URL from looping is the NVS memory of an applied/rolled-back URL (main.c)
+ * and FOTA_RETRY_COOLDOWN_S for one that failed.
+ *
+ * FOTA_RETRY_COOLDOWN_S — a URL that just failed is refused for this long
+ *   (fota_skip_known_bad), then accepted again without "force", so the cloud's
+ *   plain re-send works. Bounds a retained bad URL to one attempt per window.
+ * FOTA_READFILE_WAIT_S — how long WE wait for the modem to report the image
+ *   saved (was 130 s); 600 s covers ~450 KB at ~6 kbit/s, a 2G fallback cell.
+ *   The modem's own AT+QHTTPREADFILE parameter stays the proven 120.
+ * FOTA_TOTAL_BUDGET_MS — all attempts together; MQTT is down meanwhile and
+ *   du_task buffers to flash, which holds hours. */
+#define TLS_VERIFY_SERVER      0
+#define FOTA_RETRY_COOLDOWN_S  1800               /* 30 min */
+#define FOTA_READFILE_WAIT_S   600
+#define FOTA_TOTAL_BUDGET_MS   (30 * 60 * 1000)
 
 /* ── Connectivity recovery (layered escalation) ──────────────────────────── */
 #define MQTT_RECONNECT_RETRIES 5      /* L1: plain MQTT reconnect attempts   */
@@ -559,6 +603,25 @@
  * call site, so a new radar driver inherits the retry with no extra work. */
 #define RADAR_READ_RETRIES 3
 
+/* ── Modbus reply timing — radar (Ztech/Pantech) and DG ──────────────────────
+ * A device gets MODBUS_REPLY_TIMEOUT_MS from our request to START its reply —
+ * a working one answers in ~10-100 ms, and 1 s is the usual Modbus master
+ * default. Once bytes flow the read ends at the expected length, or after
+ * MODBUS_BYTE_GAP_MS of silence (an exception, or a reply that stopped short),
+ * and never later than 2 x MODBUS_REPLY_TIMEOUT_MS after the request, so line
+ * noise trickling in cannot hold the bus. The largest reply, SGC120's 161
+ * bytes, takes 335 ms at 4800 baud, well inside that.
+ *
+ * A failed attempt is retried after MODBUS_RETRY_GAP_MS. The gap lets a late
+ * reply finish before we transmit again — sending over it would garble both —
+ * and the RX flush before every request then discards it.
+ *
+ * Until 2026-09-28 radar waited 200 ms then listened 500 ms, DG listened 500 ms
+ * for the whole reply, and both retried after 100 ms. */
+#define MODBUS_REPLY_TIMEOUT_MS  1000
+#define MODBUS_BYTE_GAP_MS        100
+#define MODBUS_RETRY_GAP_MS       500
+
 /* ── Genset ─────────────────────────────────────────────────────────────── */
 #define GENSET_OFF          0
 #define GENSET_SEDEMAC      1
@@ -597,8 +660,12 @@
 #define GENSET_MODEL_GC902   6
 #define GENSET_MODEL_MAX     6   /* highest valid model id — update when adding */
 
-/* ── Digital input FIFO ─────────────────────────────────────────────────── */
-#define DI_FIFO_SIZE  20
+/* ── Digital input FIFO ─────────────────────────────────────────────────────
+ * Transitions waiting to be published — during an outage, every change since
+ * the link dropped. Each carries the time it was seen (di.c), so a replay
+ * after the outage still says WHEN the DG started or the mains failed. Full =
+ * the OLDEST is dropped. 64 x ~124 B ≈ 8 KB of RAM (was 20 x 256 B = 5 KB). */
+#define DI_FIFO_SIZE  64
 
 /* ── Offline record queue (store.c) ────────────────────────────────────────
  * Backed by littlefs on the `storage` partition — 0x1e0000 = 1920 KB, per
@@ -730,9 +797,9 @@
  * case", which is simply not true — measured against the real retry budgets,
  * one nozzle can hold the bus for far longer than a genset poll:
  *
- *   genset  1 attempt = 3 reads x MB_TIMEOUT_MS(500)     ~1.6 s  (Mahindra;
- *                       the two-read models ~1.1 s)
- *   radar   1 tank    = 3 retries x (200 turnaround+500)  ~2.4 s
+ *   genset  1 attempt = 3 reads x MODBUS_REPLY_TIMEOUT_MS ~3.1 s  (silent
+ *                       Mahindra; the two-read models ~2 s)
+ *   radar   1 tank    = 3 x 1 s reply window, 500 ms apart ~4 s
  *   Yenen   1 nozzle  = 3 reads x RS485_RECV_TIMEOUT_MS   ~6.6 s  (silent pump;
  *                       was ~13.2 s until Command 1 was dropped — yenen.h)
  *   BlueSky 1 nozzle  = 7 reads x RS485_RECV_TIMEOUT_MS  ~15.8 s  (answers
@@ -746,7 +813,8 @@
  *
  * DU_TASK  waits long enough to never lose a round to bus contention. It can
  *          afford to: it is only ever waiting on radar/genset, both bounded
- *          at ~2.4 s, so this ceiling is headroom that should never be spent.
+ *          at ~4 s (~7 s under a noise storm, see MODBUS_REPLY_TIMEOUT_MS),
+ *          so this ceiling is headroom that should never be spent.
  * MAIN     waits about one worst-case nozzle. Radar and genset are sampled
  *          state on 10-minute and 5-minute cadences — skipping one and
  *          publishing "404" costs nothing, and the next reading is current.

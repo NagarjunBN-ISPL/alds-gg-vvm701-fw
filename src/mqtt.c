@@ -380,10 +380,13 @@ bool mqtt_connect(void) {
     /* TLS + persistent session — both must be set before QMTOPEN, since
      * Quectel rejects QMTCFG/QSSLCFG changes once the link is already open. */
     if (s_mqtt_tls) {
-        /* seclevel=1: verify the broker's certificate against the CA
-         * uploaded by tls_ca_provision() (called once at boot, before the
-         * first connect attempt) — was seclevel=0 (no verification at all)
-         * until 2026-07-17. cacert is re-asserted on every connect attempt,
+        /* seclevel = TLS_VERIFY_SERVER (config.h): 0 = encrypted, broker
+         * certificate NOT checked — the 2026-09-28 "FOTA must not fail"
+         * decision, since this link is also the FOTA command channel and a
+         * refused certificate would cut the station off for good. 1 = verify
+         * against the CA uploaded by tls_ca_provision() (called once at boot,
+         * before the first connect attempt), as 2026-07-17..09-28.
+         * cacert is re-asserted on every connect attempt,
          * same defensive "don't assume it survived" posture already used
          * for sslversion/ciphersuite below, since QSSLCFG settings are reset
          * by some recovery paths (e.g. modem_hard_reset) that this function
@@ -391,12 +394,13 @@ bool mqtt_connect(void) {
          * SSL context 2. */
         modem_at("AT+QSSLCFG=\"sslversion\",2,4",       "OK", 3000, NULL, 0);
         modem_at("AT+QSSLCFG=\"ciphersuite\",2,0XFFFF", "OK", 3000, NULL, 0);
-        {
+        if (TLS_VERIFY_SERVER) {   /* off: the pre-2026-07-17 sequence, no cacert */
             char cacert_cmd[64];
             snprintf(cacert_cmd, sizeof(cacert_cmd), "AT+QSSLCFG=\"cacert\",2,\"%s\"", TLS_CA_FILE);
             modem_at(cacert_cmd, "OK", 3000, NULL, 0);
         }
-        modem_at("AT+QSSLCFG=\"seclevel\",2,1",         "OK", 3000, NULL, 0);
+        modem_at(TLS_VERIFY_SERVER ? "AT+QSSLCFG=\"seclevel\",2,1"
+                                   : "AT+QSSLCFG=\"seclevel\",2,0", "OK", 3000, NULL, 0);
         modem_at("AT+QMTCFG=\"ssl\",0,1,2",             "OK", 3000, NULL, 0);
     } else {
         /* Plaintext MQTT — credentials and telemetry travel unencrypted.

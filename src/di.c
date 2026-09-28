@@ -1,6 +1,7 @@
 #include "di.h"
 #include "forensics.h"
 #include "config.h"
+#include "modem.h"
 #include "mqtt.h"
 #include "ms51_bus.h"
 #include "driver/uart.h"
@@ -38,6 +39,35 @@ void di_uart_init(void) {
     ms51_bus_init();
 
     di_mutex = xSemaphoreCreateMutex();
+}
+
+_Static_assert(DI_PAYLOAD_MAX > 4 * 17 + 5, "DI payload buffer must hold 4 x \"DIn\":-2147483648");
+
+/* Queue one DI transition, stamped with the time it was seen — not the time
+ * it is later published, which after an outage can be hours on (a DG that ran
+ * 10:00-12:00 would otherwise replay as two events at the reconnect instant).
+ * Full FIFO = the OLDEST entry is overwritten, so the newest state always gets
+ * through. Returns false only if the FIFO mutex could not be taken; the caller
+ * then retries on its next poll. */
+static bool di_enqueue(const char *payload) {
+    char ts[sizeof(di_fifo[0].ts)] = {0};
+    bool ts_ok = rtc_timestamp(ts, sizeof(ts));   /* before the lock: no I/O, but no need to hold it */
+
+    if (xSemaphoreTake(di_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    int slot = di_tail;
+    strncpy(di_fifo[slot].payload, payload, sizeof(di_fifo[slot].payload) - 1);
+    di_fifo[slot].payload[sizeof(di_fifo[slot].payload) - 1] = '\0';
+    memcpy(di_fifo[slot].ts, ts, sizeof(di_fifo[slot].ts));
+    di_fifo[slot].ts_ok = ts_ok;
+    di_tail = (di_tail + 1) % DI_FIFO_SIZE;
+    if (di_count < DI_FIFO_SIZE) {
+        di_count++;
+    } else {
+        /* Overwrite oldest */
+        di_head = (di_head + 1) % DI_FIFO_SIZE;
+    }
+    xSemaphoreGive(di_mutex);
+    return true;
 }
 
 /* Very small JSON parser — finds "DI1": <val> patterns */
@@ -199,19 +229,7 @@ void di_task(void *param) {
              * gone for good. Only commit last_payload inside the success
              * branch below, so a timeout leaves dedup state untouched and
              * the very next poll (2s later) naturally retries the enqueue. */
-            if (xSemaphoreTake(di_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                int slot = di_tail;
-                strncpy(di_fifo[slot].payload, payload, sizeof(di_fifo[slot].payload) - 1);
-                di_fifo[slot].payload[sizeof(di_fifo[slot].payload) - 1] = '\0';
-                di_tail = (di_tail + 1) % DI_FIFO_SIZE;
-                if (di_count < DI_FIFO_SIZE) {
-                    di_count++;
-                } else {
-                    /* Overwrite oldest */
-                    di_head = (di_head + 1) % DI_FIFO_SIZE;
-                }
-                xSemaphoreGive(di_mutex);
-
+            if (di_enqueue(payload)) {
                 strncpy(last_payload, payload, sizeof(last_payload) - 1);
                 last_payload[sizeof(last_payload) - 1] = '\0';
             }
@@ -231,7 +249,9 @@ bool di_publish_buffer(const char *topic, const char *hw_id,
 
     bool all_ok = true;  /* stays true if nothing to drain (DI healthy, idle) */
     for (;;) {
-        char entry_payload[256];
+        char entry_payload[sizeof(di_fifo[0].payload)];
+        char entry_ts[sizeof(di_fifo[0].ts)];
+        bool entry_ts_ok = false;
         int  snap_head = -1;
         bool got = false;
 
@@ -249,6 +269,9 @@ bool di_publish_buffer(const char *topic, const char *hw_id,
                 strncpy(entry_payload, di_fifo[snap_head].payload,
                         sizeof(entry_payload) - 1);
                 entry_payload[sizeof(entry_payload) - 1] = '\0';
+                memcpy(entry_ts, di_fifo[snap_head].ts, sizeof(entry_ts));
+                entry_ts[sizeof(entry_ts) - 1] = '\0';
+                entry_ts_ok = di_fifo[snap_head].ts_ok;
                 got = true;
             }
             xSemaphoreGive(di_mutex);
@@ -256,11 +279,12 @@ bool di_publish_buffer(const char *topic, const char *hw_id,
 
         if (!got) break;
 
-        /* Wrap in envelope with HW_ID and TS */
+        /* Wrap in envelope with HW_ID and TS — the time the change was seen,
+         * or now if the clock was not set yet when it happened. */
         char msg[400];
         snprintf(msg, sizeof(msg),
                  "{\"HW_ID\":\"%s\",\"di\":%s,\"TS\":\"%s\"}",
-                 hw_id, entry_payload, ts_latest);
+                 hw_id, entry_payload, entry_ts_ok ? entry_ts : ts_latest);
 
         /* mqtt_publish() itself now logs the full topic + payload at INFO,
          * so no separate log line is needed here — this msg is distinct from

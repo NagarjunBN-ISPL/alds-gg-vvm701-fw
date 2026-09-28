@@ -39,9 +39,11 @@ static uint16_t crc16(const uint8_t *data, size_t len) {
 
 /* ── Modbus RTU request / response ───────────────────────────────────────
  * Sends an FC03/FC04 read and returns the raw, CRC + slave/FC-echo validated
- * response in rx (length in *rx_len). */
-#define MB_TIMEOUT_MS 500
-
+ * response in rx (length in *rx_len). Timing is the shared Modbus rule in
+ * config.h: the DG gets MODBUS_REPLY_TIMEOUT_MS to start answering, then the
+ * read ends at the expected length, after MODBUS_BYTE_GAP_MS of silence, or at
+ * the hard cap. (It used to be one 500 ms window for the whole reply, which
+ * SGC120's 161-byte reply at 4800 baud — 335 ms on the wire — nearly filled.) */
 static bool modbus_request(uint8_t slave, uint8_t fc,
                             uint16_t addr, uint16_t count,
                             uint8_t *rx, size_t rx_max, int *rx_len) {
@@ -61,14 +63,17 @@ static bool modbus_request(uint8_t slave, uint8_t fc,
     while (uart_read_bytes(RS485_UART, tmp, sizeof(tmp), 0) > 0);
 
     uart_write_bytes(RS485_UART, req, 8);
-    vTaskDelay(pdMS_TO_TICKS(10)); /* inter-frame gap */
 
     int got = 0;
     int expected = 5 + count * 2; /* slave+fc+bytecount+data+CRC */
-    int64_t dl = esp_timer_get_time() + (int64_t)MB_TIMEOUT_MS * 1000;
-    while (esp_timer_get_time() < dl && got < (int)rx_max) {
+    int64_t t0   = esp_timer_get_time();
+    int64_t dl   = t0 + (int64_t)MODBUS_REPLY_TIMEOUT_MS * 1000;       /* first byte */
+    int64_t hard = t0 + (int64_t)MODBUS_REPLY_TIMEOUT_MS * 2 * 1000;   /* whole reply */
+    while (got < (int)rx_max) {
+        int64_t now = esp_timer_get_time();
+        if (now >= dl || now >= hard) break;
         /* Feed the WDT inside the read loop, matching every other UART loop in
-         * the firmware. Today the arithmetic is safe (MB_TIMEOUT_MS 500 ms x a
+         * the firmware. Today the arithmetic is safe (a 2 s cap per read x a
          * handful of reads/retries << 120 s), but the dispenser/radar loops
          * learned the hard way that "safe by arithmetic" silently breaks the
          * moment a timeout or retry constant is raised. This makes it safe by
@@ -78,14 +83,14 @@ static bool modbus_request(uint8_t slave, uint8_t fc,
         if (uart_read_bytes(RS485_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
             rx[got++] = ch;
             /* A Modbus exception reply is exactly 5 bytes (slave, fc|0x80,
-             * code, CRC, CRC). Without shrinking the target the loop waits the
-             * full MB_TIMEOUT_MS for `expected` data bytes that never arrive —
-             * up to 500 ms x retries of the shared RS485 bus held idle, which
-             * directly starves the dispenser polls waiting on that lock. Detect
-             * the exception the instant the FC byte lands and stop at the true
-             * length. A normal reply clears bit 7, so `expected` is unchanged. */
+             * code, CRC, CRC). Without shrinking the target the read would run
+             * on to the silence gap waiting for `expected` data bytes that never
+             * arrive. Detect the exception the instant the FC byte lands and
+             * stop at the true length. A normal reply clears bit 7, so
+             * `expected` is unchanged. */
             if (got == 2 && (rx[1] & 0x80)) expected = 5;
             if (got >= expected) break;
+            dl = esp_timer_get_time() + (int64_t)MODBUS_BYTE_GAP_MS * 1000;
         }
     }
     *rx_len = got;

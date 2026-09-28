@@ -25,8 +25,9 @@ bool modem_get_operator(char *out, size_t out_size);
  * the single value was then stamped onto every payload in that cycle, so the
  * last nozzle of a cycle carried a timestamp ~40 s older than its own reading.
  *
- * modem_time_sync(): pulls network time (AT+QLTS=2, falling back to AT+CCLK?),
- * converts the modem's LOCAL time + quarter-hour offset to UTC, and sets the
+ * modem_time_sync(): pulls network time (AT+QLTS=2), falling back to NTP
+ * (AT+QNTP, rate limited — config.h NTP_*) and then to the modem's own clock
+ * (AT+CCLK?), converts the LOCAL time + quarter-hour offset to UTC, and sets the
  * RTC via settimeofday(). Call once after network bring-up, then periodically
  * (see modem_time_resync_due()) to bound RTC drift.
  *

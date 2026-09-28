@@ -102,7 +102,7 @@ static uint16_t crc16(const uint8_t *b, int n) {
 }
 
 /* ── simulated DG controller ──────────────────────────────────────────── */
-typedef enum { B_SILENT, B_EXCEPTION, B_WRONG_SLAVE, B_WRONG_COUNT } Odd_t;
+typedef enum { B_SILENT, B_EXCEPTION, B_WRONG_SLAVE, B_WRONG_COUNT, B_CUT_SHORT } Odd_t;
 
 static struct {
     const Exchange_t *ex;
@@ -110,6 +110,8 @@ static struct {
     int      odd_idx;       /* exchange answered with `odd` instead; -1 none  */
     Odd_t    odd;
     bool     dead;          /* powered down: nothing answers                  */
+    int      delay_ms;      /* every reply starts this long after its request */
+    bool     drip;          /* line noise: one byte every 90 ms, forever      */
     uint8_t  req[8][16];    /* every request the firmware sent, in order      */
     int      req_len[8];
     int      n_req;
@@ -118,6 +120,7 @@ static struct {
 
 static uint8_t rx[300];
 static int rx_len, rx_pos;
+static int64_t ready_us, drip_next_us;
 
 static void dg_load(const Exchange_t *ex, int n) {
     memset(&DG, 0, sizeof(DG));
@@ -129,6 +132,8 @@ int uart_write_bytes(uart_port_t port, const void *src, size_t size) {
     (void)port;
     const uint8_t *f = (const uint8_t *)src;
     rx_len = rx_pos = 0;
+    ready_us = s_now_us + (int64_t)DG.delay_ms * 1000;
+    drip_next_us = s_now_us;
     if (DG.n_req < 8) {
         int n = size < 16 ? (int)size : 16;
         memcpy(DG.req[DG.n_req], f, (size_t)n);
@@ -147,12 +152,15 @@ int uart_write_bytes(uart_port_t port, const void *src, size_t size) {
 
     uint8_t r[300];
     int rn = parse_hex(DG.ex[hit].rsp, r, (int)sizeof(r));
-    if (hit == DG.odd_idx) {
+    if (hit == DG.odd_idx && DG.odd == B_CUT_SHORT) {
+        rn -= 10;                                       /* reply stops mid-frame */
+    } else if (hit == DG.odd_idx) {
         switch (DG.odd) {
             case B_SILENT:      return (int)size;
             case B_EXCEPTION:   r[1] |= 0x80; r[2] = 0x02; rn = 3; break;  /* illegal address */
             case B_WRONG_SLAVE: r[0] = 0x04; rn -= 2;              break;  /* a radar's reply */
             case B_WRONG_COUNT: r[2] -= 2;   rn -= 4;              break;  /* one register short */
+            case B_CUT_SHORT:                                      break;  /* handled above */
         }
         uint16_t c = crc16(r, rn);                      /* every odd reply CRC-checks */
         r[rn++] = (uint8_t)(c & 0xFF);
@@ -165,8 +173,17 @@ int uart_write_bytes(uart_port_t port, const void *src, size_t size) {
 
 int uart_read_bytes(uart_port_t port, void *buf, uint32_t length, uint32_t ticks) {
     (void)port;
+    if (DG.drip) {
+        if (s_now_us >= drip_next_us) {
+            *(uint8_t *)buf = 0x55;
+            drip_next_us = s_now_us + 90000;
+            return 1;
+        }
+        sim_clock_advance_ms((int64_t)ticks);
+        return 0;
+    }
     int avail = rx_len - rx_pos;
-    if (avail <= 0) {
+    if (avail <= 0 || s_now_us < ready_us) {
         sim_clock_advance_ms((int64_t)ticks);   /* the wait actually costs time */
         return 0;
     }
@@ -300,7 +317,8 @@ int main(void) {
     int64_t held_ms = (esp_timer_get_time() - t0) / 1000;
     CHECK(!ok && !gd.reg_valid && !gd.al_valid && !gd.st_valid, "a dead DG must read nothing");
     CHECK(gd.has_alarms && gd.has_status, "the model still promises Alarms and status (404s)");
-    CHECK(held_ms <= 1700, "one attempt held the bus %lld ms (budget ~1.6 s, config.h)", (long long)held_ms);
+    CHECK(held_ms >= 3 * MODBUS_REPLY_TIMEOUT_MS && held_ms <= 3200,
+          "one attempt held the bus %lld ms (3 reads x the 1 s window + 2 x 50 ms, config.h)", (long long)held_ms);
     CHECK(g_wdt_feeds > 0, "the watchdog was not fed while waiting");
     genset_build_registers_payload(&gd, HWID, TS, buf, sizeof(buf));
     expect_msg("dead DG", buf, "registers", "404");
@@ -309,6 +327,36 @@ int main(void) {
     genset_build_status_payload(&gd, HWID, TS, buf, sizeof(buf));
     expect_msg("dead DG", buf, "status", "404");
     printf("       dead Mahindra: one attempt holds the bus %lld ms\n", (long long)held_ms);
+
+    printf("== reply timing: 1 s to start, silence ends a short reply, noise capped ==\n");
+    dg_load(k_gc1211, N(k_gc1211));
+    DG.delay_ms = 900;
+    ok = genset_poll(10, GENSET_MODEL_GC1211, &gd);
+    CHECK(ok && gd.reg_valid && gd.al_valid && gd.st_valid, "a DG answering after 900 ms must be read (%d %d %d)",
+          gd.reg_valid, gd.al_valid, gd.st_valid);
+
+    dg_load(k_gc1211, N(k_gc1211));
+    DG.delay_ms = 1100;
+    ok = genset_poll(10, GENSET_MODEL_GC1211, &gd);
+    CHECK(!ok && !gd.reg_valid && !gd.al_valid && !gd.st_valid, "a reply starting after 1100 ms is too late");
+
+    dg_load(k_gc1211, N(k_gc1211));
+    DG.odd_idx = 0; DG.odd = B_CUT_SHORT;
+    t0 = esp_timer_get_time();
+    ok = genset_poll(10, GENSET_MODEL_GC1211, &gd);
+    held_ms = (esp_timer_get_time() - t0) / 1000;
+    CHECK(!ok && !gd.reg_valid && gd.al_valid && gd.st_valid, "a registers reply cut short must be refused");
+    CHECK(held_ms <= MODBUS_BYTE_GAP_MS + 150, "a cut-short reply must end on the silence gap, not the window (%lld ms)",
+          (long long)held_ms);
+
+    dg_load(k_gc1211, N(k_gc1211));
+    DG.drip = true;
+    t0 = esp_timer_get_time();
+    ok = genset_poll(10, GENSET_MODEL_GC1211, &gd);
+    held_ms = (esp_timer_get_time() - t0) / 1000;
+    CHECK(!ok && !gd.reg_valid && !gd.al_valid && !gd.st_valid, "line noise must not pass as DG data");
+    CHECK(held_ms <= 3 * 2 * MODBUS_REPLY_TIMEOUT_MS + 200, "noise held the bus %lld ms, cap 3 x %d + gaps",
+          (long long)held_ms, 2 * MODBUS_REPLY_TIMEOUT_MS);
 
     printf("== odd replies are rejected, never published as data ==\n");
     dg_load(k_gc1211, N(k_gc1211));

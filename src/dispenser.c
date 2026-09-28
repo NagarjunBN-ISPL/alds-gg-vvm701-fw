@@ -111,18 +111,71 @@ static int rs485_xfer(const uint8_t *cmd, size_t cmd_len,
 }
 
 /* ── BlueSky response validation ──────────────────────────────────────────
- * Every confirmed BlueSky frame starts 0xF5 followed by the nozzle address,
- * so both are enforced: a response must echo the header AND the address we
- * polled, or it is treated as line noise / crosstalk and dropped.
+ * Every reply to a read has one layout, confirmed on field frames of all five
+ * commands (status D5, totalizer C5, RSP B6, k-factor E2, RFID D7) from two
+ * sites:
  *
- * A prior XOR-of-all-bytes-==-0x80 checksum check was removed here: field
- * data from a real dispenser (2026-07-08) showed every single response
- * frame — both nozzles, every command type — computing XOR=0x00, never
- * 0x80. That rule was written for our own OUTGOING command frames (where
- * 0xF5^0xA2^0xD7 does equal 0x80 by construction) and had only ever been
- * assumed, not confirmed, to also hold for the device's responses. The
- * field data disproves that assumption, so the check is gone rather than
- * left in as permanent log noise around a formula that doesn't apply here. */
+ *     F5 <addr> A<n> <data...> <cmd> <chk>     n = bytes after byte 2
+ *     f5 02 a4 65 82 b6 02                     nozzle 2, RSP 65.82
+ *
+ * <cmd> echoes the command polled, and <chk> is the XOR of every byte before
+ * it with bit 7 cleared — bluesky_frame()'s addr ^ cmd ^ 0xD7 is the same rule
+ * worked out for our 5-byte commands. A reply to a read is accepted only if
+ * ALL of these hold:
+ *   - F5 and the polled address                  (crosstalk, line noise)
+ *   - byte 2 is A<n> and the frame is n+3 bytes  (a reply cut short)
+ *   - n >= 3, i.e. at least one data byte        (our own command echoed back)
+ *   - <cmd> is the command we sent               (a late reply to another read)
+ *   - <chk> matches                              (a byte corrupted on the wire)
+ *   - totalizer and RSP data are BCD digits 0-9  (the cloud decodes them as BCD)
+ * A frame that fails is dropped; the caller retries, then reports "404".
+ *
+ * A prior "XOR of all bytes == 0x80" check was removed on 2026-07-08 because
+ * real replies XORed to 0x00. Both were half right: with bit 7 cleared, a
+ * valid frame XORs to 0x00 or 0x80 depending on its data.
+ *
+ * What this cannot catch: a well-formed frame carrying a wrong value from the
+ * pump itself. f5,02,a4,00,65,b6,00 (RSP 00.65 from a pump set to 65.82,
+ * Vinayakapuram 2026-09-23) has a valid checksum and passes. */
+static uint8_t bluesky_chk(const uint8_t *buf, int n) {
+    uint8_t x = 0;
+    for (int i = 0; i < n; i++) x ^= buf[i];
+    return (uint8_t)(x & 0x7F);
+}
+
+static bool bcd_ok(const uint8_t *p, int n) {
+    for (int i = 0; i < n; i++)
+        if ((p[i] >> 4) > 9 || (p[i] & 0x0F) > 9) return false;
+    return true;
+}
+
+static bool bluesky_read_valid(const uint8_t *buf, int len, uint8_t addr,
+                               uint8_t cmd, const char *what) {
+    const char *why = NULL;
+    if (len < 6)
+        why = "short frame";
+    else if (buf[0] != 0xF5 || buf[1] != addr)
+        why = "bad header/addr echo";
+    else if ((buf[2] & 0xF0) != 0xA0 || (buf[2] & 0x0F) + 3 != len)
+        why = "length byte does not match the frame";
+    else if (buf[len - 2] != cmd)
+        why = "not a reply to this command";
+    else if (buf[len - 1] != bluesky_chk(buf, len - 1))
+        why = "bad checksum";
+    else if ((cmd == BS_CMD_TOTAL || cmd == BS_CMD_RSP) && !bcd_ok(buf + 3, len - 5))
+        why = "non-BCD digit";
+    if (why) {
+        ESP_LOGW(TAG, "BlueSky nz%u %s: %s (%d bytes) — dropped", addr, what, why, len);
+        return false;
+    }
+    return true;
+}
+
+/* The passthrough's reply to a cloud-built frame is the one reply whose layout
+ * is NOT known: no write reply has ever been captured, and it may not echo the
+ * command or carry data. So only the header and the address are checked, as
+ * before; what a write left in the pump is confirmed by the read-back, which
+ * goes through bluesky_read_valid(). Reads never come here. */
 static bool bluesky_resp_valid(const uint8_t *buf, int len, uint8_t addr,
                                 const char *what) {
     if (len < 4) {
@@ -155,7 +208,7 @@ static void log_raw_frame(uint8_t addr, const char *what, const uint8_t *buf, in
 /* Read one BlueSky data field (totalizer / RSP / k-factor) into buf, retrying
  * up to max_tries times, and return the VALIDATED response length (0 if every
  * attempt failed or returned an invalid frame). Consolidates the read + raw
- * log + header/addr validation the individual field blocks used to repeat
+ * log + frame validation the individual field blocks used to repeat
  * inline, and adds the retry the sale-critical reads now need. Each attempt
  * flushes the RS485 RX inside rs485_xfer(), so a stale reply from a prior
  * attempt can't be mistaken for this one. */
@@ -168,7 +221,7 @@ static int du_read_field(uint8_t addr, uint8_t cmd_byte, uint8_t *buf,
         int len = rs485_xfer(cmd, 5, buf, DU_RESP_MAX);
         esp_task_wdt_reset();
         log_raw_frame(addr, what, buf, len);
-        if (len > 0 && bluesky_resp_valid(buf, len, addr, what))
+        if (len > 0 && bluesky_read_valid(buf, len, addr, cmd_byte, what))
             return len;
         if (attempt < max_tries)
             ESP_LOGW(TAG, "BlueSky nz%u %s: no valid frame (attempt %d/%d) — retrying",
@@ -234,7 +287,7 @@ void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz, bool read_kfactor) {
         log_raw_frame(addr, "status", nz->status, nz->status_len);
 
         if (nz->status_len > 0 &&
-            !bluesky_resp_valid(nz->status, nz->status_len, addr, "status"))
+            !bluesky_read_valid(nz->status, nz->status_len, addr, BS_CMD_STATUS, "status"))
             nz->status_len = 0;
 
         if (nz->status_len < 4) {
@@ -441,7 +494,7 @@ static bool bluesky_nozzle_idle(uint8_t addr, bool *present) {
         int len = rs485_xfer(cmd, 5, st, DU_RESP_MAX);
         esp_task_wdt_reset();
         log_raw_frame(addr, "status(gate)", st, len);
-        if (len < 4 || !bluesky_resp_valid(st, len, addr, "status(gate)")) continue;
+        if (len <= 0 || !bluesky_read_valid(st, len, addr, BS_CMD_STATUS, "status(gate)")) continue;
         *present = true;
         return (st[3] == 0x80 || st[3] == 0x00);
     }

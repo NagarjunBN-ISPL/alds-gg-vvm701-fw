@@ -34,10 +34,15 @@ esp_err_t esp_task_wdt_reset(void) { g_wdt_feeds++; return ESP_OK; }
 int uart_param_config(uart_port_t port, const uart_config_t *cfg) { (void)port; (void)cfg; return 0; }
 
 /* ── simulated BlueSky pump ────────────────────────────────────────────────
- * Answers the four read commands the driver uses and one k-factor WRITE shape:
+ * Answers the four read commands the driver uses in the real reply layout —
+ * F5 <addr> A<n> <data...> <cmd> <chk>, chk = XOR of the bytes before it with
+ * bit 7 cleared — since the driver drops anything else. And one k-factor WRITE
+ * shape:
  *   F5 <addr> A4 E3 <k1> <k2> <cs>   → pump stores k1 k2, replies F5 <addr> A2 E3 <cs>
  * (the real write command set is the cloud's; the driver only checks the frame
- * shape and the address, so any well-formed frame exercises the same path). */
+ * shape and the address, so any well-formed frame exercises the same path. The
+ * write reply's layout is unknown, so the driver checks only its header and
+ * address — this ack, with no data and no real checksum, must keep passing). */
 #define WR_KFACT 0xE3
 static struct {
     uint8_t kf[16][2];         /* k-factor per address                           */
@@ -52,6 +57,17 @@ static int rx_len, rx_pos;
 
 static void reply(const uint8_t *r, int n) { memcpy(rx, r, (size_t)n); rx_len = n; rx_pos = 0; }
 
+static void reply_read(uint8_t a, uint8_t cmd, const uint8_t *data, int n) {
+    uint8_t r[32], x = 0;
+    int k = 0;
+    r[k++] = 0xF5; r[k++] = a; r[k++] = (uint8_t)(0xA0 | (n + 2));
+    memcpy(r + k, data, (size_t)n); k += n;
+    r[k++] = cmd;
+    for (int i = 0; i < k; i++) x ^= r[i];
+    r[k++] = (uint8_t)(x & 0x7F);
+    reply(r, k);
+}
+
 int uart_write_bytes(uart_port_t port, const void *src, size_t size) {
     (void)port;
     const uint8_t *f = (const uint8_t *)src;
@@ -62,13 +78,14 @@ int uart_write_bytes(uart_port_t port, const void *src, size_t size) {
 
     if (size == 5) {
         switch (f[3]) {
-            case 0xD5: { uint8_t r[] = {0xF5, a, 0xA1, 0x80};                     reply(r, 4); break; }
-            case 0xC5: { uint8_t r[] = {0xF5, a, 0xA4, 0xC5, 0x00, 0x12, 0x34};   reply(r, 7); break; }
-            case 0xB6: { uint8_t r[] = {0xF5, a, 0xA3, 0xB6, 0x00, 0x64};         reply(r, 6); break; }
+            case 0xD5: { uint8_t d[] = {0x80};                                    reply_read(a, 0xD5, d, 1);  break; }
+            case 0xC5: { uint8_t d[] = {0x00, 0x02, 0x15, 0x18, 0x26,
+                                        0x23, 0x30, 0x19, 0x35, 0x34};            reply_read(a, 0xC5, d, 10); break; }
+            case 0xB6: { uint8_t d[] = {0x68, 0x86};                              reply_read(a, 0xB6, d, 2);  break; }
             case 0xE2:
                 P.kf_reads++;
                 if (P.drop_kf_reads > 0) { P.drop_kf_reads--; break; }
-                { uint8_t r[] = {0xF5, a, 0xA3, 0xE2, P.kf[a][0], P.kf[a][1]}; reply(r, 6); }
+                reply_read(a, 0xE2, P.kf[a], 2);
                 break;
         }
     } else if (size == 7 && f[3] == WR_KFACT) {
@@ -110,7 +127,7 @@ static const char *round_kf(uint8_t addr, bool due, int *reads) {
     int before = P.kf_reads;
     du_poll_bluesky_nozzle(addr, &nz, due);
     if (reads) *reads = P.kf_reads - before;
-    if (nz.kfact_len == 6) snprintf(s, sizeof(s), "%02x%02x", nz.kfact[4], nz.kfact[5]);
+    if (nz.kfact_len == 7) snprintf(s, sizeof(s), "%02x%02x", nz.kfact[3], nz.kfact[4]);
     else if (nz.kfact_len == 0) snprintf(s, sizeof(s), "404");
     else snprintf(s, sizeof(s), "len%d", nz.kfact_len);
     return s;
@@ -145,7 +162,7 @@ int main(void) {
      *     message, without waiting for the next due read. */
     bool ok = write_kf(1, 1, 0x04, 0x00, rb, reason);
     CHECK(ok, "[2] write refused: %s", reason);
-    CHECK(strcmp(rb, "f5,01,a3,e2,04,00") == 0, "[2] read-back hex: %s", rb);
+    CHECK(strcmp(rb, "f5,01,a4,04,00,e2,36") == 0, "[2] read-back hex: %s", rb);
     kf = round_kf(1, false, &reads);
     CHECK(strcmp(kf, "0400") == 0, "[2] next message still carries the old k-factor: %s", kf);
     CHECK(reads == 0, "[2] read-back already confirmed it — no extra bus read expected, got %d", reads);

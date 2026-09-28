@@ -1438,16 +1438,13 @@ static void handle_msg(const char *topic, const char *payload) {
         bool force = false;
         char fota_msg[160];
 
-        /* ── Retained-message backstop #1: the grace window ──────────────────
-         * A retained URL is re-delivered on every reconnect, and the FOTA path
-         * tears MQTT down for minutes each time. Dropped, with an ack that
-         * names the cause, if it lands right after subscribing. */
-        if (cmd_in_retain_grace(fleet ? "fleet update" : "update")) {
-            snprintf(fota_msg, sizeof(fota_msg),
-                     "{\"HW_ID\":\"%s\",\"status\":\"fota_ignored_retained\"}", g_imei);
-            mqtt_publish(t_data, fota_msg);
-            return;
-        }
+        /* No retain-grace drop here any more (2026-09-28, "FOTA must not fail",
+         * config.h). The broker keeps this gateway's session, so an update sent
+         * while it was offline is delivered right after it resubscribes — the
+         * grace window used to throw exactly those away (fota_ignored_retained)
+         * and the station silently missed the update. A retained URL is still
+         * kept from looping by backstop #2 (applied / rolled back, in NVS) and
+         * the failed-URL cooldown below. */
 
         /* Two payload forms: a bare URL, or JSON —
          *   {"url":"https://...","target":"gg","force":true}
@@ -1505,16 +1502,17 @@ static void handle_msg(const char *topic, const char *payload) {
         }
 
         /* Guard against a retained (or repeatedly re-published) update
-         * message re-triggering a download that already FAILED this boot: a
-         * RETAINED bad URL is re-delivered on EVERY reconnect, and each
-         * attempt tears down MQTT for minutes — without this the device does
-         * nothing but loop FOTA attempts. A different URL clears the block.
-         * Compares the extracted URL, never the raw payload — the JSON form
-         * would otherwise never match and the guard would be dead for exactly
-         * the fleet messages it matters most for. "force" overrides this one
-         * too (the operator's explicit retry of a URL that failed on, say, a
-         * transient S3 error must not be answered fota_skip_known_bad). */
-        static char s_fota_blocked[FOTA_URL_MAX + 1] = "";
+         * message re-triggering a download that just FAILED: a RETAINED bad
+         * URL is re-delivered on EVERY reconnect, and each attempt tears down
+         * MQTT for minutes — without this the device does nothing but loop
+         * FOTA attempts. The block lasts FOTA_RETRY_COOLDOWN_S (it used to
+         * last the whole boot, which also refused the cloud's own plain
+         * re-send); a different URL clears it at once. Compares the extracted
+         * URL, never the raw payload — the JSON form would otherwise never
+         * match and the guard would be dead for exactly the fleet messages it
+         * matters most for. "force" overrides this one too. */
+        static char    s_fota_blocked[FOTA_URL_MAX + 1] = "";
+        static int64_t s_fota_blocked_us = 0;
 
         size_t url_len = strlen(url_to_use);
         if (url_len == 0 || url_len > FOTA_URL_MAX) {
@@ -1526,9 +1524,10 @@ static void handle_msg(const char *topic, const char *payload) {
             mqtt_publish(t_data, fota_msg);
             return;
         }
-        if (!force && s_fota_blocked[0] && strcmp(url_to_use, s_fota_blocked) == 0) {
-            ESP_LOGW(TAG, "FOTA: identical URL already failed this boot — skipping "
-                          "(clear the retained message, publish a new URL, or force)");
+        if (!force && s_fota_blocked[0] && strcmp(url_to_use, s_fota_blocked) == 0 &&
+            esp_timer_get_time() - s_fota_blocked_us < (int64_t)FOTA_RETRY_COOLDOWN_S * 1000000LL) {
+            ESP_LOGW(TAG, "FOTA: identical URL failed less than %d min ago — skipping "
+                          "(re-send later, publish a new URL, or force)", FOTA_RETRY_COOLDOWN_S / 60);
             snprintf(fota_msg, sizeof(fota_msg),
                      "{\"HW_ID\":\"%s\",\"status\":\"fota_skip_known_bad\"}", g_imei);
             mqtt_publish(t_data, fota_msg);
@@ -1620,10 +1619,12 @@ static void handle_msg(const char *topic, const char *payload) {
             esp_restart();
         }
 
-        /* Download failed — remember this exact URL so a retained copy of it
-         * can't re-trigger the loop, then bring MQTT back up. */
+        /* Download failed — remember this exact URL and when, so a retained
+         * copy of it can't re-trigger the loop inside the cooldown, then bring
+         * MQTT back up. */
         strncpy(s_fota_blocked, url_to_use, sizeof(s_fota_blocked) - 1);
         s_fota_blocked[sizeof(s_fota_blocked) - 1] = '\0';
+        s_fota_blocked_us = esp_timer_get_time();
 
         if (mqtt_connect()) {
             subscribe_all();
@@ -2213,7 +2214,7 @@ static bool poll_one_tank(int tank_idx, RadarType_t type, const char *ts) {
     if (rs485_bus_lock(RS485_BUS_WAIT_MAIN_MS)) {
         rs485_bus_set_8n1(9600);
         for (int attempt = 1; attempt <= RADAR_READ_RETRIES && !ok; attempt++) {
-            if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(100));
+            if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(MODBUS_RETRY_GAP_MS));
             switch (type) {
                 case RADAR_T_PANTECH: ok = radar_pantech_read(slave, tank_idx, rx, &rx_len); break;
                 case RADAR_T_ZTECH:
@@ -2271,7 +2272,8 @@ static uint8_t poll_radar(const char *ts, uint8_t mask) {
      * setting it out here would race with du_task reconfiguring the port for
      * a dispenser read. */
     /* poll_incoming_mqtt() after every tank, not just at the end of the round.
-     * A tank that has to time out costs ~800 ms x RADAR_READ_RETRIES, and with
+     * A tank that has to time out costs ~4 s (RADAR_READ_RETRIES x the 1 s reply
+     * window, 500 ms apart — config.h), and with
      * several configured this loop could hold an inbound command — a panel
      * unlock in particular — for seconds. The lock is the one command where
      * latency is felt by a person standing at the box, so it gets serviced at
@@ -2321,8 +2323,9 @@ static bool poll_genset(const char *ts) {
      * powered down — pinned the bus for ~3.3 s every 5 minutes, long enough to
      * push a dispenser round past its own wait. Each attempt re-asserts the
      * baud under the lock, so nothing about correctness changes; the worst-case
-     * hold just drops to one genset_poll (~1.6 s for a Mahindra's three reads,
-     * ~1.1 s for the two-read models). A lock timeout mid-burst
+     * hold just drops to one genset_poll (~3.1 s for a silent Mahindra's three
+     * reads, ~2 s for the two-read models, at the 1 s reply window in config.h).
+     * A lock timeout mid-burst
      * abandons the remaining attempts and publishes 404 for this cycle, exactly
      * as a dead DG would. */
     bool ok = false;
@@ -2337,7 +2340,7 @@ static bool poll_genset(const char *ts) {
     memset(&gd, 0, sizeof(gd));
     genset_expect(g_cfg.genset_model, &gd);
     for (int attempt = 1; attempt <= GENSET_READ_RETRIES && !ok; attempt++) {
-        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(100));
+        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(MODBUS_RETRY_GAP_MS));
         if (!rs485_bus_lock(RS485_BUS_WAIT_MAIN_MS)) {
             ESP_LOGW(TAG, "genset: RS485 bus busy — attempt %d/%d skipped",
                      attempt, GENSET_READ_RETRIES);
@@ -3218,12 +3221,9 @@ void app_main(void) {
     mqtt_set_activity_cb(led_activity_pulse);   /* blink on every cloud push */
 
     /* Upload the trusted root CA once, before the first TLS attempt of any
-     * kind — both mqtt_connect() and fota_download() assume this file
-     * already exists on the modem's UFS by the time they run. A failure
-     * here is logged but not fatal: mqtt_connect() will still try TLS with
-     * seclevel=1 pointing at a cacert file that doesn't exist, which the
-     * modem will reject — that's a loud, visible connect failure, safer
-     * than silently falling back to no validation. */
+     * kind — with TLS_VERIFY_SERVER 1 both mqtt_connect() and fota_download()
+     * rely on it. With 0 (the setting since 2026-09-28, config.h) nothing
+     * reads it and this returns at once without touching the modem. */
     tls_ca_provision();
 
     /* Initial MQTT: try a few times; if the broker/session won't come up,

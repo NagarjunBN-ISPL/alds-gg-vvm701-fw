@@ -45,6 +45,10 @@ python3 extract.py "$SRC/dispenser.c" func:du_bytes_to_hex func:clamp_pos \
     func:du_build_nozzle_payload > extracted_payload.inc || rc=1
 python3 extract.py "$SRC/gps.c" func:next_field func:gps_parse_loc func:add_field \
     func:gps_build_payload func:gps_gsv_summary > extracted_gps.inc || rc=1
+python3 extract.py "$SRC/di.c" func:di_enqueue func:di_publish_buffer \
+    > extracted_di.inc || rc=1
+python3 extract.py "$SRC/modem.c" func:days_from_civil func:parse_and_set_rtc \
+    func:qntp_time > extracted_rtc.inc || rc=1
 
 # ── functional suites ───────────────────────────────────────────────────────
 gcc $CFLAGS test_yenen_rsp.c "$SRC/yenen.c" -o t  || rc=1   # RSP driver + noise
@@ -63,8 +67,12 @@ gcc $CFLAGS $SAN test_store_fuzz.c simfs.c store_host.o     -o tst || rc=1
 gcc $CFLAGS $SAN test_json_fuzz.c                           -o tj  || rc=1
 gcc $CFLAGS $SAN test_gps.c -lm                             -o tgps || rc=1  # AT+QGPSLOC parser + payload (bwsr's suite)
 gcc $CFLAGS $SAN test_kfactor.c "$SRC/dispenser.c"            -o tkf || rc=1   # k-factor cache vs a simulated pump
+gcc $CFLAGS $SAN test_bluesky_frame.c                         -o tbf || rc=1   # BlueSky reply check vs field frames
+gcc $CFLAGS $SAN test_radar.c "$SRC/radar.c"                  -o trd || rc=1   # radar reply timing vs a simulated radar
+gcc $CFLAGS $SAN test_di.c                                    -o tdi || rc=1   # DI queue: change time kept, oldest dropped
+gcc $CFLAGS $SAN test_rtc.c                                   -o trtc || rc=1  # NTP result -> UTC clock, same guards
 
-for f in t tm td ty tg tn tp tl tfz tst tj tgps tkf; do
+for f in t tm td ty tg tn tp tl tfz tst tj tgps tkf tbf trd tdi trtc; do
     out=$(./$f 2>/dev/null)
     echo "$f: $(echo "$out" | tail -1)"
     echo "$out" | grep -q "0 failures" || rc=1

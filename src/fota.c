@@ -84,18 +84,18 @@ static bool fota_download(const char *url, char *reason, size_t reason_size) {
 
     fota_pdp_refresh();
 
-    /* SSL config on dedicated context. Until 2026-07-17 this ran with
-     * seclevel=0 PLUS ignoreinvalidcertsign=1 and ignoremulticertchainverify
-     * =1 — meaning the HTTPS-only check in fota_perform() was the only real
-     * gate, and a network-position attacker (rogue DNS, compromised APN
-     * routing, a fake AP) could present ANY certificate, including a
-     * self-signed one, and this device would download and FLASH whatever
-     * "firmware" it served. That's the worst-case outcome in this whole
-     * system: attacker-controlled code execution. Now verified against the
-     * CA tls_ca_provision() uploads at boot (see tls_ca.c) — cacert is
-     * re-asserted here every attempt, same defensive posture as the rest of
-     * this block, since a modem_hard_reset() between retries (see
-     * fota_perform()) clears QSSLCFG state.
+    /* SSL config on dedicated context. The certificate policy follows
+     * TLS_VERIFY_SERVER (config.h). History, so the trade is on record:
+     * until 2026-07-17 this ran with seclevel=0 plus both ignore flags, so a
+     * network-position attacker (rogue DNS, compromised APN routing) could
+     * present ANY certificate and have this device FLASH whatever it served —
+     * attacker-controlled code execution. 2026-07-17..09-28 it verified
+     * against the CA bundle. On 2026-09-28 the product decision was that an
+     * update which cannot fail outweighs that risk (stations countrywide,
+     * FOTA the only reach), so TLS_VERIFY_SERVER 0 restores the unverified
+     * set. cacert is still re-asserted here every attempt, since a
+     * modem_hard_reset() between retries (see fota_perform()) clears QSSLCFG
+     * state, and it is what 1 would use.
      *
      * ignorelocaltime stays 1: this is a clock-skew safety net (the modem's
      * own RTC may not be network-synced yet at the point FOTA runs), not a
@@ -116,15 +116,25 @@ static bool fota_download(const char *url, char *reason, size_t reason_size) {
     modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ciphersuite\",%d,0XFFFF", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
-    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"cacert\",%d,\"%s\"", FOTA_SSL_CTX, TLS_CA_FILE);
-    modem_at(cmd, "OK", 3000, NULL, 0);
-    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"seclevel\",%d,1", FOTA_SSL_CTX);
+    /* TLS_VERIFY_SERVER (config.h) decides cacert and the next three. 0 — the
+     * 2026-09-28 "FOTA must not fail" decision — sends exactly the
+     * pre-2026-07-17 sequence (commit 3e21943, and OTA_Integration before it):
+     * no cacert, seclevel 0 plus both ignore flags, so no certificate problem
+     * can stop an update. The download is still encrypted (https only). */
+    if (TLS_VERIFY_SERVER) {
+        snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"cacert\",%d,\"%s\"", FOTA_SSL_CTX, TLS_CA_FILE);
+        modem_at(cmd, "OK", 3000, NULL, 0);
+    }
+    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"seclevel\",%d,%d", FOTA_SSL_CTX,
+             TLS_VERIFY_SERVER ? 1 : 0);
     modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignorelocaltime\",%d,1", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
-    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignoreinvalidcertsign\",%d,0", FOTA_SSL_CTX);
+    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignoreinvalidcertsign\",%d,%d", FOTA_SSL_CTX,
+             TLS_VERIFY_SERVER ? 0 : 1);
     modem_at(cmd, "OK", 3000, NULL, 0);
-    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignoremulticertchainverify\",%d,0", FOTA_SSL_CTX);
+    snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignoremulticertchainverify\",%d,%d", FOTA_SSL_CTX,
+             TLS_VERIFY_SERVER ? 0 : 1);
     modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"sni\",%d,1", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
@@ -192,21 +202,29 @@ static bool fota_download(const char *url, char *reason, size_t reason_size) {
      * g_len at its -1 sentinel. Proceeding would save a 0-byte file, and
      * fota_flash() would then fail cleanly, but only after burning a retry
      * attempt on a request that was never going to work. */
+    /* No usable Content-Length (a chunked reply) is NOT a failure any more: the
+     * body is saved and flashed all the same, and esp_ota_end()'s check of the
+     * image's own header and SHA-256 decides whether it is whole. Only the UFS
+     * size comparison below needs the length, so it is skipped without one. */
     if (g_len <= 0) {
-        ESP_LOGE(TAG, "HTTPS GET: missing or invalid content-length (%d)", g_len);
-        fota_set_reason(reason, reason_size, "bad_content_length");
-        return false;
+        ESP_LOGW(TAG, "HTTP 200 without a usable content-length (%d) — downloading "
+                      "anyway; the image check decides", g_len);
+        g_len = -1;
     }
     ESP_LOGI(TAG, "HTTP 200 OK (%d bytes) — saving to UFS ...", g_len);
 
-    /* Save the response body to a UFS file, then fota_flash() reads it out. */
+    /* Save the response body to a UFS file, then fota_flash() reads it out.
+     * The modem's own parameter stays the proven 120 (every FOTA that has run
+     * on this modem used it); only OUR wait for the result is longer —
+     * FOTA_READFILE_WAIT_S, config.h — so a slow cell that is still
+     * delivering is not abandoned at 130 s. */
     snprintf(cmd, sizeof(cmd), "AT+QHTTPREADFILE=\"%s\",120", FOTA_FILE);
     if (!modem_at(cmd, "OK", 5000, NULL, 0)) {
         ESP_LOGE(TAG, "QHTTPREADFILE rejected");
         fota_set_reason(reason, reason_size, "readfile_rejected");
         return false;
     }
-    if (!modem_read_until("+QHTTPREADFILE:", 130000, resp, sizeof(resp))) {
+    if (!modem_read_until("+QHTTPREADFILE:", (FOTA_READFILE_WAIT_S + 10) * 1000, resp, sizeof(resp))) {
         ESP_LOGE(TAG, "QHTTPREADFILE timeout");
         fota_set_reason(reason, reason_size, "readfile_timeout");
         return false;
@@ -237,7 +255,7 @@ static bool fota_download(const char *url, char *reason, size_t reason_size) {
         const char *comma = p ? strchr(p, ',') : NULL;
         if (comma) stored = atoi(comma + 1);
         ESP_LOGI(TAG, "UFS holds %d bytes, HTTP delivered %d", stored, g_len);
-        if (stored >= 0 && stored != g_len) {
+        if (g_len > 0 && stored >= 0 && stored != g_len) {
             ESP_LOGE(TAG, "UFS file is SHORT — %d of %d bytes; refusing to flash a partial image",
                      stored, g_len);
             fota_set_reason(reason, reason_size, "ufs_short_%d", stored);
@@ -496,7 +514,7 @@ static bool fota_flash(char *reason, size_t reason_size) {
  * attempts — no OTA partition, an over-long QFREAD command — aborts at once;
  * everything else (network, HTTP status, short read, verify) is retried. */
 #define FOTA_ATTEMPTS        5
-#define FOTA_TOTAL_BUDGET_MS (15 * 60 * 1000)
+/* FOTA_TOTAL_BUDGET_MS lives in config.h (30 min since 2026-09-28). */
 
 static bool fota_reason_is_final(const char *reason) {
     return reason && (strcmp(reason, "no_ota_partition")  == 0 ||
@@ -546,11 +564,11 @@ bool fota_perform(const char *url, const char *pub_topic,
     clean_url[sizeof(clean_url) - 1] = '\0';
     sanitize_url(clean_url);
 
-    /* HTTPS only. "http" (4 chars) would also match "http://" — accepting
-     * plaintext FOTA means the firmware binary itself travels unencrypted
-     * and unauthenticated, letting anyone on the network path (or a
-     * compromised/spoofed server) hand the device arbitrary code to flash
-     * and boot. We only ever generate/expect https:// URLs. */
+    /* HTTPS only — plain http stays refused (user decision, 2026-09-28) even
+     * though the server certificate is no longer checked (TLS_VERIFY_SERVER,
+     * config.h): the image still travels encrypted, so a passive listener on
+     * the path can neither read nor change it; that takes an active
+     * man-in-the-middle. */
     if (strncmp(clean_url, "https://", 8) != 0) {
         ESP_LOGE(TAG, "FOTA: rejecting non-HTTPS URL [%s]", clean_url);
         fota_set_reason(reason, reason_size, "non_https_url");
@@ -568,23 +586,29 @@ bool fota_perform(const char *url, const char *pub_topic,
             fota_set_reason(reason, reason_size, "budget_exhausted");
             break;
         }
+        bool net_ok = true;
         if (attempt == 3 || attempt == FOTA_ATTEMPTS) {
             ESP_LOGW(TAG, "FOTA: escalating — power-cycling modem before attempt %d", attempt);
             modem_hard_reset();
             esp_task_wdt_reset();
-            if (!network_init()) {
-                ESP_LOGE(TAG, "FOTA: network rebuild failed after modem reset");
+            /* A failed rebuild costs THIS attempt, not the whole update (it
+             * used to abort here): the next attempt's fota_pdp_refresh() tries
+             * the data context again after the normal back-off. */
+            net_ok = network_init();
+            if (!net_ok) {
+                ESP_LOGE(TAG, "FOTA: network rebuild failed after modem reset — "
+                              "counting it as a failed attempt");
                 fota_set_reason(reason, reason_size, "network_rebuild_failed");
-                break;
+            } else {
+                /* Re-provisioning after a power-cycle is cheap insurance
+                 * against a module that came back without the CA file
+                 * (only consulted when TLS_VERIFY_SERVER is 1). */
+                tls_ca_provision();
             }
-            /* The download verifies S3's certificate against the CA file in
-             * the modem's UFS. Re-provisioning after a power-cycle is cheap
-             * insurance against a module that came back without it. */
-            tls_ca_provision();
             esp_task_wdt_reset();
         }
 
-        if (fota_download(clean_url, reason, reason_size) &&
+        if (net_ok && fota_download(clean_url, reason, reason_size) &&
             fota_flash(reason, reason_size))
             return true;
 

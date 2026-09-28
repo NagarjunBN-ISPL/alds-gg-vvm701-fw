@@ -70,25 +70,31 @@ static void radar_frame(uint8_t slave, uint8_t func, uint8_t *out /* 8 bytes */)
     radar_frame_ex(slave, func, 0x0000, 0x0002, out);
 }
 
-/* 500 ms fixed read window for radar (no per-byte-reset needed) */
-#define RADAR_TIMEOUT_MS 500
-
 /* Reading 2 registers: slave + FC + bytecount + 4 data + 2 CRC = 9 bytes */
 #define RADAR_RESP_LEN 9
 
+/* One request/reply. Timing is the shared Modbus rule in config.h: the radar
+ * gets MODBUS_REPLY_TIMEOUT_MS to start answering, then the read ends at the
+ * expected length, after MODBUS_BYTE_GAP_MS of silence, or at the hard cap.
+ * There is no fixed wait after transmitting: the UART buffers the reply while
+ * we wait, so the 200 ms "turnaround" delay this used to have only shortened
+ * the window. */
 static int radar_xfer(const uint8_t *cmd, size_t cmd_len,
                       uint8_t *resp, size_t resp_max, int expected) {
     uint8_t tmp[64];
     while (uart_read_bytes(RS485_UART, tmp, sizeof(tmp), 0) > 0);
 
     uart_write_bytes(RS485_UART, cmd, cmd_len);
-    vTaskDelay(pdMS_TO_TICKS(200)); /* TX→RX turn-around */
 
     int got = 0;
-    int64_t dl = esp_timer_get_time() + (int64_t)RADAR_TIMEOUT_MS * 1000;
-    while (esp_timer_get_time() < dl && got < (int)resp_max) {
+    int64_t t0   = esp_timer_get_time();
+    int64_t dl   = t0 + (int64_t)MODBUS_REPLY_TIMEOUT_MS * 1000;       /* first byte */
+    int64_t hard = t0 + (int64_t)MODBUS_REPLY_TIMEOUT_MS * 2 * 1000;   /* whole reply */
+    while (got < (int)resp_max) {
+        int64_t now = esp_timer_get_time();
+        if (now >= dl || now >= hard) break;
         /* WDT feed, same rationale as the genset/dispenser read loops: safe by
-         * construction rather than by the current value of RADAR_TIMEOUT_MS. */
+         * construction rather than by the current value of the timeouts. */
         if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(RS485_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
@@ -98,6 +104,7 @@ static int radar_xfer(const uint8_t *cmd, size_t cmd_len,
              * extra garbage bytes after a valid frame would break the
              * CRC check below and turn good data into a false 404. */
             if (got >= expected) break;
+            dl = esp_timer_get_time() + (int64_t)MODBUS_BYTE_GAP_MS * 1000;
         }
     }
     return got;
