@@ -1,6 +1,5 @@
 #include "tls_ca.h"
 #include "modem.h"
-#include "config.h"
 #include "esp_log.h"
 #include <string.h>
 #include <stdio.h>
@@ -187,15 +186,6 @@ static const char *k_ca_bundle =
 "-----END CERTIFICATE-----\n";
 
 bool tls_ca_provision(void) {
-    /* With server verification off (config.h TLS_VERIFY_SERVER 0) nothing
-     * reads the CA file, so none of this runs: the modem then gets exactly the
-     * SSL setup it ran on until 2026-07-17 — no file, no cacert reference —
-     * rather than a mix of old and new that was never exercised. */
-    if (!TLS_VERIFY_SERVER) {
-        ESP_LOGI(TAG, "server certificate check off (TLS_VERIFY_SERVER 0) — CA bundle not uploaded");
-        return true;
-    }
-
     size_t len = strlen(k_ca_bundle);
     if (!modem_upload_file(TLS_CA_FILE, k_ca_bundle, len)) {
         ESP_LOGE(TAG, "CA cert upload failed — TLS validation cannot be enabled this boot");

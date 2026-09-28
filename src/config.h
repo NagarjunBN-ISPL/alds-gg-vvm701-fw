@@ -359,8 +359,7 @@
  * announcements (each a blocking publish), so the window is sized to cover a
  * slow link with margin; a genuine command that falls inside it is simply
  * re-sent by the operator, who sees the ack. setconfig is exempt: its own
- * byte-identical guard handles the retained case without losing a real push.
- * FOTA is exempt too since 2026-09-28 — see "FOTA must not fail" below. */
+ * byte-identical guard handles the retained case without losing a real push. */
 #define CMD_RETAIN_GRACE_MS  15000
 /* The panel lock keeps its OWN, shorter grace to match cng-cpil's lock contract
  * byte-for-byte (lock_cmd.h LOCK_RETAIN_GRACE_MS): a human pressing unlock and a
@@ -368,37 +367,6 @@
  * lock ack/refusal rides <base>/<imei>/lock/out, not <base>/data. The other
  * one-shot commands (restart/factory_reset/FOTA) keep CMD_RETAIN_GRACE_MS. */
 #define LOCK_RETAIN_GRACE_MS  5000
-
-/* ── FOTA must not fail (product decision, 2026-09-28) ───────────────────────
- * Stations are spread across the country and FOTA is the only way to reach
- * them, so no security check may be what stops an update: a compromised
- * gateway was judged less bad than an unreachable fleet. Hence:
- *
- * TLS_VERIFY_SERVER 0 — MQTT (the FOTA command channel) and the FOTA download
- *   stay ENCRYPTED but do not check the server's certificate (QSSLCFG seclevel
- *   0, what both paths ran on until 2026-07-17). A CA change, an expired
- *   cross-sign, a broker moved to another CA or a missing CA file can then no
- *   longer cut the fleet off. With 0 the CA bundle is not uploaded and no
- *   cacert is set — the exact SSL sequence both paths ran on until July. 1
- *   brings back the upload and the check with nothing else to change.
- *
- * FOTA commands are NOT dropped by the retain grace any more: an update queued
- * while the gateway was offline runs when it reconnects. What stops a retained
- * URL from looping is the NVS memory of an applied/rolled-back URL (main.c)
- * and FOTA_RETRY_COOLDOWN_S for one that failed.
- *
- * FOTA_RETRY_COOLDOWN_S — a URL that just failed is refused for this long
- *   (fota_skip_known_bad), then accepted again without "force", so the cloud's
- *   plain re-send works. Bounds a retained bad URL to one attempt per window.
- * FOTA_READFILE_WAIT_S — how long WE wait for the modem to report the image
- *   saved (was 130 s); 600 s covers ~450 KB at ~6 kbit/s, a 2G fallback cell.
- *   The modem's own AT+QHTTPREADFILE parameter stays the proven 120.
- * FOTA_TOTAL_BUDGET_MS — all attempts together; MQTT is down meanwhile and
- *   du_task buffers to flash, which holds hours. */
-#define TLS_VERIFY_SERVER      0
-#define FOTA_RETRY_COOLDOWN_S  1800               /* 30 min */
-#define FOTA_READFILE_WAIT_S   600
-#define FOTA_TOTAL_BUDGET_MS   (30 * 60 * 1000)
 
 /* ── Connectivity recovery (layered escalation) ──────────────────────────── */
 #define MQTT_RECONNECT_RETRIES 5      /* L1: plain MQTT reconnect attempts   */

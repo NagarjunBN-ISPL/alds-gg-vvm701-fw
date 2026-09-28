@@ -253,7 +253,7 @@ All on `<base>/data`, bare IMEI unless noted, one-shot.
 | `{"status":"cmd_ignored_retained","cmd":".."}` | a `restart`/`factory_reset` arrived within 15 s of subscribing, treated as retained and dropped |
 | `{"status":"connectivity_rollback","reason":"new_settings_unreachable"}` | a pushed APN/broker change did not reach a broker; reverted |
 | `fota_initiated`, `fota_successful` (`"handover":true` on a product swap), `fota_completed` | section 8.3 |
-| `fota_failed` (`reason`), `fota_skip_known_bad`, `fota_skip_already_applied`, `fota_skip_reverted`, `fota_reverted` (`image`) | section 8.3 |
+| `fota_failed` (`reason`), `fota_skip_known_bad`, `fota_skip_already_applied`, `fota_skip_reverted`, `fota_ignored_retained`, `fota_reverted` (`image`) | section 8.3 |
 | `{"status":"busy"}` | a second `rsp`/`kfactor` passthrough arrived while one was in flight; no `/out` reply follows |
 | `{"HW_ID":"<hw_id>","status":"rsp_rejected","reason":".."}` / `kfactor_rejected` | passthrough frame refused or unanswered, section 8.6 |
 | `{"HW_ID":"<hw_id>","status":"rsp_readback","data":".."}` / `kfactor_readback` | value read back after a passthrough write |
@@ -329,31 +329,28 @@ https://devfota-fuelsense.s3.ap-south-1.amazonaws.com/fota/gg/alds-gg-vvm701-fw-
 {"url":"https://.../alds-gg-vvm701-fw-1.0.1.bin","target":"gg","force":true}
 ```
 
-HTTPS only, URL up to 511 bytes, and it must be the final URL — redirects are not
-followed. The server's certificate is not checked (encrypted, not authenticated), so
-no CA change can block an update. Use a host the SIM can reach: S3 works; raw.githubusercontent.com
-did not connect from the Airtel IoT SIM (err 716). `target` is optional; anything but
-`gg`/`alds-gg`/`alds-gg-vvm701` is ignored, keeping a GGY fleet payload off GG units on
-the shared broker. Fleet pushes stagger 0-29 s. Sequence: `fota_initiated` (MQTT
-closes), `fota_successful` (flashed, rebooting), then `fota_completed` with the new
-`fw` after the first poll cycle on the new image — the real success. Bounded 30 min,
-5 tries; a slow (2G) cell gets up to 10 min for the download.
+HTTPS only, URL up to 511 bytes; S3 and GitHub raw both work (their CA roots are in
+the image). `target` is optional; anything but `gg`/`alds-gg`/`alds-gg-vvm701` is
+ignored, keeping a GGY fleet payload off GG units on the shared broker. Fleet pushes
+stagger 0-29 s. Sequence: `fota_initiated` (MQTT closes), `fota_successful` (flashed,
+rebooting), then `fota_completed` with the new `fw` after the first poll cycle on the
+new image — the real success. Bounded 15 min, 5 tries.
 
 Failure is `fota_failed` with `reason`: `http_<code>_err_<n>` (404 wrong URL,
 403 forbidden, -1 never reached the server), `non_https_url`, `no_url`,
 `url_too_long`, `url_setup_no_connect`, `url_setup_no_ok`, `get_timeout`,
-`get_rejected`, `ufs_short_<n>`, `file_open_failed`,
+`get_rejected`, `bad_content_length`, `bad_length_<n>` (image size outside
+64 KB-3 MB, e.g. an error page), `ufs_short_<n>`, `file_open_failed`,
 `file_open_parse`, `readfile_timeout`, `readfile_rejected`, `readfile_err_<n>`,
-`read_cmd_too_long`, `read_short`, `read_corrupt_length`,
-`download_read_failed`, `flash_timeout`, `ota_begin_failed`, `ota_write_failed`,
-`image_verify_failed`, `set_boot_failed`, `no_ota_partition`,
-`network_rebuild_failed`, `budget_exhausted`.
+`read_cmd_too_long`, `read_short`, `read_corrupt_length`, `size_mismatch_<n>`
+(bytes written to flash), `download_read_failed`, `flash_timeout`,
+`ota_begin_failed`, `ota_write_failed`, `image_verify_failed`, `set_boot_failed`,
+`no_ota_partition`, `budget_exhausted`.
 
-Publish with retain off — a retained URL re-delivers on every reconnect. An update
-sent while a gateway was offline is delivered and run when it reconnects (the broker
-keeps its session). The device skips a URL it already applied
-(`fota_skip_already_applied`, or `fota_skip_reverted` if that image was rolled back)
-or that failed less than 30 min ago (`fota_skip_known_bad` — just re-send it later);
+Publish with retain off — a retained URL re-delivers on every reconnect. The device
+drops one within 15 s of subscribing (`fota_ignored_retained`), skips a URL it
+already applied (`fota_skip_already_applied`, or `fota_skip_reverted` if that image
+was rolled back) or that already failed this boot (`fota_skip_known_bad`);
 `"force":true` overrides all three, and a fresh file name per release avoids them.
 An image that never confirms itself is rolled back and reported `fota_reverted` with
 the discarded `image` name; config is untouched.
@@ -424,9 +421,8 @@ as-is; use `setrsp` for a Yenen price.
   for network reasons at most 6 times in a row, then stays up.
 - Broker outage: the device stays on the network, buffers to flash and probes the
   broker every 30 s, so the fleet drains within minutes of its return.
-- TLS is encrypted but the broker's and FOTA host's certificates are not checked,
-  so moving either to another CA cannot cut the fleet off. The image still carries
-  ISRG Root X1/X2/YE/YR and Amazon Root CA 1 for the day checking is switched back on.
+- TLS roots in the image: ISRG Root X1, X2, YE, YR and Amazon Root CA 1. A
+  broker or FOTA host on another CA fails to connect.
 
 ## Appendix: Yenen frame decode
 

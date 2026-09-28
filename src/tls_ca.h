@@ -11,9 +11,8 @@
  * brokers and GitHub Pages + Amazon Root CA 1 for S3 — see tls_ca.c) to the
  * modem's UFS and points both SSL contexts at it. Call once at boot, after
  * the modem is confirmed up and before the first TLS connection attempt —
- * with TLS_VERIFY_SERVER 1, mqtt_connect()/fota_download() both assume
- * TLS_CA_FILE already exists by the time they run. With 0 (config.h) it does
- * nothing and returns true.
+ * mqtt_connect()/fota_download() both assume TLS_CA_FILE already exists by
+ * the time they run.
  *
  * Re-uploads unconditionally on every boot rather than trying to detect
  * whether the file is already present and correct: it's a ~6.5 KB write, and

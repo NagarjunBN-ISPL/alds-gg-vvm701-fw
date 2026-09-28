@@ -9,6 +9,13 @@
  * download. Real URLs are well under 200 bytes. */
 #define FOTA_URL_MAX 511
 
+/* Plausible image sizes, from cng-cpil's fota.h (field-proven there). A reply
+ * outside them is refused before anything is saved: an error page served with
+ * a 200 is a few hundred bytes and would otherwise be flashed as firmware.
+ * Today's images are ~450 KB. */
+#define FOTA_MIN_IMAGE_BYTES  65536
+#define FOTA_MAX_IMAGE_BYTES  (3 * 1024 * 1024)
+
 /* True if the image fota_perform() just staged belongs to ANOTHER product
  * (cross-product handover — see image_is_foreign in fota.c). Valid only after
  * fota_perform() returned true, until the restart that follows. The caller
