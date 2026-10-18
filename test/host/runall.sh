@@ -20,12 +20,9 @@ SAN="-g -O1 -fsanitize=address,undefined -Wno-format-truncation"
 rc=0
 
 # ── pull the functions under test out of main.c / nvs_config.c ──────────────
-python3 extract.py "$SRC/main.c" type:PendingRsp_t func:du_nozzle_label \
-    func:json_get_price_x100 func:setrsp_clamp func:setrsp_reject \
-    func:setrsp_publish_ack > extracted.inc || rc=1
-python3 extract.py "$SRC/main.c" func:json_get_int func:json_get_str \
+python3 extract.py "$SRC/main.c" func:json_get_str \
     func:json_has_key func:json_get_bool func:setcfg_has_secret \
-    func:json_get_price_x100 func:payload_is_one_json_object \
+    func:payload_is_one_json_object \
     > extracted_json.inc || rc=1
 python3 extract.py "$SRC/main.c" func:mqtt_reconnect_if_needed \
     > extracted_ladder.inc || rc=1
@@ -38,9 +35,16 @@ python3 extract.py "$SRC/nvs_config.c" func:erase_sibling_namespaces \
     > extracted_product.inc || rc=1
 python3 extract.py "$SRC/main.c" func:validate_suffixes func:radar_slave_for \
     func:validate_bus_addresses > extracted_plan.inc || rc=1
-python3 extract.py "$SRC/main.c" func:json_get_int func:json_get_str func:json_has_key \
-    func:setcfg_get_sfx func:setcfg_int_in_range func:setcfg_genset_addr \
+python3 extract.py "$SRC/main.c" func:json_get_str func:json_has_key \
+    func:setcfg_get_sfx func:setcfg_value func:setcfg_value_ends \
+    func:setcfg_int_in_range func:setcfg_genset_addr \
+    func:setcfg_get_text func:streq_ci func:setcfg_du_slots \
     > extracted_setcfg.inc || rc=1
+python3 extract.py "$SRC/main.c" func:json_get_str func:json_has_key \
+    func:setcfg_get_sfx func:setcfg_value func:setcfg_value_ends func:setcfg_word \
+    func:setcfg_int_in_range func:setcfg_get_bool func:setcfg_get_text \
+    func:setcfg_genset_addr func:setcfg_check_members func:payload_is_one_json_object \
+    > extracted_setcfg_all.inc || rc=1
 python3 extract.py "$SRC/dispenser.c" func:du_bytes_to_hex func:clamp_pos \
     func:du_build_nozzle_payload > extracted_payload.inc || rc=1
 python3 extract.py "$SRC/gps.c" func:next_field func:gps_parse_loc func:add_field \
@@ -51,13 +55,14 @@ python3 extract.py "$SRC/modem.c" func:days_from_civil func:parse_and_set_rtc \
     func:qntp_time > extracted_rtc.inc || rc=1
 
 # ── functional suites ───────────────────────────────────────────────────────
-gcc $CFLAGS test_yenen_rsp.c "$SRC/yenen.c" -o t  || rc=1   # RSP driver + noise
-gcc $CFLAGS test_main_rsp.c simnvs.c "$SRC/nvs_config.c" -o tm || rc=1   # price parse, acks
-gcc $CFLAGS test_du_plan.c  simnvs.c "$SRC/nvs_config.c" -o td || rc=1   # suffix = dispenser number
+gcc $CFLAGS test_yenen.c "$SRC/yenen.c"     -o t  || rc=1   # Yenen poll path + noise
+gcc $CFLAGS test_du_plan.c  simnvs.c "$SRC/nvs_config.c" -o td || rc=1   # slot ON with its suffix = dispenser number
+gcc $CFLAGS test_setcfg.c                   -o tsc || rc=1  # setconfig: bad values refused, never clamped
 gcc $CFLAGS test_payload.c                  -o ty || rc=1   # nozzle payload = field shape
 gcc $CFLAGS test_genset.c "$SRC/genset.c"   -o tg || rc=1   # DG reads = the spec's frames
 gcc $CFLAGS test_nvs_creds.c                -o tn || rc=1   # firmware creds win
 gcc $CFLAGS test_product_guard.c            -o tp || rc=1   # product guard
+gcc $CFLAGS test_cpu_load.c "$SRC/cpu_load.c" -o tcpu || rc=1   # per-core CPU load in diagnostics
 
 # ── fault injection, sanitizers on ──────────────────────────────────────────
 gcc $CFLAGS $SAN test_ladder.c                              -o tl  || rc=1
@@ -68,11 +73,12 @@ gcc $CFLAGS $SAN test_json_fuzz.c                           -o tj  || rc=1
 gcc $CFLAGS $SAN test_gps.c -lm                             -o tgps || rc=1  # AT+QGPSLOC parser + payload (bwsr's suite)
 gcc $CFLAGS $SAN test_kfactor.c "$SRC/dispenser.c"            -o tkf || rc=1   # k-factor cache vs a simulated pump
 gcc $CFLAGS $SAN test_bluesky_frame.c                         -o tbf || rc=1   # BlueSky reply check vs field frames
+gcc $CFLAGS $SAN test_rsp_tunnel.c "$SRC/rsp_tunnel.c"        -o trt || rc=1   # rsp/kfactor tunnel: bytes in = bytes out
 gcc $CFLAGS $SAN test_radar.c "$SRC/radar.c"                  -o trd || rc=1   # radar reply timing vs a simulated radar
 gcc $CFLAGS $SAN test_di.c                                    -o tdi || rc=1   # DI queue: change time kept, oldest dropped
 gcc $CFLAGS $SAN test_rtc.c                                   -o trtc || rc=1  # NTP result -> UTC clock, same guards
 
-for f in t tm td ty tg tn tp tl tfz tst tj tgps tkf tbf trd tdi trtc; do
+for f in t td tsc ty tg tn tp tcpu tl tfz tst tj tgps tkf tbf trt trd tdi trtc; do
     out=$(./$f 2>/dev/null)
     echo "$f: $(echo "$out" | tail -1)"
     echo "$out" | grep -q "0 failures" || rc=1

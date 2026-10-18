@@ -302,6 +302,32 @@ static bool image_is_foreign(const esp_partition_t *part) {
     return foreign;
 }
 
+/* ── Which images this gateway will take ──────────────────────────────────
+ * Every VVM701 product — alds-gg, alds-ggy, alds-iocl, btpl-gg, cng-cpil,
+ * bwsr-neo, hsd-snf, project name "<product>-vvm701-fw" — shares one partition
+ * table, bootloader configuration and flash layout, so any of them may replace
+ * any other by FOTA, in every direction. Anything else (an Arduino or
+ * PlatformIO build, whose partition table sits at 0x8000; a test image; the
+ * wrong file) would be booted by this board's bootloader and fail to find its
+ * partition table: a rollback at best, a site visit at worst. alds-sr is a
+ * VVM701 product but runs secure boot, outside the swap set, and is refused.
+ *
+ * A NAME PATTERN, not a list, on purpose: a product added later is accepted by
+ * every gateway already in the field without updating them first. The same
+ * rule, word for word, is in every VVM701 product's FOTA. */
+#define FOTA_IMAGE_SUFFIX   "-vvm701-fw"
+#define FOTA_IMAGE_REFUSED  "alds-sr-vvm701-fw"
+
+static bool fota_image_allowed(const char *name, size_t name_size) {
+    char   n[64];
+    size_t sl = strlen(FOTA_IMAGE_SUFFIX);
+    if (!name || name_size == 0) return false;
+    int len = snprintf(n, sizeof(n), "%.*s", (int)name_size, name);
+    if (len <= 0 || (size_t)len >= sizeof(n) || (size_t)len <= sl) return false;
+    if (strcmp(n + (size_t)len - sl, FOTA_IMAGE_SUFFIX) != 0) return false;
+    return strcmp(n, FOTA_IMAGE_REFUSED) != 0;
+}
+
 /* ── UFS → OTA partition ─────────────────────────────────────────────── */
 static bool fota_flash(int expected, char *reason, size_t reason_size) {
     char cmd[128], hdr[128];
@@ -479,6 +505,20 @@ static bool fota_flash(int expected, char *reason, size_t reason_size) {
         return false;
     }
 
+    /* Before the boot slot is committed: a refused image is written but never
+     * booted, and the running firmware stays exactly as it was. */
+    {
+        esp_app_desc_t desc;
+        memset(&desc, 0, sizeof(desc));
+        if (esp_ota_get_partition_description(update_part, &desc) != ESP_OK ||
+            !fota_image_allowed(desc.project_name, sizeof(desc.project_name))) {
+            ESP_LOGE(TAG, "the image is '%.*s' — not a VVM701 swap-set firmware; refused, "
+                          "nothing changed", (int)sizeof(desc.project_name), desc.project_name);
+            fota_set_reason(reason, reason_size, "not_a_vvm701_image");
+            return false;
+        }
+    }
+
     if (esp_ota_set_boot_partition(update_part) != ESP_OK) {
         ESP_LOGE(TAG, "Set boot partition failed");
         fota_set_reason(reason, reason_size, "set_boot_failed");
@@ -526,14 +566,16 @@ static bool fota_flash(int expected, char *reason, size_t reason_size) {
  * MQTT is torn down for the duration, du_task is buffering to flash, and the
  * queue needs the broker back more than this update needs a fifth try on a
  * link that has failed four times. And a reason that cannot change between
- * attempts — no OTA partition, an over-long QFREAD command — aborts at once;
+ * attempts — no OTA partition, an over-long QFREAD command, an image that is
+ * not a VVM701 swap-set firmware — aborts at once;
  * everything else (network, HTTP status, short read, verify) is retried. */
 #define FOTA_ATTEMPTS        5
 #define FOTA_TOTAL_BUDGET_MS (15 * 60 * 1000)
 
 static bool fota_reason_is_final(const char *reason) {
-    return reason && (strcmp(reason, "no_ota_partition")  == 0 ||
-                      strcmp(reason, "read_cmd_too_long") == 0);
+    return reason && (strcmp(reason, "no_ota_partition")   == 0 ||
+                      strcmp(reason, "read_cmd_too_long")  == 0 ||
+                      strcmp(reason, "not_a_vvm701_image") == 0);
 }
 
 /* Strip leading/trailing whitespace, quotes and CR/LF from the URL.

@@ -1,13 +1,14 @@
 /* Host harness for the BlueSky reply check in src/dispenser.c. The file is
  * #included whole, so the static bluesky_read_valid() is tested directly, and
- * du_poll_bluesky_nozzle() / du_exec_bluesky_passthrough() are driven against
- * a pump that replays exact bytes.
+ * du_poll_bluesky_nozzle() is driven against a pump that replays exact bytes.
  *
  * What it pins:
  *   - every real field frame passes — the checksum rule is right (a wrong rule
  *     would turn every nozzle in the fleet into "404");
  *   - each kind of damaged frame is dropped, retried, and never published;
- *   - the idle gate, the payload shape and the passthrough are unchanged. */
+ *   - the idle gate and the payload shape are unchanged.
+ * (The rsp/kfactor tunnel checks nothing and lives in rsp_tunnel.c — see
+ * test_rsp_tunnel.c.) */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -54,12 +55,10 @@ static Frame fr(const char *hex) {
 
 /* ── the pump: replays exact bytes ─────────────────────────────────────────
  * A read command answers with the next frame queued for it, or once the queue
- * is empty with its standing reply (len 0 = silent). Anything longer than a
- * 5-byte read is a write and gets write_ack. */
+ * is empty with its standing reply (len 0 = silent). */
 static Frame standing[256];
 static Frame queued[256][8];
 static int   nqueued[256], qpos[256], reads[256];
-static Frame write_ack;
 
 static uint8_t rx[64];
 static int     rx_len, rx_pos;
@@ -77,7 +76,6 @@ static void pump_reset(void) {
     standing[BS_CMD_TOTAL]  = fr(V_TOTAL);
     standing[BS_CMD_RSP]    = fr(V_RSP);
     standing[BS_CMD_KFACT]  = fr(V_KFACT);
-    write_ack = fr("f5,02,a2,b7,00");
 }
 
 int uart_write_bytes(uart_port_t port, const void *src, size_t size) {
@@ -89,8 +87,6 @@ int uart_write_bytes(uart_port_t port, const void *src, size_t size) {
         uint8_t cmd = f[3];
         reads[cmd]++;
         r = (qpos[cmd] < nqueued[cmd]) ? &queued[cmd][qpos[cmd]++] : &standing[cmd];
-    } else if (size > 5 && f[0] == 0xF5) {
-        r = &write_ack;
     }
     if (r && r->len) { memcpy(rx, r->b, (size_t)r->len); rx_len = r->len; }
     return (int)size;
@@ -258,33 +254,6 @@ int main(void) {
     nz = poll2();
     CHECK(nz.present && nz.idle && nz.total_len == 15, "[7] 0x00 idle: present=%d idle=%d total_len=%d",
           nz.present, nz.idle, nz.total_len);
-
-    /* [8] Passthrough: the write's own reply is still checked for header and
-     *     address only (its layout is unknown); the read-back is checked in full. */
-    {
-        char resp[64], rb[64], reason[32], hex[40];
-        uint8_t w[] = {0xF5, 0x02, 0xA4, 0xB7, 0x65, 0x82, 0};
-        w[6] = bluesky_chk(w, 6);
-        du_bytes_to_hex(w, 7, hex, sizeof(hex));
-
-        pump_reset();
-        bool ok = du_exec_bluesky_passthrough(hex, 1, 2, BS_CMD_RSP, resp, sizeof(resp), rb, sizeof(rb),
-                                              reason, sizeof(reason));
-        CHECK(ok && strcmp(resp, "f5,02,a2,b7,00") == 0 && strcmp(rb, V_RSP) == 0,
-              "[8] rsp write: ok=%d resp=%s rb=%s", ok, resp, rb);
-
-        pump_reset();
-        queue(0xB6, "f5,02,a4,65,82,b6,03", 2);            /* read-back damaged on both attempts */
-        ok = du_exec_bluesky_passthrough(hex, 1, 2, BS_CMD_RSP, resp, sizeof(resp), rb, sizeof(rb),
-                                         reason, sizeof(reason));
-        CHECK(ok && rb[0] == '\0', "[8] damaged read-back must be dropped: ok=%d rb=%s", ok, rb);
-
-        pump_reset();
-        queue(0xD5, "f5,02,a3,80,d5,00", DU_STATUS_RETRIES); /* damaged status: gate refuses */
-        ok = du_exec_bluesky_passthrough(hex, 1, 2, BS_CMD_RSP, resp, sizeof(resp), rb, sizeof(rb),
-                                         reason, sizeof(reason));
-        CHECK(!ok && strcmp(reason, "nozzle_absent") == 0, "[8] damaged status: ok=%d reason=%s", ok, reason);
-    }
 
     printf("%d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;

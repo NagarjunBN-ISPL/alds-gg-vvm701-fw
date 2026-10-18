@@ -24,11 +24,14 @@ typedef enum {
  * or change size, bump the "/N" in PRODUCT_ID (config.h) so the product guard
  * treats the old blob as foreign and wipes it instead of misreading it. */
 typedef struct {
-    uint8_t  du_count;                        /* 0-6 */
-    uint8_t  du_make[DU_MAX_DISPENSERS];      /* du_make_t per entry */
-    char     du_sfx[DU_MAX_DISPENSERS][3];    /* 2-digit dispenser number + NUL;
-                                               * "" = the entry's position. See
-                                               * du_number_of() below. */
+    /* ── Dispenser slots: slot i (0-based, setconfig keys du<i+1>Make /
+     * du<i+1>Sfx) is ON when its suffix is set, and polls dispenser
+     * du_number_of(cfg, i) = that suffix. An empty suffix = slot OFF, never
+     * polled. du_count = the number of slots ON: setconfig keeps it in step
+     * and nvs_config_load() re-derives it from the suffixes. */
+    uint8_t  du_count;                        /* slots ON, 0-6 */
+    uint8_t  du_make[DU_MAX_DISPENSERS];      /* du_make_t per slot */
+    char     du_sfx[DU_MAX_DISPENSERS][3];    /* "01".."06", or "" = slot OFF */
     uint8_t  ztech_count;       /* 0-4 — slave per tank = its suffix (auto 4..) */
     uint8_t  pantech_count;     /* 0-4 — auto slaves continue after Ztech      */
     uint8_t  reserved_u8;       /* was masibus_count (alds-ggy). Kept as a byte
@@ -98,18 +101,35 @@ typedef struct {
      * default and the first boot of a firmware carrying this feature adopts the
      * compiled credentials once, then stamps them. */
     uint32_t cred_fp;
+
+    /* ── Appended 2026-10-16 (see the layout note above) ─────────────────
+     * How du_count/du_sfx above are to be read. DU_PLAN_LIST (0) is what every
+     * blob written before the slot rule reads back — the field lies past its
+     * end, so it keeps the default — and means "a list of du_count entries,
+     * an empty suffix = the entry's position". nvs_config_load() converts such
+     * a plan to slots ONCE, in RAM, polling exactly the dispensers the old
+     * build polled, and leaves DU_PLAN_SLOTS here; the next save stores it.
+     * Never 0 in a blob this build wrote. */
+    uint8_t  du_plan;
 } DeviceConfig;
 
+#define DU_PLAN_LIST   0   /* blob from a build before the slot rule */
+#define DU_PLAN_SLOTS  1   /* du_sfx are slots (this build)           */
+
 /* ── Dispenser number ──────────────────────────────────────────────────────
- * Station-list entry i (0-based) names dispenser N: its suffix as a number if
- * one is set, else its position (i+1). N IS the bus address (BlueSky nozzles
- * 2N-1 and 2N, Yenen head N) and the HW_ID suffix ("%02d") — this is the ONE
- * place a suffix becomes a number, so the label the cloud sees and the address
- * the bus is asked cannot disagree. Returns 0 for a suffix that is set but not
- * a valid number (never after nvs_config_load(), which clears such a suffix;
- * possible on a setconfig candidate, where the validator refuses it). Pure —
- * no ESP-IDF, so the host tests compile it. */
+ * Slot i (0-based) polls dispenser N = its suffix as a number. N IS the bus
+ * address (BlueSky nozzles 2N-1 and 2N, Yenen head N) and the HW_ID suffix
+ * ("%02d") — this is the ONE place a suffix becomes a number, so the label the
+ * cloud sees and the address the bus is asked cannot disagree. Returns 0 for
+ * a slot that is OFF (empty suffix), a suffix that is not a valid number (never
+ * after nvs_config_load(), which turns such a slot OFF; possible on a
+ * setconfig candidate, where the validator refuses it), or i out of range.
+ * Pure — no ESP-IDF, so the host tests compile it. */
 int du_number_of(const DeviceConfig *c, int i);
+
+/* True when slot i is ON (its suffix is set). After nvs_config_load() an ON
+ * slot always has a valid, unique du_number_of(). Pure. */
+bool du_slot_on(const DeviceConfig *c, int i);
 
 void nvs_config_defaults(DeviceConfig *cfg);
 

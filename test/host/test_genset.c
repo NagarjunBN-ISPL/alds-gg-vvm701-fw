@@ -4,7 +4,8 @@
  *
  * There is no DG in the lab, so this is the protocol test: the firmware must
  * send exactly the spec's request frames (bytes and CRC), in the spec's order,
- * and publish each reply as its own message under the spec's key —
+ * and publish each reply AS RECEIVED — the complete frame, slave + FC + byte
+ * count + data + CRC — as its own message under the spec's key —
  * "registers", "Alarms" (capital A, Mahindra only) and "status". The failure
  * cases cover a controller that is powered down, answers one read with an
  * exception, cross-talks (a radar's valid-CRC reply) or sends the wrong size. */
@@ -75,6 +76,20 @@ static const Exchange_t k_sgc120[] = {
       "00 00 00 00 00 00 00 00 31 01 90 01 18 00 1C 00 92 00 91 05 E7 00 2D 00 "
       "22 00 00 00 01 00 03 00 00 00 00 11 00 11 11 00 11 11 01 01 00 11 00 00 "
       "00 01 10 00 00 11 11 11 00 00 F1 00 01 23 10 24 7E" },
+};
+
+/* sfxGenset "08" -> slave 8. The register data is a live SGC 120 Mk II reading
+ * from a station (2026-09-29, DG running at 1556 RPM, 239.8 V), re-addressed
+ * to slave 8; both CRCs are what a slave-8 exchange carries. */
+static const Exchange_t k_sgc120_s8[] = {
+    { "08 03 00 01 00 4E 94 A7",
+      "08 03 9C 09 5E 09 52 09 54 10 2A 10 28 10 35 02 07 02 07 02 07 00 00 00 "
+      "00 00 00 00 00 0A 08 00 00 00 00 00 00 00 00 00 00 01 F3 00 00 00 00 00 "
+      "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+      "00 00 00 00 00 00 00 00 00 05 F9 00 00 06 FC 00 00 03 50 00 00 00 00 00 "
+      "00 00 00 00 00 00 00 03 DE 00 50 00 E6 00 0E 00 01 00 94 06 14 00 CB 00 "
+      "01 00 00 00 6A 00 03 00 00 00 00 11 11 01 11 00 11 11 01 00 00 00 11 00 "
+      "11 11 11 00 00 11 11 11 00 10 F1 00 81 63 10 23 42" },
 };
 
 #define N(a) ((int)(sizeof(a) / sizeof((a)[0])))
@@ -212,13 +227,14 @@ static const char *frame_str(const uint8_t *b, int n) {
     return s;
 }
 
-/* The data bytes of a spec reply as the firmware must publish them. */
+/* A spec reply as the firmware must publish it: every byte, nothing removed. */
 static void reply_hex(const char *rsp, char *out, size_t out_size) {
     uint8_t r[300];
-    parse_hex(rsp, r, (int)sizeof(r));
+    int n = parse_hex(rsp, r, (int)sizeof(r));
     int p = 0;
-    for (int i = 0; i < r[2] && p < (int)out_size - 4; i++)
-        p += snprintf(out + p, out_size - (size_t)p, i ? ",%02x" : "%02x", r[3 + i]);
+    out[0] = '\0';
+    for (int i = 0; i < n && p < (int)out_size - 4; i++)
+        p += snprintf(out + p, out_size - (size_t)p, i ? ",%02x" : "%02x", r[i]);
 }
 
 static void expect_msg(const char *what, const char *got, const char *key, const char *hex) {
@@ -243,6 +259,7 @@ static void expect_frames(const char *what, const Exchange_t *ex, int n) {
 
 int main(void) {
     GensetData_t gd;
+    bool ok;
     static char buf[2048], hex[600];
 
     printf("== every model sends exactly the spec's commands and publishes its replies ==\n");
@@ -282,24 +299,48 @@ int main(void) {
         printf("       %-7s %d command(s) byte-exact, messages OK\n", cases[c].name, DG.n_req);
     }
 
-    /* The GC1211 messages spelled out in full, independent of reply_hex(). */
+    /* The GC1211 messages spelled out in full, independent of reply_hex():
+     * slave 0a, FC 04, byte count, data, CRC — the frame exactly as received. */
     dg_load(k_gc1211, N(k_gc1211));
     genset_poll(10, GENSET_MODEL_GC1211, &gd);
     genset_build_registers_payload(&gd, HWID, TS, buf, sizeof(buf));
     expect_msg("GC1211 literal", buf, "registers",
+               "0a,04,48,"
                "01,3f,00,3e,00,22,00,89,00,89,05,48,07,39,05,dc,01,f3,09,69,09,5c,09,52,"
                "10,51,10,3d,10,48,00,00,00,00,00,04,00,00,00,00,00,00,00,00,00,00,00,00,"
-               "00,00,00,00,00,00,00,00,00,00,00,00,00,00,00,00,00,04,00,01,00,00,1b,08");
+               "00,00,00,00,00,00,00,00,00,00,00,00,00,00,00,00,00,04,00,01,00,00,1b,08,"
+               "5e,2c");
     genset_build_alarms_payload(&gd, HWID, TS, buf, sizeof(buf));
-    expect_msg("GC1211 literal", buf, "Alarms", "11,10,11,11,11,11");
+    expect_msg("GC1211 literal", buf, "Alarms", "0a,04,06,11,10,11,11,11,11,48,44");
     printf("       %s\n", buf);
     genset_build_status_payload(&gd, HWID, TS, buf, sizeof(buf));
-    expect_msg("GC1211 literal", buf, "status", "c0,00,00,00");
+    expect_msg("GC1211 literal", buf, "status", "0a,04,04,c0,00,00,00,7d,44");
+
+    printf("== suffix 08: the command goes to slave 8, its reply is published whole ==\n");
+    dg_load(k_sgc120_s8, N(k_sgc120_s8));
+    ok = genset_poll(8, GENSET_MODEL_SGC120, &gd);
+    CHECK(ok, "slave 8: poll failed against a slave-8 SGC 120");
+    expect_frames("slave 8", k_sgc120_s8, N(k_sgc120_s8));
+    CHECK(gd.reg_len == 161, "slave 8: kept %d bytes, the whole reply is 161", gd.reg_len);
+    genset_build_registers_payload(&gd, HWID, TS, buf, sizeof(buf));
+    reply_hex(k_sgc120_s8[0].rsp, hex, sizeof(hex));
+    expect_msg("slave 8", buf, "registers", hex);
+    CHECK(strstr(buf, "\"registers\":\"08,03,9c,09,5e,") && strstr(buf, ",63,10,23,42\""),
+          "slave 8: the message must start with the slave id and end with the CRC: %s", buf);
+    CHECK(strlen(buf) < MQTT_MODEM_PAYLOAD_SAFE_MAX, "slave 8: message %zu bytes", strlen(buf));
+    printf("       sent %s, published 161 bytes\n", frame_str(DG.req[0], DG.req_len[0]));
+
+    /* A controller left at slave 10 does not answer a slave-8 command. */
+    dg_load(k_sgc120, N(k_sgc120));
+    ok = genset_poll(8, GENSET_MODEL_SGC120, &gd);
+    CHECK(!ok && !gd.reg_valid && DG.unknown == 1, "a slave-10 DG must not answer suffix 08");
+    genset_build_registers_payload(&gd, HWID, TS, buf, sizeof(buf));
+    expect_msg("slave 8 vs DG at 10", buf, "registers", "404");
 
     printf("== Alarms unanswered: the poll fails, status is still read ==\n");
     dg_load(k_gc1211, N(k_gc1211));
     DG.odd_idx = 1; DG.odd = B_SILENT;
-    bool ok = genset_poll(10, GENSET_MODEL_GC1211, &gd);
+    ok = genset_poll(10, GENSET_MODEL_GC1211, &gd);
     CHECK(!ok, "a missing Alarms reply must fail the poll, so the 60 s re-poll runs");
     CHECK(gd.reg_valid && !gd.al_valid && gd.st_valid, "only Alarms should be missing (%d %d %d)",
           gd.reg_valid, gd.al_valid, gd.st_valid);
@@ -307,7 +348,7 @@ int main(void) {
     genset_build_alarms_payload(&gd, HWID, TS, buf, sizeof(buf));
     expect_msg("silent Alarms", buf, "Alarms", "404");
     genset_build_status_payload(&gd, HWID, TS, buf, sizeof(buf));
-    expect_msg("silent Alarms", buf, "status", "c0,00,00,00");
+    expect_msg("silent Alarms", buf, "status", "0a,04,04,c0,00,00,00,7d,44");
 
     printf("== DG powered down: three 404 messages, bounded bus hold, WDT fed ==\n");
     dg_load(k_gc1211, N(k_gc1211));

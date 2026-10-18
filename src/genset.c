@@ -14,10 +14,12 @@ static const char *TAG = "genset";
 /* ══════════════════════════════════════════════════════════════════════════
  * Genset polling, per the DG integration spec. Each model defines up to three
  * Modbus reads — a measurement block ("registers"), the alarm registers
- * ("Alarms", Mahindra only) and a DG status block ("status") — and each read's
- * DATA bytes are shipped to the cloud verbatim as a comma-separated hex string
- * in its OWN MQTT message. The firmware never interprets a genset register;
- * the cloud owns every register map and scaling.
+ * ("Alarms", Mahindra only) and a DG status block ("status"). Each reply is
+ * validated, then shipped to the cloud AS RECEIVED — the complete frame,
+ * slave + FC + byte count + data + CRC, nothing removed — as a comma-separated
+ * hex string in its OWN MQTT message, the same as radar and dispenser frames.
+ * The firmware never interprets a genset register; the cloud owns every
+ * register map and scaling.
  *
  * Pieces: Modbus RTU transport (crc16 / modbus_request), a data-driven model
  * table (g_models), the read helper (read_block), and the three serialisers.
@@ -122,29 +124,30 @@ static bool modbus_request(uint8_t slave, uint8_t fc,
     return true;
 }
 
-/* ── Read one block and keep only its DATA bytes ──────────────────────────
+/* ── Read one block and keep the whole validated frame ────────────────────
  * modbus_request has already validated CRC + slave/FC echo + exception bit, so
  * rx is well-formed. We additionally require the byte-count field and the total
  * length to match exactly what was asked for, so a valid-CRC-but-wrong-shape
- * reply can never be forwarded as good data. The 3-byte header and 2-byte CRC
- * are stripped — the cloud receives the register payload only. */
+ * reply can never be forwarded as good data. Nothing is removed: the frame is
+ * kept exactly as the controller sent it — slave, FC, byte count, data, CRC. */
 static bool read_block(uint8_t slave, uint8_t fc, uint16_t start, uint16_t count,
-                       uint8_t *out_data, int out_max, int *out_len,
+                       uint8_t *out_frame, int out_max, int *out_len,
                        const char *what) {
     uint8_t rx[260];
     int rx_len = 0;
+    *out_len = 0;
     if (!modbus_request(slave, fc, start, count, rx, sizeof(rx), &rx_len))
         return false;
 
     int bytecount = rx[2];
-    if (bytecount != (int)count * 2 || rx_len != 3 + bytecount + 2 || bytecount > out_max) {
+    if (bytecount != (int)count * 2 || rx_len != 3 + bytecount + 2 || rx_len > out_max) {
         ESP_LOGW(TAG, "%s: unexpected shape (bytecount=%d want=%d rx_len=%d)",
                  what, bytecount, (int)count * 2, rx_len);
         return false;
     }
 
-    memcpy(out_data, rx + 3, (size_t)bytecount);
-    *out_len = bytecount;
+    memcpy(out_frame, rx, (size_t)rx_len);
+    *out_len = rx_len;
     return true;
 }
 
@@ -228,7 +231,7 @@ bool genset_poll(uint8_t slave, uint8_t model, GensetData_t *out) {
     genset_expect(model, out);
 
     out->reg_valid = read_block(slave, mdl->fc, mdl->reg_start, mdl->reg_count,
-                                out->reg_data, (int)sizeof(out->reg_data),
+                                out->reg_frame, (int)sizeof(out->reg_frame),
                                 &out->reg_len, "registers");
 
     /* The follow-up reads run in the spec's order (Alarms, then status), each
@@ -239,13 +242,13 @@ bool genset_poll(uint8_t slave, uint8_t model, GensetData_t *out) {
     if (out->has_alarms) {
         vTaskDelay(pdMS_TO_TICKS(50));
         out->al_valid = read_block(slave, mdl->fc, mdl->al_start, mdl->al_count,
-                                   out->al_data, (int)sizeof(out->al_data),
+                                   out->al_frame, (int)sizeof(out->al_frame),
                                    &out->al_len, "Alarms");
     }
     if (out->has_status) {
         vTaskDelay(pdMS_TO_TICKS(50));
         out->st_valid = read_block(slave, mdl->fc, mdl->st_start, mdl->st_count,
-                                   out->st_data, (int)sizeof(out->st_data),
+                                   out->st_frame, (int)sizeof(out->st_frame),
                                    &out->st_len, "status");
     }
 
@@ -255,10 +258,11 @@ bool genset_poll(uint8_t slave, uint8_t model, GensetData_t *out) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
- * JSON serialisers — one message per read. Data is emitted as a comma-separated
- * lowercase hex string, the same shape radar and dispenser use.
+ * JSON serialisers — one message per read. The complete reply frame is emitted
+ * as a comma-separated lowercase hex string, the same shape radar and
+ * dispenser use.
  * ══════════════════════════════════════════════════════════════════════════ */
-static void build_payload(const char *key, const uint8_t *data, int len, bool valid,
+static void build_payload(const char *key, const uint8_t *frame, int len, bool valid,
                           const char *hw_id, const char *ts,
                           char *buf, size_t buf_size) {
     if (!valid || len <= 0) {
@@ -268,13 +272,13 @@ static void build_payload(const char *key, const uint8_t *data, int len, bool va
         return;
     }
 
-    /* len is bounded by the caller's buffer (GENSET_REG_DATA_MAX at most), so
-     * worst case is 160 * "xx," = 480 chars, which fits hex[]. */
-    char hex[GENSET_REG_DATA_MAX * 3 + 1];
+    /* len is bounded by the caller's buffer (GENSET_REG_FRAME_MAX at most), so
+     * worst case is 161 * "xx," = 483 chars, which fits hex[]. */
+    char hex[GENSET_REG_FRAME_MAX * 3 + 1];
     int  pos = 0;
     for (int i = 0; i < len && pos + 4 < (int)sizeof(hex); i++) {
         if (i > 0) hex[pos++] = ',';
-        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", data[i]);
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x", frame[i]);
     }
     hex[pos] = '\0';
 
@@ -283,7 +287,7 @@ static void build_payload(const char *key, const uint8_t *data, int len, bool va
                      hw_id, key, hex, ts);
 
     /* A truncated or over-ceiling payload is broken JSON — fall back to the
-     * guaranteed-valid 404 shape. Even the largest block (SGC120, 156 B → ~467
+     * guaranteed-valid 404 shape. Even the largest frame (SGC120, 161 B → 482
      * hex chars) sits far under both buf_size and the modem ceiling, so this is
      * belt-and-suspenders. */
     if (n < 0 || n >= (int)buf_size || n > MQTT_MODEM_PAYLOAD_SAFE_MAX) {
@@ -298,7 +302,7 @@ static void build_payload(const char *key, const uint8_t *data, int len, bool va
 void genset_build_registers_payload(const GensetData_t *d,
                                     const char *hw_id, const char *ts,
                                     char *buf, size_t buf_size) {
-    build_payload("registers", d->reg_data, d->reg_len, d->reg_valid,
+    build_payload("registers", d->reg_frame, d->reg_len, d->reg_valid,
                   hw_id, ts, buf, buf_size);
 }
 
@@ -307,13 +311,13 @@ void genset_build_registers_payload(const GensetData_t *d,
 void genset_build_alarms_payload(const GensetData_t *d,
                                  const char *hw_id, const char *ts,
                                  char *buf, size_t buf_size) {
-    build_payload("Alarms", d->al_data, d->al_len, d->al_valid,
+    build_payload("Alarms", d->al_frame, d->al_len, d->al_valid,
                   hw_id, ts, buf, buf_size);
 }
 
 void genset_build_status_payload(const GensetData_t *d,
                                  const char *hw_id, const char *ts,
                                  char *buf, size_t buf_size) {
-    build_payload("status", d->st_data, d->st_len, d->st_valid,
+    build_payload("status", d->st_frame, d->st_len, d->st_valid,
                   hw_id, ts, buf, buf_size);
 }

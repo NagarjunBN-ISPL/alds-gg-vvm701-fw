@@ -1,5 +1,6 @@
 /* Host stub for driver/uart.h — just enough of the surface yenen.c uses.
- * The bytes go to the simulated pump in test_yenen_rsp.c. */
+ * The bytes go to the simulated pump or line of the suite that links it
+ * (test_yenen.c, test_kfactor.c, test_rsp_tunnel.c, ...). */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>

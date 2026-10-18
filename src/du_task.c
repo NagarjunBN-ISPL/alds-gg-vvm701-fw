@@ -386,29 +386,29 @@ static void du_task_run(void *arg)
                        round_start - last_bs_us >= (int64_t)BLUESKY_POLL_INTERVAL_MS * 1000LL - 500000LL);
         if (bs_due) { last_bs_us = round_start; s_bs_round++; }
 
-        /* Snapshot the counts once per round rather than re-reading g_cfg in
-         * each loop condition. parse_setconfig() assigns the whole DeviceConfig
-         * struct, which is not atomic, and on its nvs_save_failed path it does
-         * so WITHOUT the usual reboot — leaving a live window where this task
-         * could see a half-updated struct and poll a nozzle that was just
-         * deconfigured. Both counts are clamped to their MAX and the g_hw_*
-         * arrays are sized to MAX, so a torn read was never memory-unsafe; the
-         * snapshot just keeps each round internally consistent. */
-        uint8_t n_du = g_cfg.du_count;
-        if (n_du > DU_MAX_DISPENSERS) n_du = DU_MAX_DISPENSERS;
+        /* g_cfg is fixed after boot: parse_setconfig() saves first and only
+         * then assigns the live struct, ~500 ms before the reboot that applies
+         * it, so this task never runs on with a half-updated plan. The loop
+         * walks every slot (the arrays are sized to DU_MAX_DISPENSERS, so a
+         * torn read could never index past them) and skips the OFF ones. */
+        uint8_t n_du = g_cfg.du_count;          /* slots ON — only gates du_ok below */
 
         bool all_ok = true;
         bool any_yenen = false;                 /* decides the round pacing below */
 
-        for (int i = 0; i < n_du; i++) {
+        for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
+            /* Slot OFF (no suffix): not polled, and not a fault — a dispenser
+             * the station switched off is not a dispenser that stopped
+             * answering. */
+            if (!du_slot_on(&g_cfg, i)) continue;
             /* THE dispenser number, from du_number_of() (nvs_config.c) — the
-             * product's one rule for which pump a list entry is. It is the
-             * address on the bus and the base of the nozzle labels — never the
-             * loop index. nvs_config_load() guarantees it is valid and unique
-             * for every entry inside du_count, so the check is a belt. */
+             * product's one rule for which pump a slot is. It is the address on
+             * the bus and the base of the nozzle labels — never the loop index.
+             * nvs_config_load() guarantees it is valid and unique for every ON
+             * slot, so the check is a belt. */
             int n = du_number_of(&g_cfg, i);
             if (n < 1 || n > DU_MAX_DISPENSERS) {
-                ESP_LOGE(TAG, "DU entry %d resolves to no dispenser number — skipped", i + 1);
+                ESP_LOGE(TAG, "DU slot %d resolves to no dispenser number — skipped", i + 1);
                 all_ok = false;
                 continue;
             }

@@ -7,6 +7,7 @@
 #include "dispenser.h"
 #include "yenen.h"
 #include "rs485_bus.h"
+#include "rsp_tunnel.h"
 #include "du_task.h"
 #include "store.h"
 #include "radar.h"
@@ -53,7 +54,8 @@ static char g_hw_pantech[RADAR_MAX][24];
 static char g_hw_genset[24], g_hw_di[24];
 
 #define TOPIC_MAX 200
-static char t_data[TOPIC_MAX];
+static char t_data[TOPIC_MAX];   /* <base>/data — polled device readings only (build_topics) */
+static char t_logs[TOPIC_MAX];   /* <base>/logs — everything else (build_topics)            */
 static char t_update[TOPIC_MAX];
 static char t_fleet_update[TOPIC_MAX];
 static char t_setcfg[TOPIC_MAX];
@@ -64,58 +66,14 @@ static char t_setcfg[TOPIC_MAX];
  * parser) — the cng-cpil lock contract. */
 static char t_lock[TOPIC_MAX];
 static char t_lock_out[TOPIC_MAX];
-static char t_rsp_bs_in[DU_MAX_DISPENSERS][TOPIC_MAX], t_rsp_bs_out[DU_MAX_DISPENSERS][TOPIC_MAX];
-static char t_kf_bs_in[DU_MAX_DISPENSERS][TOPIC_MAX],  t_kf_bs_out[DU_MAX_DISPENSERS][TOPIC_MAX];
-/* Yenen gets the rsp passthrough only. There is no k-factor equivalent in the
- * Yenen command set, so no kfactor topic pair is created for it — subscribing
- * to one would just be a topic nothing can ever answer. */
-static char t_rsp_yn_in[DU_MAX_DISPENSERS][TOPIC_MAX],   t_rsp_yn_out[DU_MAX_DISPENSERS][TOPIC_MAX];
-/* Yenen unit-price update. Deliberately its OWN topic pair rather than more
- * traffic on the rsp passthrough above: that one is a raw byte tunnel where the
- * cloud owns the frame and its checksum, which is the wrong contract for a
- * price change — a mistyped checksum there is silently answered "404". Here the
- * cloud sends a number and the device owns the frame, the idle gate, the ACK
- * and the read-back. */
-static char t_setrsp_yn_in[DU_MAX_DISPENSERS][TOPIC_MAX], t_setrsp_yn_out[DU_MAX_DISPENSERS][TOPIC_MAX];
+/* The cloud's raw command tunnel, per dispenser (rsp_tunnel.h): the cloud
+ * frames the command, the gateway puts it on the bus and answers .../out with
+ * the pump's reply as received, or "404". rsp for every make; kfactor for
+ * BlueSky only — Yenen has no k-factor, so it gets no kfactor topic. "" = not
+ * served (an OFF slot, or kfactor on a Yenen slot): never subscribed. */
+static char t_rsp_in[DU_MAX_DISPENSERS][TOPIC_MAX], t_rsp_out[DU_MAX_DISPENSERS][TOPIC_MAX];
+static char t_kf_in[DU_MAX_DISPENSERS][TOPIC_MAX],  t_kf_out[DU_MAX_DISPENSERS][TOPIC_MAX];
 
-typedef struct {
-    bool pending;
-    char cmd_hex[256];
-    char resp_topic[TOPIC_MAX];
-} PendingCmd_t;
-
-static PendingCmd_t g_rsp_bs_cmd[DU_MAX_DISPENSERS];
-static PendingCmd_t g_kf_bs_cmd[DU_MAX_DISPENSERS];
-static PendingCmd_t g_rsp_yn_cmd[DU_MAX_DISPENSERS];
-
-/* ── Pending Yenen RSP update, one slot per unit ───────────────────────────
- * Held as state rather than executed inside handle_msg() for the same reason
- * the passthrough commands are: handle_msg() runs from the MQTT drain, and an
- * RS485 exchange there would block the drain (and the poll cycle around it) on
- * a pump.
- *
- * The extra state over PendingCmd_t is the retry window. A price push that
- * lands while the nozzle is mid-sale, or while du_task holds the bus, has NOT
- * failed — the hardware is fine and the write will succeed a moment later. So
- * those two outcomes leave the side in `todo` and are re-attempted at
- * YN_RSP_RETRY_PACE_MS until YN_RSP_BUSY_WINDOW_S runs out, and only then does
- * the ack go out as a failure. Every other outcome (silent nozzle, NAK, failed
- * verify) is final on the first attempt — see config.h for why retrying those
- * would spend real bus time on a nozzle that is not going to answer. */
-typedef struct {
-    bool        pending;
-    uint16_t    price_x100;
-    uint8_t     req;             /* sides requested:  bit0 = A, bit1 = B      */
-    uint8_t     todo;            /* sides still to attempt (same bit layout)  */
-    bool        ok[2];           /* side confirmed at the requested price     */
-    uint16_t    got[2];          /* price read back from the pump, 0 if none  */
-    const char *result[2];       /* outcome token, incl. the last transient   */
-    int64_t     deadline_us;     /* give up on transients after this          */
-    int64_t     next_try_us;     /* pacing between transient retries          */
-    char        resp_topic[TOPIC_MAX];
-} PendingRsp_t;
-
-static PendingRsp_t g_setrsp_yn[DU_MAX_DISPENSERS];
 static int g_diag_cycle = 0;
 
 /* ── LED ──────────────────────────────────────────────────────────────── */
@@ -216,8 +174,8 @@ static void build_hw_ids(void) {
     /* HW_ID suffixes are all two DIGITS and every one of them is also the
      * unit's address on its bus (an explicit sfx* from setconfig overrides the
      * auto value, but the equivalence holds either way):
-     *   dispensers   = the dispenser NUMBER (du_number_of: the suffix, else the
-     *                  list position) — BlueSky nozzles 2N-1/2N, Yenen head N
+     *   dispensers   = the dispenser NUMBER (du_number_of: the slot's suffix;
+     *                  an OFF slot has none) — BlueSky nozzles 2N-1/2N, Yenen head N
      *   Ztech tanks  = Modbus slave, auto ZTECH_SLAVE_BASE + tank index (04..)
      *   Pantech      = Modbus slave, auto continues after the last Ztech tank
      *   genset       = gensetSlave (default 10)
@@ -229,7 +187,7 @@ static void build_hw_ids(void) {
      * HW_ID. validate_suffixes() MUST stay in sync with this function. */
     for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
         int n = du_number_of(&g_cfg, i);
-        if (n < 1 || n > 99) n = i + 1;         /* unreachable after nvs_config_load(); belt */
+        if (n < 1 || n > 99) n = i + 1;         /* slot OFF: never published or subscribed; belt */
         snprintf(g_hw_du[i], sizeof(g_hw_du[i]), "%s%c%c", g_imei,
                  (char)('0' + n / 10), (char)('0' + n % 10));
     }
@@ -256,19 +214,28 @@ static void build_hw_ids(void) {
 }
 
 static void build_topics(void) {
-    /* One flat, IMEI-less outbound topic (e.g. "fuelsense/data") — the original
-     * pipeline layout the cloud built against. ALL device→cloud messages go
-     * here: equipment telemetry, lifecycle/status events, and the diagnostics
-     * and sysmon health reports (which used to have their own topics but now
-     * share this one). Every payload carries "HW_ID" (bare IMEI, or IMEI+suffix
-     * for per-equipment telemetry) so the cloud attributes it to a device by
-     * that field, and self-identifies its kind by which top-level key is
-     * present: "nozzles" / "tanks" / "genset" / "di" for telemetry, "status"
-     * for lifecycle, "diagnostics" / "sysmon" for the health reports. Inbound command
-     * topics (setconfig/update/rsp/kfactor below) stay per-IMEI — they must
-     * target one device, and flattening them would make every device act on
-     * every push. */
+    /* Two flat, IMEI-less outbound topics. Every payload carries "HW_ID" (bare
+     * IMEI, or IMEI+suffix for per-equipment telemetry) so the cloud attributes
+     * it to a device by that field.
+     *   <base>/data (e.g. "gogas/data") — the readings this gateway POLLS and
+     *     nothing else: dispenser nozzles (live and the flash backlog), radar
+     *     tanks, the DG's register/Alarms/status frames, DI changes and GPS
+     *     fixes. The record stream the cloud stores.
+     *   <base>/logs (e.g. "gogas/logs") — everything else: the diagnostics
+     *     report, every lifecycle "status" (ready/unconfigured, restarting,
+     *     factory_resetting, connectivity_rollback, firmware_credentials_
+     *     applied), every setconfig reply (config_received/_successful/
+     *     _failed, config_report) and every FOTA status. Split 2026-10-16
+     *     (btpl's layout) so /data carries device readings only. The broker
+     *     ACL must allow publishing to both.
+     * Per-IMEI reply topics are not touched by the split: lock events stay on
+     * <base>/<imei>/lock/out, and the rsp/kfactor tunnel replies on their own
+     * .../out topics — each is the answer a waiting command listens on.
+     * Inbound command topics (setconfig/update/rsp/kfactor below) stay
+     * per-IMEI — they must target one device, and flattening them would make
+     * every device act on every push. */
     snprintf(t_data,        TOPIC_MAX, "%s/data",          g_cfg.mqtt_base_topic);
+    snprintf(t_logs,        TOPIC_MAX, "%s/logs",          g_cfg.mqtt_base_topic);
     snprintf(t_update,      TOPIC_MAX, "%s/%s/update",     g_cfg.mqtt_base_topic, g_imei);
     /* Fleet FOTA carries the PRODUCT NAME: GG and GGY share one base topic in
      * production, and this is what keeps a GG fleet push off the GGY units. */
@@ -277,35 +244,18 @@ static void build_topics(void) {
     snprintf(t_lock,        TOPIC_MAX, "%s/%s/lock",       g_cfg.mqtt_base_topic, g_imei);
     snprintf(t_lock_out,    TOPIC_MAX, "%s/%s/lock/out",   g_cfg.mqtt_base_topic, g_imei);
     for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
-        if (i < g_cfg.du_count) {
-            if (g_cfg.du_make[i] == DU_MAKE_BLUESKY) {
-                snprintf(t_rsp_bs_in[i],  TOPIC_MAX, "%s/rsp/imei/%s/in",      g_cfg.mqtt_base_topic, g_hw_du[i]);
-                snprintf(t_rsp_bs_out[i], TOPIC_MAX, "%s/rsp/imei/%s/out",     g_cfg.mqtt_base_topic, g_hw_du[i]);
-                snprintf(t_kf_bs_in[i],   TOPIC_MAX, "%s/kfactor/imei/%s/in",  g_cfg.mqtt_base_topic, g_hw_du[i]);
-                snprintf(t_kf_bs_out[i],  TOPIC_MAX, "%s/kfactor/imei/%s/out", g_cfg.mqtt_base_topic, g_hw_du[i]);
-            } else if (g_cfg.du_make[i] == DU_MAKE_YENEN) {
-                snprintf(t_rsp_yn_in[i],  TOPIC_MAX, "%s/rsp/imei/%s/in",  g_cfg.mqtt_base_topic, g_hw_du[i]);
-                snprintf(t_rsp_yn_out[i], TOPIC_MAX, "%s/rsp/imei/%s/out", g_cfg.mqtt_base_topic, g_hw_du[i]);
-                snprintf(t_setrsp_yn_in[i],  TOPIC_MAX, "%s/setrsp/imei/%s/in",  g_cfg.mqtt_base_topic, g_hw_du[i]);
-                snprintf(t_setrsp_yn_out[i], TOPIC_MAX, "%s/setrsp/imei/%s/out", g_cfg.mqtt_base_topic, g_hw_du[i]);
-            }
-        } else {
-            t_rsp_bs_in[i][0] = '\0';
-            t_rsp_yn_in[i][0] = '\0';
-            t_setrsp_yn_in[i][0] = '\0';
-            t_kf_bs_in[i][0] = '\0';
+        t_rsp_in[i][0] = t_rsp_out[i][0] = '\0';
+        t_kf_in[i][0]  = t_kf_out[i][0]  = '\0';
+        if (!du_slot_on(&g_cfg, i)) continue;   /* an OFF slot gets no command topics */
+        const bool bluesky = (g_cfg.du_make[i] == DU_MAKE_BLUESKY);
+        if (!bluesky && g_cfg.du_make[i] != DU_MAKE_YENEN) continue;
+        snprintf(t_rsp_in[i],  TOPIC_MAX, "%s/rsp/imei/%s/in",  g_cfg.mqtt_base_topic, g_hw_du[i]);
+        snprintf(t_rsp_out[i], TOPIC_MAX, "%s/rsp/imei/%s/out", g_cfg.mqtt_base_topic, g_hw_du[i]);
+        if (bluesky) {                          /* Yenen has no k-factor */
+            snprintf(t_kf_in[i],  TOPIC_MAX, "%s/kfactor/imei/%s/in",  g_cfg.mqtt_base_topic, g_hw_du[i]);
+            snprintf(t_kf_out[i], TOPIC_MAX, "%s/kfactor/imei/%s/out", g_cfg.mqtt_base_topic, g_hw_du[i]);
         }
     }
-}
-
-/* The 1-based global nozzle label for this dispenser side, matching the
- * telemetry payloads: dispenser N publishes nozzles 2N-1 and 2N, where N is
- * the dispenser NUMBER (the suffix), not the list position. Mirrors du_task so
- * the ack refers to a nozzle by exactly the number its readings arrive under. */
-static int du_nozzle_label(int unit, int side) {
-    int n = du_number_of(&g_cfg, unit);
-    if (n < 1) n = unit + 1;
-    return (n - 1) * 2 + side + 1;
 }
 
 /* Forward decls — defined later in the file. */
@@ -389,42 +339,13 @@ static void subscribe_all(void) {
     mqtt_subscribe(t_fleet_update);
     mqtt_subscribe(t_setcfg);
     mqtt_subscribe(t_lock);
-    for (int i = 0; i < g_cfg.du_count; i++) {
-        if (g_cfg.du_make[i] == DU_MAKE_BLUESKY) {
-            mqtt_subscribe(t_rsp_bs_in[i]);
-            mqtt_subscribe(t_kf_bs_in[i]);
-        } else if (g_cfg.du_make[i] == DU_MAKE_YENEN) {
-            mqtt_subscribe(t_rsp_yn_in[i]);
-            mqtt_subscribe(t_setrsp_yn_in[i]);
-        }
+    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {   /* "" = not served (build_topics) */
+        if (t_rsp_in[i][0]) mqtt_subscribe(t_rsp_in[i]);
+        if (t_kf_in[i][0])  mqtt_subscribe(t_kf_in[i]);
     }
 }
 
 /* ── Tiny JSON helpers ────────────────────────────────────────────────── */
-static int json_get_int(const char *json, const char *key, int def) {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char *p = strstr(json, search);
-    if (!p) return def;
-    p += strlen(search);
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    /* A number sent as a string ("duCount":"2") is taken as that number. It
-     * used to read as absent: the key kept its old value and the push was
-     * still acked config_successful, so a dashboard that quotes every value
-     * could never change a count, a genset field or the MQTT port. */
-    if (*p == '"') p++;
-    /* atoi() cannot distinguish a real 0 from "unparseable" — it returns 0 for
-     * "", "}", "abc" and a stray comma alike. Treat a 0 that did not come from
-     * an actual digit as absent and hand back the caller's current value, so a
-     * garbled field leaves that setting untouched instead of silently zeroing
-     * it. Returning a negative sentinel here would be worse than useless: the
-     * count call sites clamp <0 back to 0 (reintroducing the same silent zero),
-     * while gensetType/diEnable cast straight to uint8_t and would land on 255. */
-    int val = atoi(p);
-    if (val == 0 && *p != '0') return def;
-    return val;
-}
-
 static bool json_get_str(const char *json, const char *key,
                           char *out, size_t out_size) {
     if (out_size == 0) return false;
@@ -498,19 +419,125 @@ static bool setcfg_get_sfx(const char *json, const char *key, char *out, size_t 
     return true;
 }
 
-/* An int key that switches equipment. Out of lo..hi it is REFUSED rather than
- * clamped: the loader clamps a stored gensetType or diEnable out of range to
- * OFF on the next boot, so a typo became a DG or DI silently switched off
- * after a config_successful ack. Key absent: *io is left as is. */
+/* The text right after "key": (and any whitespace) — the start of its value —
+ * or NULL when the key is absent. */
+static const char *setcfg_value(const char *json, const char *key) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    const char *p = strstr(json, search);
+    if (!p) return NULL;
+    p += strlen(search);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return p;
+}
+
+/* True when nothing but whitespace stands between p and the end of the value
+ * (the ',' before the next member, or the object's closing '}'). */
+static bool setcfg_value_ends(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return *p == ',' || *p == '}';
+}
+
+/* Consumes `word` (lower case) at *pp, ignoring case. */
+static bool setcfg_word(const char **pp, const char *word) {
+    const char *p = *pp;
+    for (; *word; word++, p++) {
+        char c = (*p >= 'A' && *p <= 'Z') ? (char)(*p + 32) : *p;
+        if (c != *word) return false;
+    }
+    *pp = p;
+    return true;
+}
+
+/* An int key. The value must be a whole number — bare or quoted ("2" is 2) —
+ * and inside lo..hi, or the push is REFUSED with the key named. Nothing is
+ * clamped, defaulted or ignored any more: "duCount":9 used to become 6,
+ * "duCount":-1 became 0 (every dispenser gone), "duCount":"two" and
+ * "gensetModel":12 were quietly replaced, and each was acked
+ * config_successful — on a gateway that only setconfig can reach. Key
+ * absent: *io is left as is. */
 static bool setcfg_int_in_range(const char *json, const char *key, int lo, int hi,
                                 int *io, char *err, size_t err_size) {
-    if (!json_has_key(json, key)) return true;
-    int v = json_get_int(json, key, *io);
+    const char *p = setcfg_value(json, key);
+    if (!p) return true;
+    bool quoted = (*p == '"');
+    if (quoted) p++;
+    bool neg = (*p == '-');
+    if (neg) p++;
+    /* At most 9 digits are read (fits a 32-bit long with no overflow); a 10th
+     * is left in place and fails the end-of-value check below. */
+    long v      = 0;
+    int  digits = 0;
+    while (*p >= '0' && *p <= '9' && digits < 9) {
+        v = v * 10 + (*p - '0');
+        digits++;
+        p++;
+    }
+    bool shape_ok = digits >= 1;
+    if (shape_ok && quoted) {
+        if (*p == '"') p++;
+        else           shape_ok = false;
+    }
+    if (!shape_ok || !setcfg_value_ends(p)) {
+        snprintf(err, err_size, "%s must be a whole number %d..%d", key, lo, hi);
+        return false;
+    }
+    if (neg) v = -v;
     if (v < lo || v > hi) {
         snprintf(err, err_size, "%s must be %d..%d", key, lo, hi);
         return false;
     }
+    *io = (int)v;
+    return true;
+}
+
+/* A switch key: true/false or 1/0, bare or quoted, any case. Anything else is
+ * REFUSED — "gpsEnable":"true" used to be ignored (only the bare form was
+ * read) and "yes" too, both acked config_successful. Key absent: *io is left
+ * as is. */
+static bool setcfg_get_bool(const char *json, const char *key, bool *io,
+                            char *err, size_t err_size) {
+    const char *p = setcfg_value(json, key);
+    if (!p) return true;
+    bool quoted = (*p == '"');
+    if (quoted) p++;
+    bool v, ok = true;
+    if      (setcfg_word(&p, "true"))  v = true;
+    else if (setcfg_word(&p, "false")) v = false;
+    else if (*p == '1')                { v = true;  p++; }
+    else if (*p == '0')                { v = false; p++; }
+    else                               { v = false; ok = false; }
+    if (ok && quoted) {
+        if (*p == '"') p++;
+        else           ok = false;
+    }
+    if (!ok || !setcfg_value_ends(p)) {
+        snprintf(err, err_size, "%s must be true or false", key);
+        return false;
+    }
     *io = v;
+    return true;
+}
+
+/* A string key into a fixed field. Present but not a string, or longer than
+ * the field, is REFUSED: json_get_str() would read the first as absent and
+ * silently CUT the second — a broker password or APN one character short is a
+ * gateway that never reconnects. *present says whether the key was sent. */
+static bool setcfg_get_text(const char *json, const char *key, char *out, size_t out_size,
+                            bool *present, char *err, size_t err_size) {
+    *present = false;
+    if (!json_has_key(json, key)) return true;
+    char wide[160];
+    if (!json_get_str(json, key, wide, sizeof(wide))) {
+        snprintf(err, err_size, "%s must be a string", key);
+        return false;
+    }
+    if (strlen(wide) > out_size - 1) {
+        snprintf(err, err_size, "%s is longer than %u characters", key, (unsigned)(out_size - 1));
+        return false;
+    }
+    memcpy(out, wide, strlen(wide) + 1);
+    *present = true;
     return true;
 }
 
@@ -527,11 +554,8 @@ static bool setcfg_int_in_range(const char *json, const char *key, int lo, int h
  * A slave outside 1..247 is refused: an address is never guessed. */
 static bool setcfg_genset_addr(const char *json, DeviceConfig *nc, char *err, size_t err_size) {
     bool slave_present = json_has_key(json, "gensetSlave");
-    int  slave         = json_get_int(json, "gensetSlave", nc->genset_slave);
-    if (slave_present && (slave < 1 || slave > 247)) {
-        snprintf(err, err_size, "gensetSlave must be 1..247");
-        return false;
-    }
+    int  slave         = nc->genset_slave;
+    if (!setcfg_int_in_range(json, "gensetSlave", 1, 247, &slave, err, err_size)) return false;
     bool sfx_present = json_has_key(json, "sfxGenset");
     char sfx[sizeof(nc->sfx_genset)] = "";
     if (!setcfg_get_sfx(json, "sfxGenset", sfx, sizeof(sfx), err, err_size)) return false;
@@ -568,8 +592,9 @@ static bool setcfg_has_secret(const char *json) {
            json_has_key(json, "apnUser")  || json_has_key(json, "apnPass");
 }
 
-/* Parse a JSON boolean. Accepts true/false and 1/0 — json_get_int can't be
- * used here because atoi("true") is 0, i.e. it can't tell true from false. */
+/* Parse a JSON boolean. Accepts true/false and 1/0 — an atoi()-style reader
+ * can't be used here because atoi("true") is 0, i.e. it can't tell true from
+ * false. */
 static bool json_get_bool(const char *json, const char *key, bool def) {
     char search[64];
     snprintf(search, sizeof(search), "\"%s\":", key);
@@ -580,70 +605,6 @@ static bool json_get_bool(const char *json, const char *key, bool def) {
     if (*p == 't' || *p == 'T' || *p == '1') return true;
     if (*p == 'f' || *p == 'F' || *p == '0') return false;
     return def;
-}
-
-/* ── Rupee amount -> hundredths ───────────────────────────────────────────
- * For the Yenen RSP update, whose frame carries the price as exactly four
- * ASCII digits of rupees x100 (yenen.h). json_get_int() cannot be used: it
- * stops at the '.' and would read 65.32 as a flat 65.
- *
- * Accepts the value quoted or bare — "65.32" and 65.32 are the same push — and
- * with 0, 1 or 2 decimals. A third decimal is READ AND ROUNDED rather than
- * rejected, because a cloud that serialises the price through a float can emit
- * 65.319999 or 65.320001 for what an operator typed as 65.32; truncating those
- * would quietly set a price one paisa off. Anything beyond that (letters, a
- * fourth decimal, a value the four digits cannot hold) is refused outright, so
- * a malformed push is answered with a reason instead of a wrong price.
- *
- * Returns false without touching *out unless a whole, well-formed value in
- * 0.01 .. 99.99 was parsed. */
-static bool json_get_price_x100(const char *json, const char *key, uint16_t *out) {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char *p = strstr(json, search);
-    if (!p) return false;
-    p += strlen(search);
-    while (*p == ' ' || *p == '\t') p++;
-    bool quoted = (*p == '"');
-    if (quoted) p++;
-    if (*p < '0' || *p > '9') return false;
-
-    uint32_t rupees = 0;
-    int      n_int  = 0;
-    while (*p >= '0' && *p <= '9') {
-        if (++n_int > 3) return false;              /* past the 99.99 ceiling */
-        rupees = rupees * 10 + (uint32_t)(*p - '0');
-        p++;
-    }
-
-    /* Work in thousandths so the third decimal can round the second. */
-    uint32_t milli = rupees * 1000;
-    if (*p == '.') {
-        p++;
-        uint32_t scale = 100;
-        int      n_dec = 0;
-        while (*p >= '0' && *p <= '9') {
-            if (++n_dec > 3) return false;          /* more precision than exists */
-            milli += (uint32_t)(*p - '0') * scale;
-            scale /= 10;
-            p++;
-        }
-        if (n_dec == 0) return false;               /* a bare trailing '.'    */
-    }
-
-    /* Only a value terminator may follow — catches "65.32x" and 65.32.1 rather
-     * than silently accepting the part that parsed. */
-    if (quoted) {
-        if (*p != '"') return false;
-        p++;
-    }
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != ',' && *p != '}' && *p != '\0' && *p != '\r' && *p != '\n') return false;
-
-    uint32_t x100 = (milli + 5) / 10;               /* round the third decimal */
-    if (x100 == 0 || x100 > 9999) return false;
-    *out = (uint16_t)x100;
-    return true;
 }
 
 /* ── setconfig ────────────────────────────────────────────────────────── */
@@ -668,6 +629,90 @@ static const char * const s_setcfg_known_keys[] = {
     "apn","apnUser","apnPass",
     "mqttHost","mqttPort","mqttUser","mqttPass","mqttBaseTopic","mqttTls",
 };
+/* The read-only keys of a config_report. A report can be copied, edited and
+ * sent back as a setconfig (passwords are reported only as *Set booleans for
+ * exactly that reason), so these are accepted and IGNORED — they set nothing
+ * and do not count as config keys. */
+static const char * const s_setcfg_report_keys[] = {
+    "HW_ID", "status", "fw", "apnPassSet", "mqttPassSet", "connPending",
+};
+#define SETCFG_KEYS_MAX 64
+_Static_assert(sizeof(s_setcfg_known_keys) / sizeof(s_setcfg_known_keys[0]) +
+               sizeof(s_setcfg_report_keys) / sizeof(s_setcfg_report_keys[0]) < SETCFG_KEYS_MAX,
+               "setcfg_check_members() tracks at most SETCFG_KEYS_MAX - 1 keys");
+
+/* Walks the top level of a setconfig payload — already proven ONE complete
+ * JSON object by payload_is_one_json_object() — and checks every member: a key
+ * from `keys` or `extra` (or "cmd"), named only once, holding a plain value (a
+ * string, or a bare number / true / false). The typed readers then judge each
+ * value; `extra` keys are read by nobody (s_setcfg_report_keys).
+ *
+ * Refusing an unknown key is the point: the readers look keys up by name, so a
+ * typo ("du1make", "gpsenable") used to be skipped without a word and the push
+ * acked config_successful with that setting never applied — on a gateway that
+ * nobody can visit. A key sent twice is refused because only the first copy
+ * would be read. `err` names the key; non-alphanumerics in it become '_'. */
+static bool setcfg_check_members(const char *json, const char *const *keys, size_t n_keys,
+                                 const char *const *extra, size_t n_extra,
+                                 char *err, size_t err_size) {
+    bool seen[SETCFG_KEYS_MAX] = {false};   /* keys, then extra, then "cmd" */
+    if (n_keys > SETCFG_KEYS_MAX - 1) n_keys = SETCFG_KEYS_MAX - 1;
+    if (n_extra > SETCFG_KEYS_MAX - 1 - n_keys) n_extra = SETCFG_KEYS_MAX - 1 - n_keys;
+    const char *p = strchr(json, '{');
+    if (!p) { snprintf(err, err_size, "bad_payload"); return false; }
+    p++;
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '}') return true;                    /* end of the object */
+        if (*p != '"') { snprintf(err, err_size, "bad_payload"); return false; }
+        const char *k = ++p;
+        while (*p && *p != '"' && *p != '\\') p++;     /* no key of ours has an escape */
+        if (*p != '"') { snprintf(err, err_size, "bad_payload"); return false; }
+        size_t klen = (size_t)(p - k);
+        p++;
+
+        int idx = -1;
+        if (klen == 3 && strncmp(k, "cmd", 3) == 0) idx = (int)(n_keys + n_extra);
+        for (size_t i = 0; i < n_keys && idx < 0; i++)
+            if (strlen(keys[i]) == klen && strncmp(k, keys[i], klen) == 0) idx = (int)i;
+        for (size_t i = 0; i < n_extra && idx < 0; i++)
+            if (strlen(extra[i]) == klen && strncmp(k, extra[i], klen) == 0) idx = (int)(n_keys + i);
+        if (idx < 0 || seen[idx]) {
+            char name[25];
+            size_t n = klen < sizeof(name) - 1 ? klen : sizeof(name) - 1;
+            for (size_t i = 0; i < n; i++) name[i] = isalnum((unsigned char)k[i]) ? k[i] : '_';
+            name[n] = '\0';
+            snprintf(err, err_size, "%s_key_%s", idx < 0 ? "unknown" : "duplicate", name);
+            return false;
+        }
+        seen[idx] = true;
+
+        /* The ':' must follow the key directly — every JSON serialiser writes
+         * it so, and the readers look keys up as "key": exactly. With a space
+         * in between, a key passed here would then read as ABSENT. */
+        if (*p != ':') { snprintf(err, err_size, "bad_payload"); return false; }
+        p++;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '"') {                                /* a string, escapes honoured */
+            p++;
+            while (*p && *p != '"') { if (*p == '\\' && p[1]) p++; p++; }
+            if (*p != '"') { snprintf(err, err_size, "bad_payload"); return false; }
+            p++;
+        } else {                                        /* a bare number / true / false */
+            const char *v = p;
+            while (isalnum((unsigned char)*p) || *p == '-' || *p == '+' || *p == '.') p++;
+            if (p == v) {                               /* an object, an array, nothing */
+                snprintf(err, err_size, "%.*s must be a plain value", (int)(klen < 24 ? klen : 24), k);
+                return false;
+            }
+        }
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == ',') { p++; continue; }
+        if (*p == '}') return true;
+        snprintf(err, err_size, "bad_payload");
+        return false;
+    }
+}
 
 /* Every active piece of equipment's *effective* HW_ID suffix (custom if set,
  * else the numeric auto value from build_hw_ids()) must be unique, or two
@@ -697,24 +742,21 @@ static bool validate_suffixes(const DeviceConfig *c, char *err, size_t err_size)
      * The 32-entry arrays above bound the total: 6 dispensers + 4 Ztech +
      * 4 Pantech + genset + DI = 16 at full capacity. Raising any *_MAX in
      * config.h past that headroom means growing them too. */
-    for (int i = 0; i < c->du_count; i++) {
+    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
+        /* Slot OFF (no suffix): not polled, publishes nothing, claims no
+         * suffix — there is no position fallback any more. */
+        if (!du_slot_on(c, i)) continue;
         snprintf(label[n], sizeof(label[n]), "DU%d", i + 1);
         /* A dispenser's suffix IS its number IS its bus address, so it has to
          * be one the bus can reach before anything else is checked: 01..06
          * (a BlueSky nozzle address is 2N, and the bus carries 12), Yenen
-         * 01..05 (head 6 has no nozzle code — DU_YENEN_MAX). Checked on the
-         * RESOLVED number so an omitted suffix (= position) is covered too. */
-        if (c->du_sfx[i][0]) {
-            sfx[n] = c->du_sfx[i];
-            if (strlen(sfx[n]) != 2 || !isdigit((unsigned char)sfx[n][0]) ||
-                !isdigit((unsigned char)sfx[n][1])) {
-                snprintf(err, err_size, "DU%d suffix must be 2 digits (the dispenser number, 01..0%d)",
-                         i + 1, DU_MAX_DISPENSERS);
-                return false;
-            }
-        } else {
-            snprintf(auto_sfx[n], sizeof(auto_sfx[n]), "%02d", i + 1);
-            sfx[n] = auto_sfx[n];
+         * 01..05 (head 6 has no nozzle code — DU_YENEN_MAX). */
+        sfx[n] = c->du_sfx[i];
+        if (strlen(sfx[n]) != 2 || !isdigit((unsigned char)sfx[n][0]) ||
+            !isdigit((unsigned char)sfx[n][1])) {
+            snprintf(err, err_size, "DU%d suffix must be 2 digits (the dispenser number, 01..0%d)",
+                     i + 1, DU_MAX_DISPENSERS);
+            return false;
         }
         int num   = du_number_of(c, i);
         int max_n = (c->du_make[i] == DU_MAKE_YENEN) ? DU_YENEN_MAX : DU_MAX_DISPENSERS;
@@ -872,13 +914,69 @@ static bool conn_str_ok(const char *s) {
     return true;
 }
 
+/* Dispenser slots (the btpl meter rule). Slot N (du1..du6) is ON exactly when
+ * du<N>Sfx is set, and that suffix is the dispenser number = bus address =
+ * HW_ID suffix; "" turns the slot OFF. A station with three BlueSky
+ * dispensers whose first is out of service sends du1Sfx "" with du2Sfx "02"
+ * and du3Sfx "03": dispensers 2 and 3 are polled and publish as ...02 and
+ * ...03, and the pumps are never re-addressed. du<N>Make sets the slot's
+ * protocol (bluesky / yenen), as before.
+ *
+ * duCount is a cross-check, not a switch: when sent it must equal the number
+ * of slots ON in the merged plan (this push over what is stored), else the
+ * push is refused with both numbers — a config page that ticked a dispenser
+ * but sent no suffix for it would otherwise be acked and poll nothing. Absent,
+ * the count simply follows the suffixes. Format, range and uniqueness of the
+ * suffixes are judged by validate_suffixes() on the merged plan. */
+static bool setcfg_du_slots(const char *json, DeviceConfig *nc, char *err, size_t err_size) {
+    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
+        char key_m[32], key_s[32], make_str[32];
+        bool make_present = false;
+        snprintf(key_m, sizeof(key_m), "du%dMake", i + 1);
+        snprintf(key_s, sizeof(key_s), "du%dSfx", i + 1);
+        if (!setcfg_get_text(json, key_m, make_str, sizeof(make_str), &make_present, err, err_size))
+            return false;
+        if (make_present) {
+            if (streq_ci(make_str, "bluesky")) {
+                nc->du_make[i] = DU_MAKE_BLUESKY;
+            } else if (streq_ci(make_str, "yenen")) {
+                nc->du_make[i] = DU_MAKE_YENEN;
+            } else {
+                /* Refuse rather than ignore: a typo here would leave the slot
+                 * on whatever make it had before (BlueSky on a fresh unit) and
+                 * the operator would see "config_successful". */
+                snprintf(err, err_size, "du_make_invalid_use_bluesky_or_yenen");
+                return false;
+            }
+        }
+        if (!setcfg_get_sfx(json, key_s, nc->du_sfx[i], sizeof(nc->du_sfx[i]), err, err_size))
+            return false;
+    }
+
+    int on = 0;
+    for (int i = 0; i < DU_MAX_DISPENSERS; i++) if (nc->du_sfx[i][0]) on++;
+    int cnt = on;
+    if (!setcfg_int_in_range(json, "duCount", 0, DU_MAX_DISPENSERS, &cnt, err, err_size))
+        return false;
+    if (cnt != on) {
+        snprintf(err, err_size, "duCount %d but %d dispenser suffixes set (a dispenser slot is ON "
+                                "only with its duNSfx)", cnt, on);
+        return false;
+    }
+    nc->du_count = (uint8_t)on;
+    nc->du_plan  = DU_PLAN_SLOTS;
+    return true;
+}
+
 /* Publish a config_failed status with a machine-readable reason. */
 static void setcfg_fail(const char *reason) {
-    char err[160];
+    /* Sized for the longest reason a reader or validator writes (verr, 128)
+     * plus the envelope and IMEI, so the JSON is never cut mid-string. */
+    char err[256];
     snprintf(err, sizeof(err),
              "{\"HW_ID\":\"%s\",\"status\":\"config_failed\",\"reason\":\"%s\"}",
              g_imei, reason);
-    mqtt_publish(t_data, err);
+    mqtt_publish(t_logs, err);
 }
 
 static const char *du_make_str(uint8_t make) {
@@ -888,7 +986,7 @@ static const char *du_make_str(uint8_t make) {
 }
 
 /* Read side of the read/write pair the old local web portal gave for free.
- * Publishes the LIVE DeviceConfig on the data topic so the fleet is auditable
+ * Publishes the LIVE DeviceConfig on the logs topic so the fleet is auditable
  * ("what is station X set to / did my change take?") without a site visit.
  * Secrets are never echoed: passwords are reported only as *Set booleans, so
  * a report can be copied, tweaked and re-sent without accidentally writing a
@@ -941,14 +1039,60 @@ static void publish_config_report(void) {
         snprintf(buf, sizeof(buf),
                  "{\"HW_ID\":\"%s\",\"status\":\"config_report\",\"error\":\"truncated\"}", g_imei);
     }
-    mqtt_publish(t_data, buf);
+    mqtt_publish(t_logs, buf);
 }
 
+/* Defined below, with the replay guard. */
+static bool payload_is_one_json_object(const char *s);
+
 static void parse_setconfig(const char *json) {
+    char verr[128];   /* refusal reason from the field readers and validators */
+
+    /* ── The payload as a whole, before any field is read ──────────────────
+     * ONE complete JSON object (a push cut short — by the publisher, or by the
+     * 2 KB inbound clamp in mqtt.c — would otherwise apply the fields that
+     * happened to arrive), in which every key is one this firmware knows and
+     * appears once. See setcfg_check_members(). */
+    if (!payload_is_one_json_object(json)) {
+        ESP_LOGW(TAG, "setconfig: not one complete JSON object — ignored (no reboot)");
+        setcfg_fail("bad_payload");
+        return;
+    }
+    if (!setcfg_check_members(json, s_setcfg_known_keys,
+                              sizeof(s_setcfg_known_keys) / sizeof(s_setcfg_known_keys[0]),
+                              s_setcfg_report_keys,
+                              sizeof(s_setcfg_report_keys) / sizeof(s_setcfg_report_keys[0]),
+                              verr, sizeof(verr))) {
+        ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
+        setcfg_fail(verr);
+        return;
+    }
+    bool known_key = false;
+    {
+        char search[24];
+        for (size_t i = 0; i < sizeof(s_setcfg_known_keys) / sizeof(s_setcfg_known_keys[0]); i++) {
+            snprintf(search, sizeof(search), "\"%s\":", s_setcfg_known_keys[i]);
+            if (strstr(json, search)) { known_key = true; break; }
+        }
+    }
+
     /* Remote commands — parsed with json_get_str so both compact
-     * ("cmd":"restart") and pretty-printed ("cmd": "restart") JSON work. */
+     * ("cmd":"restart") and pretty-printed ("cmd": "restart") JSON work. A
+     * command travels ALONE: {"cmd":"restart","gpsEnable":true} used to
+     * restart and drop the setting without a word. */
     char cmdbuf[24] = "";
-    if (json_get_str(json, "cmd", cmdbuf, sizeof(cmdbuf))) {
+    bool cmd_present = false;
+    if (!setcfg_get_text(json, "cmd", cmdbuf, sizeof(cmdbuf), &cmd_present, verr, sizeof(verr))) {
+        ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
+        setcfg_fail(verr);
+        return;
+    }
+    if (cmd_present && known_key) {
+        ESP_LOGW(TAG, "setconfig: rejected — cmd '%s' sent together with config keys", cmdbuf);
+        setcfg_fail("cmd_must_be_sent_alone");
+        return;
+    }
+    if (cmd_present) {
         /* One-shot commands: a RETAINED copy would re-run them on every
          * reconnect (a reboot loop, a wipe on every boot). Dropped inside the
          * grace window with an ack that says why — see CMD_RETAIN_GRACE_MS. */
@@ -958,7 +1102,7 @@ static void parse_setconfig(const char *json) {
             snprintf(ack, sizeof(ack),
                      "{\"HW_ID\":\"%s\",\"status\":\"cmd_ignored_retained\",\"cmd\":\"%s\"}",
                      g_imei, cmdbuf);
-            mqtt_publish(t_data, ack);
+            mqtt_publish(t_logs, ack);
             return;
         }
         if (strcmp(cmdbuf, "restart") == 0) {
@@ -969,7 +1113,7 @@ static void parse_setconfig(const char *json) {
             char ack[128];
             snprintf(ack, sizeof(ack),
                      "{\"HW_ID\":\"%s\",\"status\":\"restarting\"}", g_imei);
-            mqtt_publish(t_data, ack);
+            mqtt_publish(t_logs, ack);
             vTaskDelay(pdMS_TO_TICKS(500));
             ota_confirm_before_restart("remote restart");
             du_task_flush_to_store();
@@ -981,7 +1125,7 @@ static void parse_setconfig(const char *json) {
             char ack[128];
             snprintf(ack, sizeof(ack),
                      "{\"HW_ID\":\"%s\",\"status\":\"factory_resetting\"}", g_imei);
-            mqtt_publish(t_data, ack);
+            mqtt_publish(t_logs, ack);
             ota_confirm_before_restart("factory reset");
             nvs_config_factory_reset();
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -995,37 +1139,30 @@ static void parse_setconfig(const char *json) {
             publish_config_report();
             return;
         }
+        ESP_LOGW(TAG, "setconfig: rejected — unknown cmd '%s'", cmdbuf);
+        setcfg_fail("unknown_cmd");
+        return;
     }
 
-    /* Reject non-JSON / unrecognised payloads. A stray message published to
-     * the setconfig topic (seen in the field: a FOTA URL sent to the wrong
-     * topic) previously fell through all the json_get_int defaults, "applied"
-     * nothing — and still saved NVS and REBOOTED the device. Require a JSON
-     * object containing at least one known key before touching anything. */
-    const char *s0 = json;
-    while (*s0 == ' ' || *s0 == '\t' || *s0 == '\r' || *s0 == '\n') s0++;
-    bool known_key = false;
-    {
-        char search[24];
-        for (size_t i = 0; i < sizeof(s_setcfg_known_keys) / sizeof(s_setcfg_known_keys[0]); i++) {
-            snprintf(search, sizeof(search), "\"%s\"", s_setcfg_known_keys[i]);
-            if (strstr(json, search)) { known_key = true; break; }
-        }
-    }
-    if (*s0 != '{' || !known_key) {
+    /* Reject a payload naming nothing to set (e.g. {}). A stray message
+     * published to the setconfig topic (seen in the field: a FOTA URL sent to
+     * the wrong topic) previously fell through all the field defaults,
+     * "applied" nothing — and still saved NVS and REBOOTED the device. The
+     * shape and every key were already checked at the top. */
+    if (!known_key) {
         ESP_LOGW(TAG, "setconfig: unrecognised payload — ignored (no reboot)");
         char err[128];
         snprintf(err, sizeof(err),
                  "{\"HW_ID\":\"%s\",\"status\":\"config_failed\",\"reason\":\"bad_payload\"}",
                  g_imei);
-        mqtt_publish(t_data, err);
+        mqtt_publish(t_logs, err);
         return;
     }
 
     char st[128];
     snprintf(st, sizeof(st),
              "{\"HW_ID\":\"%s\",\"status\":\"config_received\"}", g_imei);
-    mqtt_publish(t_data, st);
+    mqtt_publish(t_logs, st);
 
     /* Stage into a copy so a validation failure below leaves the live
      * g_cfg (and the running device) completely untouched.
@@ -1043,42 +1180,18 @@ static void parse_setconfig(const char *json) {
      * on an implementation detail. */
     DeviceConfig nc;
     memcpy(&nc, &g_cfg, sizeof(nc));
-    char verr[128];   /* refusal reason from the field readers and validators */
 
-    int du_cnt = json_get_int(json, "duCount", nc.du_count);
-    if (du_cnt < 0) du_cnt = 0;
-    if (du_cnt > DU_MAX_DISPENSERS) du_cnt = DU_MAX_DISPENSERS;
-    nc.du_count = (uint8_t)du_cnt;
-
-    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
-        char key_m[32], key_s[32], make_str[32];
-        snprintf(key_m, sizeof(key_m), "du%dMake", i + 1);
-        snprintf(key_s, sizeof(key_s), "du%dSfx", i + 1);
-
-        if (json_get_str(json, key_m, make_str, sizeof(make_str))) {
-            if (streq_ci(make_str, "bluesky")) {
-                nc.du_make[i] = DU_MAKE_BLUESKY;
-            } else if (streq_ci(make_str, "yenen")) {
-                nc.du_make[i] = DU_MAKE_YENEN;
-            } else {
-                /* Refuse rather than ignore: a typo here would leave the
-                 * position on whatever make it had before (BlueSky on a fresh
-                 * unit) and the operator would see "config_successful". */
-                ESP_LOGW(TAG, "setconfig: rejected — unknown make '%s' for DU%d", make_str, i + 1);
-                setcfg_fail("du_make_invalid_use_bluesky_or_yenen");
-                return;
-            }
-        }
-        if (!setcfg_get_sfx(json, key_s, nc.du_sfx[i], sizeof(nc.du_sfx[i]), verr, sizeof(verr))) {
-            ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
-            setcfg_fail(verr);
-            return;
-        }
+    /* Dispenser slots — see setcfg_du_slots(): a slot is ON only with its
+     * suffix, and duCount must agree with the slots ON. Which dispenser each
+     * slot names (its number = its address), whether a Yenen is numbered
+     * beyond head 5, and whether two slots name the same dispenser are all
+     * checked on the MERGED plan by validate_suffixes() below — a make may
+     * come from NVS and a suffix from this push. */
+    if (!setcfg_du_slots(json, &nc, verr, sizeof(verr))) {
+        ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
+        setcfg_fail(verr);
+        return;
     }
-    /* Which dispenser each entry names (its number = its address), whether a
-     * Yenen is numbered beyond head 5, and whether two entries name the same
-     * dispenser are all checked on the MERGED plan by validate_suffixes()
-     * below — a make may come from NVS and a suffix from this push. */
 
     /* ── Radar — two input styles accepted, never mixed ────────────────────
      * (a) single-type style : radarType ("ztech"/"pantech"/"none") +
@@ -1108,10 +1221,14 @@ static void parse_setconfig(const char *json) {
             return;
         }
         char rtype[16] = "";
-        json_get_str(json, "radarType", rtype, sizeof(rtype));
-        int tc = json_get_int(json, "tankCount", 0);
-        if (tc < 0) tc = 0;
-        if (tc > RADAR_MAX) tc = RADAR_MAX;
+        bool rtype_present = false;
+        int  tc = 0;
+        if (!setcfg_get_text(json, "radarType", rtype, sizeof(rtype), &rtype_present, verr, sizeof(verr)) ||
+            !setcfg_int_in_range(json, "tankCount", 0, RADAR_MAX, &tc, verr, sizeof(verr))) {
+            ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
+            setcfg_fail(verr);
+            return;
+        }
         /* The single-type styles each zero the OTHER, so switching a site
          * from one radar vendor to another with one push can't leave the old
          * type still being polled. */
@@ -1127,38 +1244,49 @@ static void parse_setconfig(const char *json) {
             return;
         }
     } else {
-        int ztech   = json_get_int(json,"ztechCount",   nc.ztech_count);
-        int pantech = json_get_int(json,"pantechCount", nc.pantech_count);
-        if (ztech < 0) ztech = 0;
-        if (ztech > RADAR_MAX) ztech = RADAR_MAX;
-        if (pantech < 0) pantech = 0;
-        if (pantech > RADAR_MAX) pantech = RADAR_MAX;
+        int ztech = nc.ztech_count, pantech = nc.pantech_count;
+        if (!setcfg_int_in_range(json, "ztechCount",   0, RADAR_MAX, &ztech,   verr, sizeof(verr)) ||
+            !setcfg_int_in_range(json, "pantechCount", 0, RADAR_MAX, &pantech, verr, sizeof(verr))) {
+            ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
+            setcfg_fail(verr);
+            return;
+        }
         nc.ztech_count   = (uint8_t)ztech;
         nc.pantech_count = (uint8_t)pantech;
     }
 
-    /* gensetType and diEnable switch equipment on and off, so out of range
-     * they are refused (setcfg_int_in_range). gensetModel and gensetBaud keep
-     * their documented clamps — on the int, before narrowing, so 258 cannot
-     * wrap onto model 2. The genset address pair is its own reader. */
-    int gtype = nc.genset_type, di_mask = nc.di_enable;
+    /* Every genset field and switch is range-checked and REFUSED out of range
+     * (setcfg_int_in_range / setcfg_get_bool): gensetModel 12 used to become
+     * model 0 and gensetBaud 2400 became 9600, both acked config_successful.
+     * The genset address pair is its own reader. */
+    int gtype = nc.genset_type, di_mask = nc.di_enable, gmodel = nc.genset_model;
+    int gbaud = (int)nc.genset_baud;
+    bool gps_on = nc.gps_enable;
     if (!setcfg_int_in_range(json, "gensetType", GENSET_OFF, GENSET_SEDEMAC, &gtype, verr, sizeof(verr)) ||
         !setcfg_int_in_range(json, "diEnable", 0, 0x0F, &di_mask, verr, sizeof(verr)) ||
+        !setcfg_int_in_range(json, "gensetModel", 0, GENSET_MODEL_MAX, &gmodel, verr, sizeof(verr)) ||
+        !setcfg_int_in_range(json, "gensetBaud", 1, 1000000, &gbaud, verr, sizeof(verr)) ||
+        !setcfg_get_bool(json, "gpsEnable", &gps_on, verr, sizeof(verr)) ||
         !setcfg_genset_addr(json, &nc, verr, sizeof(verr))) {
         ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
         setcfg_fail(verr);
         return;
     }
-    nc.genset_type = (uint8_t)gtype;
-    nc.di_enable   = (uint8_t)di_mask;
-    int gmodel = json_get_int(json, "gensetModel", nc.genset_model);
-    nc.genset_model  = (gmodel < 0 || gmodel > GENSET_MODEL_MAX) ? GENSET_MODEL_GC1211 : (uint8_t)gmodel;
-    nc.genset_baud   = (uint32_t)json_get_int(json,"gensetBaud", (int)nc.genset_baud);
-    nc.gps_enable    = json_get_bool(json, "gpsEnable", nc.gps_enable);
+    if (json_has_key(json, "gensetBaud") && gbaud != 4800 && gbaud != 9600 && gbaud != 19200) {
+        ESP_LOGW(TAG, "setconfig: rejected — gensetBaud %d", gbaud);
+        setcfg_fail("gensetBaud must be 4800, 9600 or 19200");
+        return;
+    }
+    nc.genset_type  = (uint8_t)gtype;
+    nc.di_enable    = (uint8_t)di_mask;
+    nc.genset_model = (uint8_t)gmodel;
+    nc.genset_baud  = (uint32_t)gbaud;
+    nc.gps_enable   = gps_on;
 
-    /* Baud whitelist — an out-of-range value (0 in particular) reaches the
-     * UART clock-divider division in rs485_bus_set_8n1() and panics the chip
-     * into a reboot loop. Coerce to the Sedemac default like the counts. */
+    /* Baud whitelist, kept as a belt for a STORED value (a pushed one was
+     * refused above) — an out-of-range baud (0 in particular) reaches the UART
+     * clock-divider division in rs485_bus_set_8n1() and panics the chip into a
+     * reboot loop. */
     if (nc.genset_baud != 4800 && nc.genset_baud != 9600 && nc.genset_baud != 19200)
         nc.genset_baud = 9600;
 
@@ -1185,17 +1313,30 @@ static void parse_setconfig(const char *json) {
      * pending-trial logic enforces this on every boot), so they're exactly
      * what a bad push should roll back to. Stage them into nc's _bak fields
      * from g_cfg (still untouched here) before nc's primary fields change. */
-    bool apn_present   = json_get_str(json,"apn",           nc.apn,             sizeof(nc.apn));
-    bool auser_present = json_get_str(json,"apnUser",       nc.apn_user,        sizeof(nc.apn_user));
-    bool apass_present = json_get_str(json,"apnPass",       nc.apn_pass,        sizeof(nc.apn_pass));
-    bool host_present  = json_get_str(json,"mqttHost",      nc.mqtt_host,       sizeof(nc.mqtt_host));
-    bool user_present  = json_get_str(json,"mqttUser",      nc.mqtt_user,       sizeof(nc.mqtt_user));
-    bool pass_present  = json_get_str(json,"mqttPass",      nc.mqtt_pass,       sizeof(nc.mqtt_pass));
-    bool topic_present = json_get_str(json,"mqttBaseTopic", nc.mqtt_base_topic, sizeof(nc.mqtt_base_topic));
+    /* Every connectivity value is read strictly (setcfg_get_text and friends):
+     * a value that is not a string, or that does not FIT its field, is refused
+     * here — json_get_str() used to cut it to size, and a truncated password
+     * only surfaced as a failed trial and a rollback. */
+    bool apn_present = false, auser_present = false, apass_present = false;
+    bool host_present = false, user_present = false, pass_present = false, topic_present = false;
     bool port_present  = json_has_key(json, "mqttPort");
-    int  port_val      = port_present ? json_get_int(json, "mqttPort", nc.mqtt_port) : nc.mqtt_port;
+    int  port_val      = nc.mqtt_port;
     bool tls_present   = json_has_key(json, "mqttTls");
-    bool tls_val       = tls_present ? json_get_bool(json, "mqttTls", nc.mqtt_tls) : nc.mqtt_tls;
+    bool tls_val       = nc.mqtt_tls;
+    if (!setcfg_get_text(json, "apn",           nc.apn,             sizeof(nc.apn),             &apn_present,   verr, sizeof(verr)) ||
+        !setcfg_get_text(json, "apnUser",       nc.apn_user,        sizeof(nc.apn_user),        &auser_present, verr, sizeof(verr)) ||
+        !setcfg_get_text(json, "apnPass",       nc.apn_pass,        sizeof(nc.apn_pass),        &apass_present, verr, sizeof(verr)) ||
+        !setcfg_get_text(json, "mqttHost",      nc.mqtt_host,       sizeof(nc.mqtt_host),       &host_present,  verr, sizeof(verr)) ||
+        !setcfg_get_text(json, "mqttUser",      nc.mqtt_user,       sizeof(nc.mqtt_user),       &user_present,  verr, sizeof(verr)) ||
+        !setcfg_get_text(json, "mqttPass",      nc.mqtt_pass,       sizeof(nc.mqtt_pass),       &pass_present,  verr, sizeof(verr)) ||
+        !setcfg_get_text(json, "mqttBaseTopic", nc.mqtt_base_topic, sizeof(nc.mqtt_base_topic), &topic_present, verr, sizeof(verr)) ||
+        !setcfg_int_in_range(json, "mqttPort", 1, 65535, &port_val, verr, sizeof(verr)) ||
+        !setcfg_get_bool(json, "mqttTls", &tls_val, verr, sizeof(verr))) {
+        /* Never echo the value: it may be a password. The reason names the key. */
+        ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
+        setcfg_fail(verr);
+        return;
+    }
 
     /* Resolve mqttPort/mqttTls into nc now — port_val/tls_val already default to
      * the current values when their keys are absent, so this is a no-op unless
@@ -1227,7 +1368,7 @@ static void parse_setconfig(const char *json) {
         snprintf(ok, sizeof(ok),
                  "{\"HW_ID\":\"%s\",\"status\":\"config_successful\",\"fw\":\"%s\"}",
                  g_imei, FW_VERSION);
-        mqtt_publish(t_data, ok);
+        mqtt_publish(t_logs, ok);
         return;
     }
 
@@ -1244,7 +1385,7 @@ static void parse_setconfig(const char *json) {
             snprintf(err, sizeof(err),
                      "{\"HW_ID\":\"%s\",\"status\":\"config_failed\",\"reason\":\"empty_apn\"}",
                      g_imei);
-            mqtt_publish(t_data, err);
+            mqtt_publish(t_logs, err);
             return;
         }
         if (nc.mqtt_host[0] == '\0' || nc.mqtt_base_topic[0] == '\0' ||
@@ -1255,7 +1396,7 @@ static void parse_setconfig(const char *json) {
             snprintf(err, sizeof(err),
                      "{\"HW_ID\":\"%s\",\"status\":\"config_failed\",\"reason\":\"bad_mqtt_broker_fields\"}",
                      g_imei);
-            mqtt_publish(t_data, err);
+            mqtt_publish(t_logs, err);
             return;
         }
         if (!conn_str_ok(nc.apn)       || !conn_str_ok(nc.apn_user)  ||
@@ -1292,7 +1433,7 @@ static void parse_setconfig(const char *json) {
         snprintf(err, sizeof(err),
                  "{\"HW_ID\":\"%s\",\"status\":\"config_failed\",\"reason\":\"%s\"}",
                  g_imei, verr);
-        mqtt_publish(t_data, err);
+        mqtt_publish(t_logs, err);
         return;
     }
 
@@ -1327,7 +1468,7 @@ static void parse_setconfig(const char *json) {
         snprintf(err, sizeof(err),
                  "{\"HW_ID\":\"%s\",\"status\":\"config_failed\",\"reason\":\"nvs_save_failed\"}",
                  g_imei);
-        mqtt_publish(t_data, err);
+        mqtt_publish(t_logs, err);
         return;
     }
     g_cfg = nc;   /* persisted — now safe to go live; reboot follows immediately */
@@ -1336,104 +1477,51 @@ static void parse_setconfig(const char *json) {
     snprintf(ack, sizeof(ack),
              "{\"HW_ID\":\"%s\",\"status\":\"config_successful\",\"fw\":\"%s\"}",
              g_imei, FW_VERSION);
-    mqtt_publish(t_data, ack);
+    mqtt_publish(t_logs, ack);
     vTaskDelay(pdMS_TO_TICKS(500));
     ota_confirm_before_restart("setconfig applied");
     du_task_flush_to_store();
     esp_restart();
 }
 
+/* ── rsp / kfactor tunnel (rsp_tunnel.h) ─────────────────────────────────
+ * The cloud frames the command; the gateway only carries it. Here the payload
+ * becomes bytes and joins the queue — the bus work is left to
+ * execute_pending(), so this MQTT drain never blocks on a pump. A payload that
+ * is not a frame, or a full queue, is answered "404" on the command's own
+ * .../out at once: every command gets exactly one reply there. */
+static void tunnel_accept(int unit, uint8_t kind, const char *payload) {
+    const char *what = (kind == RSP_TUNNEL_KFACTOR) ? "kfactor" : "rsp";
+    const char *out  = (kind == RSP_TUNNEL_KFACTOR) ? t_kf_out[unit] : t_rsp_out[unit];
+    ESP_LOGI(TAG, "%s tunnel (%s) in: %.160s", what, g_hw_du[unit], payload);
+
+    uint8_t frame[RSP_TUNNEL_REQ_MAX];
+    size_t  len = rsp_tunnel_decode(payload, frame, sizeof(frame));
+    if (len == 0) {
+        ESP_LOGW(TAG, "%s tunnel (%s): not a hex frame of 1..%d bytes — nothing sent, 404",
+                 what, g_hw_du[unit], RSP_TUNNEL_REQ_MAX);
+        mqtt_publish(out, "404");
+        return;
+    }
+    if (!rsp_tunnel_push((uint8_t)unit, kind, frame, len)) {
+        ESP_LOGW(TAG, "%s tunnel (%s): %d commands already waiting — nothing sent, 404",
+                 what, g_hw_du[unit], RSP_TUNNEL_QUEUE_MAX);
+        mqtt_publish(out, "404");
+    }
+}
+
 /* ── MQTT message router ──────────────────────────────────────────────── */
-/* ── Yenen RSP update: acks ───────────────────────────────────────────────
- * Every push gets exactly one terminal message on the unit's own
- * .../setrsp/imei/<hw_id>/out topic — accepted-and-confirmed, or refused with a
- * reason. Nothing is answered on <base>/data: an operator changing a price is
- * waiting on this specific reply, and mixing it into the shared telemetry
- * stream would make the cloud correlate it out of a firehose.
- *
- * The reported price is the one READ BACK from the pump, never the one that was
- * asked for, so "RSP_updated" means the pump is holding that value. */
-static int setrsp_clamp(int pos, size_t buf_size) {
-    if (pos < 0) return 0;
-    return (pos > (int)buf_size - 1) ? (int)buf_size - 1 : pos;
-}
-
-/* Refusal for a push that never reached the bus (bad value, unit busy). */
-static void setrsp_reject(const char *topic, const char *hw_id,
-                          const char *reason) {
-    char ts[32], msg[224];
-    rtc_timestamp(ts, sizeof(ts));
-    snprintf(msg, sizeof(msg),
-             "{\"HW_ID\":\"%s\",\"status\":\"RSP_update_rejected\","
-             "\"reason\":\"%s\",\"TS\":\"%s\"}", hw_id, reason, ts);
-    ESP_LOGW(TAG, "setrsp rejected (%s)", reason);
-    /* Same reasoning as the ack above — but a rejection never touched the bus,
-     * so a lost one costs only the reply, not knowledge of the pump's state. */
-    if (!mqtt_publish(topic, msg)) {
-        ESP_LOGE(TAG, "setrsp rejection NOT delivered (link down) — reason was "
-                      "'%s'; nothing was written to the pump", reason);
-    }
-}
-
-/* Terminal ack once every requested side has a final outcome. */
-static void setrsp_publish_ack(const PendingRsp_t *c, int unit) {
-    char ts[32];
-    rtc_timestamp(ts, sizeof(ts));
-
-    bool all_ok = true;
-    for (int side = 0; side < 2; side++)
-        if ((c->req & (1u << side)) && !c->ok[side]) all_ok = false;
-
-    char msg[448];
-    int  pos = 0;
-    pos += snprintf(msg + pos, sizeof(msg) - pos,
-                    "{\"HW_ID\":\"%s\",\"status\":\"%s\",\"rsp\":\"%u.%02u\",\"nz\":{",
-                    g_hw_du[unit],
-                    all_ok ? "RSP_updated" : "RSP_update_failed",
-                    (unsigned)(c->price_x100 / 100), (unsigned)(c->price_x100 % 100));
-    pos = setrsp_clamp(pos, sizeof(msg));
-
-    bool first = true;
-    for (int side = 0; side < 2; side++) {
-        if (!(c->req & (1u << side))) continue;
-        pos += snprintf(msg + pos, sizeof(msg) - pos,
-                        "%s\"%d\":{\"result\":\"%s\"", first ? "" : ",",
-                        du_nozzle_label(unit, side),
-                        c->result[side] ? c->result[side] : "unknown");
-        pos = setrsp_clamp(pos, sizeof(msg));
-        if (c->got[side]) {
-            pos += snprintf(msg + pos, sizeof(msg) - pos, ",\"rsp\":\"%u.%02u\"",
-                            (unsigned)(c->got[side] / 100),
-                            (unsigned)(c->got[side] % 100));
-            pos = setrsp_clamp(pos, sizeof(msg));
-        }
-        pos += snprintf(msg + pos, sizeof(msg) - pos, "}");
-        pos = setrsp_clamp(pos, sizeof(msg));
-        first = false;
-    }
-    snprintf(msg + pos, sizeof(msg) - pos, "},\"TS\":\"%s\"}", ts);
-
-    ESP_LOGI(TAG, "setrsp ack: %s", msg);
-    /* This ack is the operator's ONLY reply, and it is deliberately not queued
-     * to flash: a control-plane reply replayed hours later would describe a
-     * price that may have changed since, and it would sit in a queue whose
-     * ordering contract belongs to sale records. So a failed publish means the
-     * push goes unanswered — log it at ERROR, because the pump HAS been written
-     * by this point and the serial log is then the only surviving record of
-     * what the nozzle actually holds. */
-    if (!mqtt_publish(c->resp_topic, msg)) {
-        ESP_LOGE(TAG, "setrsp ack NOT delivered (link down) — unit %d asked for "
-                      "%u.%02u; the outcome above is final on the device and "
-                      "will NOT be retried",
-                 unit + 1, (unsigned)(c->price_x100 / 100),
-                 (unsigned)(c->price_x100 % 100));
-    }
-}
-
 static void handle_msg(const char *topic, const char *payload) {
+    /* An OFF dispenser slot's command topics are "" (build_topics), so an empty
+     * topic would match them. MQTT has no zero-length topic names; belt only. */
+    if (!topic || !topic[0] || !payload) return;
     if (strcmp(topic, t_update) == 0 || strcmp(topic, t_fleet_update) == 0) {
         const bool fleet = (strcmp(topic, t_fleet_update) == 0);
-        char url_buf[FOTA_URL_MAX + 1] = {0};
+        /* One byte past the cap: json_get_str() clamps, so a URL longer than
+         * FOTA_URL_MAX arrives here one character too long and is refused as
+         * url_too_long below, instead of being cut and downloaded as a
+         * different, wrong URL. */
+        char url_buf[FOTA_URL_MAX + 2] = {0};
         const char *url_to_use = payload;
         bool force = false;
         char fota_msg[160];
@@ -1445,7 +1533,7 @@ static void handle_msg(const char *topic, const char *payload) {
         if (cmd_in_retain_grace(fleet ? "fleet update" : "update")) {
             snprintf(fota_msg, sizeof(fota_msg),
                      "{\"HW_ID\":\"%s\",\"status\":\"fota_ignored_retained\"}", g_imei);
-            mqtt_publish(t_data, fota_msg);
+            mqtt_publish(t_logs, fota_msg);
             return;
         }
 
@@ -1471,7 +1559,7 @@ static void handle_msg(const char *topic, const char *payload) {
                 ESP_LOGW(TAG, "FOTA JSON payload missing 'url'");
                 snprintf(fota_msg, sizeof(fota_msg),
                          "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"no_url\"}", g_imei);
-                mqtt_publish(t_data, fota_msg);
+                mqtt_publish(t_logs, fota_msg);
                 return;
             }
             url_to_use = url_buf;
@@ -1500,7 +1588,7 @@ static void handle_msg(const char *topic, const char *payload) {
                      "{\"HW_ID\":\"%s\",\"status\":\"%s\",\"fw\":\"%s\"}", g_imei,
                      st == FOTA_URL_APPLIED ? "fota_skip_already_applied" : "fota_skip_reverted",
                      FW_VERSION);
-            mqtt_publish(t_data, fota_msg);
+            mqtt_publish(t_logs, fota_msg);
             return;
         }
 
@@ -1523,7 +1611,7 @@ static void handle_msg(const char *topic, const char *payload) {
             snprintf(fota_msg, sizeof(fota_msg),
                      "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"url_too_long\"}",
                      g_imei);
-            mqtt_publish(t_data, fota_msg);
+            mqtt_publish(t_logs, fota_msg);
             return;
         }
         if (!force && s_fota_blocked[0] && strcmp(url_to_use, s_fota_blocked) == 0) {
@@ -1531,7 +1619,7 @@ static void handle_msg(const char *topic, const char *payload) {
                           "(clear the retained message, publish a new URL, or force)");
             snprintf(fota_msg, sizeof(fota_msg),
                      "{\"HW_ID\":\"%s\",\"status\":\"fota_skip_known_bad\"}", g_imei);
-            mqtt_publish(t_data, fota_msg);
+            mqtt_publish(t_logs, fota_msg);
             return;
         }
 
@@ -1556,7 +1644,7 @@ static void handle_msg(const char *topic, const char *payload) {
          * device goes radio-silent until fota_successful/fota_failed. */
         snprintf(fota_msg, sizeof(fota_msg),
                  "{\"HW_ID\":\"%s\",\"status\":\"fota_initiated\"}", g_imei);
-        mqtt_publish(t_data, fota_msg);
+        mqtt_publish(t_logs, fota_msg);
         vTaskDelay(pdMS_TO_TICKS(500));
 
         /* FOTA start — keep blinking continuously through the whole download
@@ -1576,7 +1664,7 @@ static void handle_msg(const char *topic, const char *payload) {
         ota_confirm_before_restart("fota requested");
 
         char fota_reason[48] = "unknown";
-        bool fota_ok = fota_perform(url_to_use, t_data, fota_reason, sizeof(fota_reason));
+        bool fota_ok = fota_perform(url_to_use, t_logs, fota_reason, sizeof(fota_reason));
 
         led_blink_stop();   /* FOTA end — back to per-push blinks / reboot */
 
@@ -1600,13 +1688,23 @@ static void handle_msg(const char *topic, const char *payload) {
                     snprintf(fota_msg, sizeof(fota_msg),
                              "{\"HW_ID\":\"%s\",\"status\":\"fota_successful\",\"handover\":%s}",
                              g_imei, foreign ? "true" : "false");
-                    mqtt_publish(t_data, fota_msg);
+                    mqtt_publish(t_logs, fota_msg);
                     vTaskDelay(pdMS_TO_TICKS(500));
                     break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(3000));
             }
             if (foreign) {
+                /* Leave the MODEM neutral for the incoming product. With
+                 * gpsEnable on, this firmware saved autogps/AGPS on in the
+                 * modem's own NVRAM, and those switches outlive the app: a
+                 * product that does not manage GNSS (cng-cpil) would otherwise
+                 * run the GNSS engine and fetch AGPS data over the SIM for the
+                 * rest of the module's life. Products that want GPS switch it
+                 * back on at their boot. Same step as hsd-snf. Bounded AT
+                 * queries only (gps.c), WDT-fed inside modem_at(). */
+                gps_end();
+
                 /* The incoming firmware is another product's. Spilling RAM to
                  * flash here would hand it this station's readings to publish
                  * as its own; and du_task may have written a round since
@@ -1630,7 +1728,7 @@ static void handle_msg(const char *topic, const char *payload) {
             snprintf(fota_msg, sizeof(fota_msg),
                      "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"%s\"}",
                      g_imei, fota_reason);
-            mqtt_publish(t_data, fota_msg);
+            mqtt_publish(t_logs, fota_msg);
         } else {
             mqtt_reconnect_if_needed();
         }
@@ -1684,271 +1782,61 @@ static void handle_msg(const char *topic, const char *payload) {
         return;
     }
     for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
-        if (strcmp(topic, t_rsp_bs_in[i]) == 0) {
-            if (g_rsp_bs_cmd[i].pending) {
-                char msg[128];
-                snprintf(msg, sizeof(msg), "{\"HW_ID\":\"%s\",\"status\":\"busy\"}", g_imei);
-                mqtt_publish(t_data, msg);
-                return;
-            }
-            g_rsp_bs_cmd[i].pending = true;
-            /* strncpy does not NUL-terminate when src is >= n bytes — these
-             * are global statics (BSS-zeroed at boot) so the final byte
-             * happens to already be '\0' on a fresh device, but that's an
-             * accident of initial state, not a guarantee after it's been
-             * written once. Terminate explicitly. */
-            strncpy(g_rsp_bs_cmd[i].cmd_hex, payload, sizeof(g_rsp_bs_cmd[i].cmd_hex)-1);
-            g_rsp_bs_cmd[i].cmd_hex[sizeof(g_rsp_bs_cmd[i].cmd_hex)-1] = '\0';
-            strncpy(g_rsp_bs_cmd[i].resp_topic, t_rsp_bs_out[i], sizeof(g_rsp_bs_cmd[i].resp_topic)-1);
-            g_rsp_bs_cmd[i].resp_topic[sizeof(g_rsp_bs_cmd[i].resp_topic)-1] = '\0';
-            return;
-        }
-        if (strcmp(topic, t_kf_bs_in[i]) == 0) {
-            if (g_kf_bs_cmd[i].pending) {
-                char msg[128];
-                snprintf(msg, sizeof(msg), "{\"HW_ID\":\"%s\",\"status\":\"busy\"}", g_imei);
-                mqtt_publish(t_data, msg);
-                return;
-            }
-            g_kf_bs_cmd[i].pending = true;
-            strncpy(g_kf_bs_cmd[i].cmd_hex, payload, sizeof(g_kf_bs_cmd[i].cmd_hex)-1);
-            g_kf_bs_cmd[i].cmd_hex[sizeof(g_kf_bs_cmd[i].cmd_hex)-1] = '\0';
-            strncpy(g_kf_bs_cmd[i].resp_topic, t_kf_bs_out[i], sizeof(g_kf_bs_cmd[i].resp_topic)-1);
-            g_kf_bs_cmd[i].resp_topic[sizeof(g_kf_bs_cmd[i].resp_topic)-1] = '\0';
-            return;
-        }
-    }
-    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
-        if (strcmp(topic, t_rsp_yn_in[i]) == 0) {
-            if (g_rsp_yn_cmd[i].pending) {
-                char msg[128];
-                snprintf(msg, sizeof(msg), "{\"HW_ID\":\"%s\",\"status\":\"busy\"}", g_imei);
-                mqtt_publish(t_data, msg);
-                return;
-            }
-            g_rsp_yn_cmd[i].pending = true;
-            strncpy(g_rsp_yn_cmd[i].cmd_hex, payload, sizeof(g_rsp_yn_cmd[i].cmd_hex)-1);
-            g_rsp_yn_cmd[i].cmd_hex[sizeof(g_rsp_yn_cmd[i].cmd_hex)-1] = '\0';
-            strncpy(g_rsp_yn_cmd[i].resp_topic, t_rsp_yn_out[i], sizeof(g_rsp_yn_cmd[i].resp_topic)-1);
-            g_rsp_yn_cmd[i].resp_topic[sizeof(g_rsp_yn_cmd[i].resp_topic)-1] = '\0';
-            return;
-        }
-    }
-    /* ── Yenen RSP (unit price) update ────────────────────────────────────
-     *   {"rsp":65.32}          both nozzles of this dispenser
-     *   {"rsp":65.32,"nz":1}   one nozzle
-     *
-     * "nz" accepts either numbering the cloud might reasonably use: 1/2 mean
-     * side A/B of the dispenser this topic addresses (the vendor doc's own
-     * "RSP NZ1"/"RSP NZ2"), and the unit's GLOBAL nozzle label — the key its
-     * readings are published under — is accepted too. The two can never
-     * disagree: global labels 1 and 2 only exist on a site with no BlueSky
-     * units, where they belong to the first Yenen unit's own two sides.
-     *
-     * Only parsing and validation happen here. The bus work is left to
-     * execute_pending() so this MQTT drain never blocks on a pump. */
-    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
-        if (strcmp(topic, t_setrsp_yn_in[i]) != 0) continue;
-
-        ESP_LOGI(TAG, "setrsp cmd (unit %d): %s", i + 1, payload);
-
-        if (i >= g_cfg.du_count || g_cfg.du_make[i] != DU_MAKE_YENEN) {
-            setrsp_reject(t_setrsp_yn_out[i], g_hw_du[i], "unit_not_configured_as_yenen");
-            return;
-        }
-        /* One update per unit at a time. A second push while the first is still
-         * inside its retry window would race two writes onto one nozzle, and
-         * the ack for either could then describe the other's price. */
-        if (g_setrsp_yn[i].pending) {
-            setrsp_reject(t_setrsp_yn_out[i], g_hw_du[i], "busy");
-            return;
-        }
-
-        uint16_t price = 0;
-        if (!json_get_price_x100(payload, "rsp", &price)) {
-            setrsp_reject(t_setrsp_yn_out[i], g_hw_du[i], "bad_rsp");
-            return;
-        }
-
-        uint8_t sides = 0x03;                       /* default: both nozzles  */
-        if (json_has_key(payload, "nz")) {
-            int nz = json_get_int(payload, "nz", -1);
-            if (nz < 0) {
-                /* Accept it quoted too — {"nz":"1"} is the same intent as
-                 * {"nz":1}, and "rsp" already takes either form. Refusing one
-                 * spelling of an unambiguous value would just be a trap. */
-                char nzs[8];
-                if (json_get_str(payload, "nz", nzs, sizeof(nzs))) nz = atoi(nzs);
-            }
-            if      (nz == 1 || nz == du_nozzle_label(i, 0)) sides = 0x01;
-            else if (nz == 2 || nz == du_nozzle_label(i, 1)) sides = 0x02;
-            else {
-                setrsp_reject(t_setrsp_yn_out[i], g_hw_du[i], "bad_nz");
-                return;
-            }
-        }
-
-        PendingRsp_t *c = &g_setrsp_yn[i];
-        memset(c, 0, sizeof(*c));
-        c->price_x100  = price;
-        c->req         = sides;
-        c->todo        = sides;
-        c->deadline_us = esp_timer_get_time()
-                         + (int64_t)YN_RSP_BUSY_WINDOW_S * 1000000LL;
-        c->next_try_us = 0;                         /* first attempt immediately */
-        strncpy(c->resp_topic, t_setrsp_yn_out[i], sizeof(c->resp_topic) - 1);
-        c->resp_topic[sizeof(c->resp_topic) - 1] = '\0';
-        c->pending = true;                          /* set LAST — arms the runner */
-
-        ESP_LOGI(TAG, "setrsp queued: unit %d sides 0x%02x -> %u.%02u",
-                 i + 1, (unsigned)sides,
-                 (unsigned)(price / 100), (unsigned)(price % 100));
-        return;
+        if (strcmp(topic, t_rsp_in[i]) == 0) { tunnel_accept(i, RSP_TUNNEL_RSP, payload);     return; }
+        if (strcmp(topic, t_kf_in[i])  == 0) { tunnel_accept(i, RSP_TUNNEL_KFACTOR, payload); return; }
     }
 }
 
-/* ── Execute pending remote commands ────────────────────────────────────
- * These drive the same RS485 bus du_task polls on, so each transaction takes
- * the bus lock. The mqtt_publish() of the reply is deliberately OUTSIDE the
- * lock: a publish is a modem round-trip that can block for a second or more
- * and does not need the bus, so holding it there would stall dispenser
- * polling for no reason. */
+/* ── Execute queued tunnel commands ─────────────────────────────────────
+ * These drive the same RS485 bus du_task polls on, so each exchange takes the
+ * bus lock — per command, so du_task gets the bus between two of them. The
+ * mqtt_publish() of the reply is deliberately OUTSIDE the lock: a publish is a
+ * modem round-trip that can block for a second or more and does not need the
+ * bus, so holding it there would stall dispenser polling for no reason.
+ *
+ * At most TUNNEL_BATCH commands per call — each costs ~2 s, the pilot's quiet
+ * window after the reply — so a burst (a whole-station price change) cannot
+ * keep the main task off its own duties, and a panel unlock arriving behind
+ * it waits seconds, not half a minute. This runs every ~1 s and after every
+ * poll step, so the rest follow straight away. */
+#define TUNNEL_BATCH 4
 static void execute_pending(void) {
-    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
-        /* Each pending command below can wait up to RS485_BUS_WAIT_MAIN_MS (9 s)
-         * for the bus before its transaction. Across DU_MAX_DISPENSERS*2 slots
-         * that worst case approaches the 120 s task WDT, so feed it once per
-         * slot. Guarded because this runs on whichever task called poll_incoming_mqtt. */
+    for (int n = 0; n < TUNNEL_BATCH; n++) {
+        RspTunnelCmd_t c;
+        if (!rsp_tunnel_pop(&c)) return;
+        /* One command can wait RS485_BUS_WAIT_MAIN_MS (9 s) for the bus and then
+         * hold it up to 3 x RS485_RECV_TIMEOUT_MS, so feed the 120 s task WDT
+         * between commands. Guarded because this runs on whichever task called
+         * poll_incoming_mqtt. */
         if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
-        /* BlueSky rsp / kfactor passthrough — the frame is the cloud's, but it
-         * is only put on the bus once it has been checked against THIS
-         * dispenser (the topic's) and the target nozzle has reported idle; see
-         * du_exec_bluesky_passthrough(). The /out reply keeps the bare-hex-or-
-         * 404 contract; a refusal is additionally explained on <base>/data so
-         * the operator learns why nothing was written. */
-        for (int kind = 0; kind < 2; kind++) {
-            PendingCmd_t *pc   = kind ? &g_kf_bs_cmd[i] : &g_rsp_bs_cmd[i];
-            const char   *what = kind ? "kfactor" : "rsp";
-            if (!pc->pending) continue;
-            pc->pending = false;
-            /* Static, not stack: this runs on the main task under the deepest
-             * call chains (poll_incoming_mqtt -> execute_pending), sequentially. */
-            static char resp_hex[128], readback[128];
-            char reason[32] = "bus_busy";
-            bool ok = false;
-            int  n  = du_number_of(&g_cfg, i);
-            if (n < 1) n = i + 1;
-            resp_hex[0] = readback[0] = '\0';
-            if (rs485_bus_lock(RS485_BUS_WAIT_MAIN_MS)) {
-                rs485_bus_set_bluesky();
-                ok = du_exec_bluesky_passthrough(pc->cmd_hex, (uint8_t)(2 * n - 1), (uint8_t)(2 * n),
-                                                 kind ? BS_CMD_KFACT : BS_CMD_RSP,
-                                                 resp_hex, sizeof(resp_hex),
-                                                 readback, sizeof(readback),
-                                                 reason, sizeof(reason));
-                rs485_bus_set_8n1(9600);
-                rs485_bus_unlock();
-            } else {
-                ESP_LOGW(TAG, "%s cmd: RS485 bus busy — not executed", what);
-            }
-            /* The /out contract: the pump's reply as bare hex, or 404. */
-            mqtt_publish(pc->resp_topic, ok ? resp_hex : "404");
-            /* Additive, on <base>/data: WHY a 404 (the operator would otherwise
-             * only learn "it didn't work"), and after a write, what the pump
-             * now holds. */
-            char msg[224];
-            if (!ok) {
-                snprintf(msg, sizeof(msg),
-                         "{\"HW_ID\":\"%s\",\"status\":\"%s_rejected\",\"reason\":\"%s\"}",
-                         g_hw_du[i], what, reason);
-                mqtt_publish(t_data, msg);
-            } else if (readback[0]) {
-                snprintf(msg, sizeof(msg),
-                         "{\"HW_ID\":\"%s\",\"status\":\"%s_readback\",\"data\":\"%s\"}",
-                         g_hw_du[i], what, readback);
-                mqtt_publish(t_data, msg);
-            }
+        if (c.unit >= DU_MAX_DISPENSERS) continue;              /* belt only */
+
+        const bool  kf   = (c.kind == RSP_TUNNEL_KFACTOR);
+        const char *what = kf ? "kfactor" : "rsp";
+        const char *out  = kf ? t_kf_out[c.unit] : t_rsp_out[c.unit];
+        const bool  bs   = (g_cfg.du_make[c.unit] == DU_MAKE_BLUESKY);
+        /* Static, not stack: the deepest call chain on the main task
+         * (poll_incoming_mqtt -> execute_pending), one command at a time. */
+        static char reply[RSP_TUNNEL_REPLY_TEXT_MAX];
+        snprintf(reply, sizeof(reply), "404");
+
+        if (!rs485_bus_lock(RS485_BUS_WAIT_MAIN_MS)) {
+            ESP_LOGW(TAG, "%s tunnel (%s): RS485 bus busy for %d ms — nothing sent, 404",
+                     what, g_hw_du[c.unit], RS485_BUS_WAIT_MAIN_MS);
+            mqtt_publish(out, reply);
+            return;                 /* a poll round has the bus; the rest wait */
         }
-    }
-    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
-        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
-        if (g_rsp_yn_cmd[i].pending) {
-            g_rsp_yn_cmd[i].pending = false;
-            char resp_hex[256] = {0};
-            bool ok = false;
-            if (rs485_bus_lock(RS485_BUS_WAIT_MAIN_MS)) {
-                rs485_bus_set_yenen();
-                ok = yn_exec_passthrough(g_rsp_yn_cmd[i].cmd_hex, resp_hex, sizeof(resp_hex));
-                rs485_bus_set_8n1(9600);
-                rs485_bus_unlock();
-            } else {
-                ESP_LOGW(TAG, "yenen rsp cmd: RS485 bus busy — not executed");
-            }
-            mqtt_publish(g_rsp_yn_cmd[i].resp_topic, ok ? resp_hex : "404");
-        }
-    }
+        if (bs) rs485_bus_set_bluesky();
+        else    rs485_bus_set_yenen();
+        rsp_tunnel_exchange(c.frame, c.len, reply, sizeof(reply));
+        /* Any tunnel frame may have been a k-factor write: the next nozzle
+         * messages re-read it instead of carrying the cached value. */
+        if (bs) du_kfactor_mark_stale();
+        rs485_bus_set_8n1(9600);    /* leave the bus as radar/genset expect */
+        rs485_bus_unlock();
 
-    /* ── Yenen RSP updates ────────────────────────────────────────────────
-     * The bus is taken and released PER NOZZLE, not per command, so the two
-     * sides of a dispenser never hold it back to back and du_task gets a clean
-     * chance at it in between. A failed lock is treated exactly like a busy
-     * nozzle — transient, retried inside the window — because that is what it
-     * is: a poll round is using the bus. */
-    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
-        PendingRsp_t *c = &g_setrsp_yn[i];
-        if (!c->pending) continue;
-        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
-
-        int64_t now = esp_timer_get_time();
-        if (now < c->next_try_us) continue;
-
-        for (int side = 0; side < 2; side++) {
-            if (!(c->todo & (1u << side))) continue;
-            /* Per SIDE, not just per unit: one side is a 9 s lock wait plus up
-             * to ~11.5 s of transactions, so a fully-loaded site with an update
-             * queued on every unit would otherwise go a long way toward the
-             * 120 s task WDT between feeds. */
-            if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
-
-            uint16_t back = 0;
-            if (!rs485_bus_lock(RS485_BUS_WAIT_MAIN_MS)) {
-                ESP_LOGW(TAG, "setrsp: RS485 bus busy — nz%d not written yet",
-                         du_nozzle_label(i, side));
-                c->result[side] = "bus_busy";       /* stays in todo, retried */
-                continue;
-            }
-            rs485_bus_set_yenen();
-            /* Head = the dispenser NUMBER, never the list position. */
-            int head = du_number_of(&g_cfg, i);
-            if (head < 1) head = i + 1;
-            YnRspResult_t r = yn_set_rsp((uint8_t)head, (uint8_t)side,
-                                         c->price_x100, &back);
-            rs485_bus_set_8n1(9600);                /* leave the bus as radar/genset expect */
-            rs485_bus_unlock();
-
-            c->result[side] = yn_rsp_result_str(r);
-            if (back) c->got[side] = back;
-            if (r == YN_RSP_BUSY) continue;         /* mid-delivery — retry   */
-
-            c->todo &= (uint8_t)~(1u << side);      /* every other outcome is final */
-            c->ok[side] = (r == YN_RSP_OK);
-        }
-
-        if (c->todo == 0) {
-            setrsp_publish_ack(c, i);
-            c->pending = false;
-        } else if (esp_timer_get_time() >= c->deadline_us) {
-            /* Window spent with a side still transient. The last transient
-             * reason is already in result[], so the ack says whether it was the
-             * nozzle or the bus that never freed up. */
-            ESP_LOGW(TAG, "setrsp: unit %d gave up after %d s (sides 0x%02x)",
-                     i + 1, YN_RSP_BUSY_WINDOW_S, (unsigned)c->todo);
-            setrsp_publish_ack(c, i);
-            c->pending = false;
-        } else {
-            c->next_try_us = esp_timer_get_time()
-                             + (int64_t)YN_RSP_RETRY_PACE_MS * 1000LL;
-        }
+        /* The /out contract: the pump's reply as received, or 404. */
+        mqtt_publish(out, reply);
     }
 }
 
@@ -2004,17 +1892,30 @@ static void ota_confirm_before_restart(const char *why) {
                   "a restart of an unconfirmed image would roll it back", why);
 }
 
+/* fota_completed is the cloud's only proof that an update took. The image
+ * confirms itself on its first poll cycle whether or not the link is up (a
+ * weak site must not roll a good update back), so the notice can find no
+ * broker at that moment — it is then kept and re-sent each cycle until a
+ * publish is confirmed. */
+static bool s_fota_completed_unsent = false;
+
+static void publish_fota_completed(void) {
+    if (!s_fota_completed_unsent || !mqtt_is_connected()) return;
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "{\"HW_ID\":\"%s\",\"status\":\"fota_completed\",\"fw\":\"%s\"}",
+             g_imei, FW_VERSION);
+    if (mqtt_publish(t_logs, msg)) s_fota_completed_unsent = false;
+}
+
 static void check_post_ota(void) {
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t   state;
     if (esp_ota_get_state_partition(running, &state) == ESP_OK
         && state == ESP_OTA_IMG_PENDING_VERIFY) {
         esp_ota_mark_app_valid_cancel_rollback();
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "{\"HW_ID\":\"%s\",\"status\":\"fota_completed\",\"fw\":\"%s\"}",
-                 g_imei, FW_VERSION);
-        mqtt_publish(t_data, msg);
+        s_fota_completed_unsent = true;
+        publish_fota_completed();
     }
 }
 
@@ -2301,8 +2202,8 @@ static uint8_t poll_radar(const char *ts, uint8_t mask) {
  * was published — false is what the fast re-poll acts on. */
 static bool poll_genset(const char *ts) {
     static GensetData_t gd;
-    /* Raw-hex genset payloads are small — the largest frame (SGC120: 163 bytes
-     * → ~490 hex chars) is well under 600 bytes — but the buffer is left at 4096
+    /* Raw-hex genset payloads are small — the largest frame (SGC120: 161 bytes
+     * → 482 hex chars) is well under 600 bytes — but the buffer is left at 4096
      * so the builder's own ceiling check (MQTT_MODEM_PAYLOAD_SAFE_MAX), not the
      * buffer, is what bounds the payload, and a future wider read block can't
      * silently truncate here. */
@@ -2645,7 +2546,7 @@ static void mqtt_reconnect_if_needed(void) {
  * for 30+ seconds (BlueSky busy-retry waits, RS485 timeouts) with no
  * chance to notice an incoming publish until the cycle fully completes.
  *
- * Also executes any rsp/kfactor command handle_msg() just marked pending,
+ * Also executes any rsp/kfactor tunnel command handle_msg() just queued,
  * right here — not just once per 12 s cycle. This runs every ~1s (via
  * sleep_with_poll) as well as between every poll-cycle step, so a remote
  * command now gets serviced within about a second of arriving instead of
@@ -2817,13 +2718,24 @@ static void run_poll_cycle(void) {
 
     diag_record_loop_time(esp_timer_get_time() - loop_start);
 
+    /* One-minute CPU sample — the busiest-minute figure in the report. Reads
+     * the FreeRTOS task table only: no I/O, no lock, microseconds. */
+    {
+        static int cpu_cycle = 0;
+        if (++cpu_cycle >= CPU_LOAD_SAMPLE_CYCLES) {
+            cpu_cycle = 0;
+            diag_cpu_sample();
+        }
+    }
+
     if (++g_diag_cycle >= DIAG_CYCLE_INTERVAL) {
         rtc_timestamp(ts, sizeof(ts));
         /* One combined diagnostics report (diagnostics + system monitor merged
-         * into diagnostics.c). diag_publish() reads the window counters and
-         * clears them on a confirmed publish — the single report-and-clear point. */
+         * into diagnostics.c), on <base>/logs. diag_publish() reads the window
+         * counters and clears them on a confirmed publish — the single
+         * report-and-clear point. */
         forensics_mark(FSLOT_MAIN, F_DIAG, 0);
-        diag_publish(g_imei, ts, t_data);
+        diag_publish(g_imei, ts, t_logs);
         g_diag_cycle = 0;
     }
 
@@ -2851,7 +2763,7 @@ static void run_poll_cycle(void) {
                 snprintf(msg, sizeof(msg),
                          "{\"HW_ID\":\"%s\",\"status\":\"unconfigured\",\"fw\":\"%s\"}",
                          g_imei, FW_VERSION);
-                mqtt_publish(t_data, msg);
+                mqtt_publish(t_logs, msg);
                 ESP_LOGW(TAG, "still unconfigured — re-announced (awaiting setconfig)");
             }
         } else {
@@ -3327,7 +3239,7 @@ void app_main(void) {
          * to) meant one failed publish silently swallowed the only notice the
          * cloud ever gets that a connectivity push was rejected and reverted.
          * Left set, it simply retries on the next boot. */
-        if (mqtt_publish(t_data, rb)) {
+        if (mqtt_publish(t_logs, rb)) {
             g_cfg.conn_rollback_notify = false;
             nvs_config_save(&g_cfg);
         } else {
@@ -3364,7 +3276,7 @@ void app_main(void) {
              g_imei,
              unconfigured ? "unconfigured" : "ready",
              FW_VERSION);
-    mqtt_publish(t_data, ready_msg);
+    mqtt_publish(t_logs, ready_msg);
 
     /* The previous update was thrown away by the bootloader (see
      * note_reverted_image_at_boot). Best effort: if the link is not up yet the
@@ -3374,7 +3286,7 @@ void app_main(void) {
         snprintf(rv, sizeof(rv),
                  "{\"HW_ID\":\"%s\",\"status\":\"fota_reverted\",\"image\":\"%s\",\"fw\":\"%s\"}",
                  g_imei, s_reverted_image, FW_VERSION);
-        mqtt_publish(t_data, rv);
+        mqtt_publish(t_logs, rv);
     }
 
     /* Announce a credential takeover to whoever the device now reports to. On a
@@ -3390,7 +3302,7 @@ void app_main(void) {
                  "\"broker_changed\":%s,\"config_erased\":%s,\"fw\":\"%s\"}",
                  g_imei, creds_new_dest ? "true" : "false",
                  product_wiped ? "true" : "false", FW_VERSION);
-        mqtt_publish(t_data, cred_msg);
+        mqtt_publish(t_logs, cred_msg);
         ESP_LOGW(TAG, "connectivity was taken from the firmware, not NVS "
                       "(broker %s)", creds_new_dest ? "CHANGED" : "unchanged");
     }
@@ -3426,6 +3338,7 @@ void app_main(void) {
             check_post_ota();
             post_ota_checked = true;
         }
+        publish_fota_completed();   /* no-op unless the notice is still owed */
 
         /* Start-to-start pacing, not a flat post-work sleep.
          *

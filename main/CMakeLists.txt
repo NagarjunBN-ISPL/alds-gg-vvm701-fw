@@ -20,6 +20,7 @@
 # ==> Adding a new src/*.c? Add it to this list, keep it alphabetical. <==
 idf_component_register(
     SRCS
+        "${CMAKE_SOURCE_DIR}/src/cpu_load.c"
         "${CMAKE_SOURCE_DIR}/src/di.c"
         "${CMAKE_SOURCE_DIR}/src/diagnostics.c"
         "${CMAKE_SOURCE_DIR}/src/dispenser.c"
@@ -37,6 +38,7 @@ idf_component_register(
         "${CMAKE_SOURCE_DIR}/src/radar.c"
         "${CMAKE_SOURCE_DIR}/src/relay.c"
         "${CMAKE_SOURCE_DIR}/src/rs485_bus.c"
+        "${CMAKE_SOURCE_DIR}/src/rsp_tunnel.c"
         "${CMAKE_SOURCE_DIR}/src/store.c"
         "${CMAKE_SOURCE_DIR}/src/tls_ca.c"
         "${CMAKE_SOURCE_DIR}/src/yenen.c"

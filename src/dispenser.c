@@ -19,9 +19,9 @@
  */
 #define BS_CMD_STATUS 0xD5
 #define BS_CMD_TOTAL  0xC5
-/* BS_CMD_RSP (0xB6) and BS_CMD_KFACT (0xE2) live in dispenser.h — the
- * passthrough caller names its read-back command with them.
- * BS_CMD_RFID (0xD7) intentionally removed — RFID is no longer polled. */
+#define BS_CMD_RSP    0xB6
+#define BS_CMD_KFACT  0xE2
+/* BS_CMD_RFID (0xD7) intentionally removed — RFID is no longer polled. */
 
 static void bluesky_frame(uint8_t addr, uint8_t cmd_byte, uint8_t *out /* 5 bytes */) {
     out[0] = 0xF5;
@@ -171,26 +171,6 @@ static bool bluesky_read_valid(const uint8_t *buf, int len, uint8_t addr,
     return true;
 }
 
-/* The passthrough's reply to a cloud-built frame is the one reply whose layout
- * is NOT known: no write reply has ever been captured, and it may not echo the
- * command or carry data. So only the header and the address are checked, as
- * before; what a write left in the pump is confirmed by the read-back, which
- * goes through bluesky_read_valid(). Reads never come here. */
-static bool bluesky_resp_valid(const uint8_t *buf, int len, uint8_t addr,
-                                const char *what) {
-    if (len < 4) {
-        ESP_LOGW(TAG, "BlueSky nz%u %s: short frame (%d bytes) — dropped",
-                 addr, what, len);
-        return false;
-    }
-    if (buf[0] != 0xF5 || buf[1] != addr) {
-        ESP_LOGW(TAG, "BlueSky nz%u %s: bad header/addr echo (0x%02x 0x%02x) — dropped",
-                 addr, what, buf[0], buf[1]);
-        return false;
-    }
-    return true;
-}
-
 /* Unconditional raw-bytes log for field debugging — prints exactly what came
  * back over RS485 for this command, regardless of whether it passed
  * validation, so a station visit can see real wire data without needing a
@@ -233,18 +213,17 @@ static int du_read_field(uint8_t addr, uint8_t cmd_byte, uint8_t *buf,
 /* ── K-factor cache ───────────────────────────────────────────────────────
  * The last k-factor known to be in each pump, indexed by the 1-based nozzle
  * address (1..DU_MAX_DISPENSERS*2; slot 0 unused). Filled by a due poll-round
- * read AND by the read-back after a passthrough k-factor write, so a
- * recalibration shows in the next nozzle message instead of up to
- * KFACTOR_POLL_INTERVAL_S later. RAM only: empty after a reboot, and the
- * first round reads it.
+ * read. RAM only: empty after a reboot, and the first round reads it.
  *
- * s_kf_stale: a k-factor write was put on the bus and its read-back has not
- * confirmed the new value (no reply, or the read-back failed). The pump may
- * hold the new value while the cache holds the old one, so every round reads
- * the k-factor, due or not, until a read succeeds.
+ * s_kf_stale: a command from the cloud's rsp/kfactor tunnel reached a BlueSky
+ * pump (du_kfactor_mark_stale). The gateway does not read those frames, so any
+ * of them may have been a k-factor write, and the pump may now hold a value
+ * the cache does not — so every round reads the k-factor, due or not, until a
+ * read succeeds. That way a recalibration shows in the next nozzle message
+ * instead of up to KFACTOR_POLL_INTERVAL_S later.
  *
- * Both callers — du_task's poll round and the main task's passthrough — run
- * under the RS485 bus lock, which serialises every access to these arrays. */
+ * Both callers — du_task's poll round and the main task's tunnel — run under
+ * the RS485 bus lock, which serialises every access to these arrays. */
 #define KF_SLOTS (DU_MAX_DISPENSERS * 2 + 1)
 static uint8_t s_kf_cache[KF_SLOTS][DU_RESP_MAX];
 static int     s_kf_cache_len[KF_SLOTS];
@@ -257,6 +236,15 @@ static void kf_cache_put(uint8_t addr, const uint8_t *kf, int len) {
     memcpy(s_kf_cache[addr], kf, (size_t)len);
     s_kf_cache_len[addr] = len;
     s_kf_stale[addr]     = false;
+}
+
+void du_kfactor_mark_stale(void) {
+    /* Only the nozzles that have answered a k-factor read before: they will
+     * answer the re-read too, at one frame's cost. One that never answered
+     * keeps waiting for its scheduled read rather than spending its full retry
+     * budget on every round. */
+    for (int a = 1; a < KF_SLOTS; a++)
+        if (s_kf_cache_len[a] > 0) s_kf_stale[a] = true;
 }
 
 /* ── BlueSky polling ──────────────────────────────────────────────────── */
@@ -337,8 +325,8 @@ void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz, bool read_kfactor) {
      * value (see s_kf_cache) is copied into nz->kfact, so every published
      * message carries a stable k-factor without spending bus time re-reading a
      * value that changes only on recalibration. Zero-length until the first
-     * good read, which the payload builder renders as "404". A k-factor write
-     * whose effect is unconfirmed (s_kf_stale) makes the read due every round
+     * good read, which the payload builder renders as "404". A tunnel command
+     * since the last good read (s_kf_stale) makes the read due every round
      * until one succeeds. */
     bool addr_cacheable = kf_addr_ok(addr);
     bool stale          = addr_cacheable && s_kf_stale[addr];
@@ -353,7 +341,7 @@ void du_poll_bluesky_nozzle(uint8_t addr, DuNozzle_t *nz, bool read_kfactor) {
             memcpy(nz->kfact, s_kf_cache[addr], (size_t)s_kf_cache_len[addr]);
             nz->kfact_len = s_kf_cache_len[addr];
             ESP_LOGW(TAG, "BlueSky nz%u kfact: read failed — carrying last good value forward%s",
-                     addr, stale ? " (a k-factor write is unconfirmed; re-reading next round)" : "");
+                     addr, stale ? " (a tunnel command may have changed it; re-reading next round)" : "");
         }
     } else if (addr_cacheable && s_kf_cache_len[addr] > 0) {
         memcpy(nz->kfact, s_kf_cache[addr], (size_t)s_kf_cache_len[addr]);
@@ -457,134 +445,4 @@ void du_build_nozzle_payload(const DuNozzle_t *nz, int label,
                  "{\"HW_ID\":\"%s\",\"nozzles\":{\"%d\":{\"data\":\"404\"}},\"TS\":\"%s\"}",
                  hw_id, label, ts);
     }
-}
-
-/* ── Remote command execution ─────────────────────────────────────────── */
-/* Parse comma-sep hex string into byte array; returns length */
-static bool is_hex_ch(char c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-           (c >= 'A' && c <= 'F');
-}
-
-static int hex_str_to_bytes(const char *s, uint8_t *out, size_t out_max) {
-    int n = 0;
-    while (*s && n < (int)out_max) {
-        /* Skip any separator/junk (spaces, commas, trailing CR/LF from the
-         * MQTT publisher) — previously a trailing newline was fed to strtol
-         * and became a bogus 0x00 byte appended to the RS485 frame. */
-        while (*s && !is_hex_ch(*s)) s++;
-        if (!*s) break;
-        if (!is_hex_ch(s[1])) break;   /* need a full 2-char byte */
-        char tmp[3] = {s[0], s[1], '\0'};
-        out[n++] = (uint8_t)strtol(tmp, NULL, 16);
-        s += 2;
-    }
-    return n;
-}
-
-/* Is the target nozzle present and idle right now? One status exchange with
- * the poll path's retry budget; the verdict is the same one
- * du_poll_bluesky_nozzle() uses (0x80 idle, 0x00 the known-defect idle). */
-static bool bluesky_nozzle_idle(uint8_t addr, bool *present) {
-    uint8_t cmd[5], st[DU_RESP_MAX];
-    bluesky_frame(addr, BS_CMD_STATUS, cmd);
-    *present = false;
-    for (int attempt = 1; attempt <= DU_STATUS_RETRIES; attempt++) {
-        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(DU_STATUS_RETRY_MS));
-        int len = rs485_xfer(cmd, 5, st, DU_RESP_MAX);
-        esp_task_wdt_reset();
-        log_raw_frame(addr, "status(gate)", st, len);
-        if (len <= 0 || !bluesky_read_valid(st, len, addr, BS_CMD_STATUS, "status(gate)")) continue;
-        *present = true;
-        return (st[3] == 0x80 || st[3] == 0x00);
-    }
-    return false;
-}
-
-static void set_reason(char *reason, size_t size, const char *tok) {
-    if (reason && size) snprintf(reason, size, "%s", tok);
-}
-
-bool du_exec_bluesky_passthrough(const char *cmd_hex, uint8_t addr_a, uint8_t addr_b,
-                                 uint8_t readback_cmd,
-                                 char *resp_buf, size_t resp_size,
-                                 char *readback_buf, size_t readback_size,
-                                 char *reason, size_t reason_size) {
-    if (resp_buf && resp_size)         resp_buf[0]     = '\0';
-    if (readback_buf && readback_size) readback_buf[0] = '\0';
-
-    uint8_t cmd[32];
-    int cmd_len = hex_str_to_bytes(cmd_hex, cmd, sizeof(cmd));
-    if (cmd_len == 0) { set_reason(reason, reason_size, "bad_hex"); return false; }
-
-    /* 1. A BlueSky frame, whole. The length nibble is the same rule rs485_xfer
-     *    uses to end a reply, so a frame that violates it here would not be
-     *    parsed by the pump either — refusing it costs nothing and catches a
-     *    truncated or mis-pasted command before the bus sees it. */
-    if (cmd_len < 5 || cmd[0] != 0xF5 || (cmd[2] & 0xF0) != 0xA0 ||
-        (cmd[2] & 0x0F) + 3 != cmd_len) {
-        ESP_LOGW(TAG, "passthrough: not a BlueSky frame (%d bytes, %02x %02x %02x) — refused",
-                 cmd_len, cmd[0], cmd_len > 1 ? cmd[1] : 0, cmd_len > 2 ? cmd[2] : 0);
-        set_reason(reason, reason_size, "bad_frame");
-        return false;
-    }
-    /* 2. Addressed to one of THIS dispenser's nozzles. */
-    uint8_t addr = cmd[1];
-    if (addr != addr_a && addr != addr_b) {
-        ESP_LOGW(TAG, "passthrough: frame targets nozzle %u but this topic is dispenser "
-                      "nozzles %u/%u — refused", addr, addr_a, addr_b);
-        set_reason(reason, reason_size, "addr_not_this_dispenser");
-        return false;
-    }
-    /* 3. Idle gate. */
-    bool present = false;
-    if (!bluesky_nozzle_idle(addr, &present)) {
-        ESP_LOGW(TAG, "passthrough: nozzle %u %s — refused", addr,
-                 present ? "is delivering" : "did not answer its status poll");
-        set_reason(reason, reason_size, present ? "nozzle_busy" : "nozzle_absent");
-        return false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(30));
-
-    /* A k-factor WRITE is about to reach the pump. From here until a read-back
-     * confirms the new value, the cached one may be out of date — including when
-     * the pump never answers, since it may have applied the write regardless. */
-    bool kf_write = (cmd_len > 5 && readback_cmd == BS_CMD_KFACT);
-    if (kf_write && kf_addr_ok(addr)) s_kf_stale[addr] = true;
-
-    /* Send, with one retry on silence or a reply that is not this nozzle's. */
-    uint8_t resp[DU_RESP_MAX];
-    int rlen = 0;
-    for (int attempt = 1; attempt <= 2; attempt++) {
-        if (attempt > 1) vTaskDelay(pdMS_TO_TICKS(DU_STATUS_RETRY_MS));
-        rlen = rs485_xfer(cmd, (size_t)cmd_len, resp, DU_RESP_MAX);
-        esp_task_wdt_reset();
-        log_raw_frame(addr, "passthrough", resp, rlen);
-        if (rlen > 0 && bluesky_resp_valid(resp, rlen, addr, "passthrough")) break;
-        rlen = 0;
-    }
-    if (rlen == 0) { set_reason(reason, reason_size, "no_reply"); return false; }
-    du_bytes_to_hex(resp, rlen, resp_buf, resp_size);
-
-    /* A frame longer than the 5-byte read shape carried data — it wrote
-     * something. Read the value back so the operator sees what the pump now
-     * holds, not merely that it acknowledged. Best effort: a failed read-back
-     * leaves readback_buf empty and does not fail the command, which DID go
-     * out and DID get a reply. */
-    if (cmd_len > 5 && readback_cmd && readback_buf && readback_size) {
-        vTaskDelay(pdMS_TO_TICKS(30));
-        uint8_t rb[DU_RESP_MAX];
-        int rb_len = du_read_field(addr, readback_cmd, rb, 2, "read-back");
-        if (rb_len > 0) du_bytes_to_hex(rb, rb_len, readback_buf, readback_size);
-        else ESP_LOGW(TAG, "passthrough: nozzle %u read-back failed — the write's effect is unverified", addr);
-        /* The read-back is the same 0xE2 read the poll round makes, so it goes
-         * straight into the cache: the next nozzle message carries the new
-         * k-factor. A failed read-back leaves the entry stale (set above), and
-         * the next round re-reads it. */
-        if (kf_write && rb_len > 0) {
-            kf_cache_put(addr, rb, rb_len);
-            ESP_LOGI(TAG, "BlueSky nz%u kfact: cache updated from the write's read-back", addr);
-        }
-    }
-    return true;
 }

@@ -141,6 +141,24 @@ CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 # match. Same trap as the WDT timeout documented in app_main().
 CONFIG_HEAP_POISONING_LIGHT=y
 
+# ── FreeRTOS run-time stats — for the CPU load in the diagnostics report ───
+# cpu_load.h derives each core's load from how long its idle task ran. The
+# 64-bit esp_timer counter never wraps (the 32-bit default wraps every ~71 min,
+# and a 15-min report window straddling the wrap would read as nonsense). Cost:
+# one 64-bit timestamp per context switch. Selects TRACE_FACILITY (for
+# uxTaskGetSystemState) and the stats-formatting functions — same five lines as
+# btpl-gg and hsd-snf. App-level only: nothing here touches the bootloader, the
+# partition table or any other part of the FOTA swap contract.
+#
+# Same trap as above: sdkconfig.defaults applies only when sdkconfig is first
+# GENERATED, so a local sdkconfig made before these lines must be regenerated
+# (delete it; the next idf.py build recreates it from this file).
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64=y
+CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
+
 # ── UART ISR in IRAM ──────────────────────────────────────────────────────
 # REQUIRED. A flash write disables the instruction cache on BOTH cores, and
 # an ISR that lives in flash cannot run until it is re-enabled. du_task (core

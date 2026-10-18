@@ -33,8 +33,9 @@
  * APPENDING a field needs no bump — nvs_config_load() already handles a short
  * blob by leaving new fields at their defaults. */
 #define PRODUCT_ID          "alds-gg-vvm701/1"
-/* MQTT base topic for the GG fleet: <base>/data, <base>/<imei>/setconfig,
- * <base>/<imei>/update, <base>/fleet/gg/update, ... Part of the credential set
+/* MQTT base topic for the GG fleet: <base>/data (polled readings), <base>/logs
+ * (everything else), <base>/<imei>/setconfig, <base>/<imei>/update,
+ * <base>/fleet/gg/update, ... Part of the credential set
  * below, so changing it re-points every unit that runs this build.
  *
  * GG and GGY will share ONE production broker and base topic (~300 GG stations,
@@ -42,7 +43,7 @@
  * nothing else: the fleet FOTA topic carries the product name (fleet/gg vs
  * fleet/ggy), the FOTA JSON "target" belt (gg vs ggy), and the distinct
  * PRODUCT_ID above (a GG<->GGY swap by FOTA wipes equipment config and comes up
- * unconfigured, which is correct — the two address dispensers differently). */
+ * unconfigured, which is correct — the two store different config layouts). */
 #define MQTT_TOPIC_BASE     "gogas"
 /* Start-to-start pacing of one dispenser poll round on du_task. Yenen nozzles
  * are read every round (10 s); BlueSky nozzles every SECOND round (20 s), see
@@ -193,6 +194,10 @@
 
 /* ── Diagnostics ────────────────────────────────────────────────────────── */
 #define DIAG_CYCLE_INTERVAL  90       /* publish the combined diagnostics report every N poll cycles (~15 min at 10 s/cycle) */
+/* Per-core CPU load in that report: the average over the report's window plus
+ * the busiest one-minute sample in it — one sample every N cycles (~1 min at
+ * 10 s/cycle). See cpu_load.h. */
+#define CPU_LOAD_SAMPLE_CYCLES  6
 #define DIAG_BOOT_GRACE_MS   60000    /* ignore loop_max during boot warmup  */
 
 /* ── Secondary-equipment cadence (wall-clock, not cycle counts) ─────────────
@@ -397,26 +402,26 @@
 #define MQTT_BEARER_DISTRUST_AFTER 8
 
 /* ── Dispenser units ──────────────────────────────────────────────────────
- * ONE station list of up to 6 dispensers (duCount + du<N>Make + du<N>Sfx),
- * any mix of BlueSky and Yenen.
+ * SIX dispenser slots (du1..du6: du<N>Make + du<N>Sfx), any mix of BlueSky and
+ * Yenen — the same slot rule as the btpl meters (2026-10-16).
  *
- * THE SUFFIX IS THE DISPENSER NUMBER, AND THE DISPENSER NUMBER IS THE BUS
- * ADDRESS. A suffix is two DIGITS, 01..06 (Yenen 01..05 — see DU_YENEN_MAX).
- * du1Sfx:"03" means "the list's first entry is dispenser 3": a BlueSky is then
- * polled on nozzle addresses 5 and 6 (2n-1, 2n) and publishes nozzle labels
- * "5" and "6"; a Yenen is head 3 (nozzle codes '2' / '7'). The position in the
- * list decides NOTHING about the wire — it only orders the poll round. An
- * omitted suffix defaults to the position (entry N = dispenser N), so a site
- * whose dispensers are numbered 1..N in order needs no suffix at all, and a
- * site with gaps (dispensers 1, 3 and 5) is configured by naming them rather
- * than by re-addressing pumps. Two entries naming the same dispenser are
- * refused (validate_suffixes). The two protocols never collide on the wire
- * because they use different line settings and framing.
+ * A SLOT IS ON EXACTLY WHEN ITS SUFFIX IS SET, AND THE SUFFIX IS THE DISPENSER
+ * NUMBER, WHICH IS THE BUS ADDRESS. A suffix is two DIGITS, 01..06 (Yenen
+ * 01..05 — see DU_YENEN_MAX). du2Sfx:"02" polls dispenser 2: a BlueSky on
+ * nozzle addresses 3 and 4 (2n-1, 2n), publishing nozzle labels "3" and "4"
+ * under HW_ID <imei>02; a Yenen as head 2. du<N>Sfx "" turns slot N OFF —
+ * there is NO position fallback any more. A station whose dispenser 1 is out
+ * of service sends du1Sfx "" and keeps du2Sfx "02" / du3Sfx "03": only those
+ * two are polled, and they still publish as 02 and 03. Nothing is ever
+ * re-addressed at the pump. duCount is a cross-check (it must equal the slots
+ * ON), not a switch. Two slots naming the same dispenser are refused
+ * (validate_suffixes). The two protocols never collide on the wire because
+ * they use different line settings and framing.
  *
- * du_number(i) in main.c / du_task.c is the ONE place the suffix is turned into
- * a number; every address, label and HW_ID derives from it, so the cloud's
- * HW_ID and the bus address cannot disagree.
- * Every runtime loop iterates g_cfg.du_count, never this cap. */
+ * du_number_of() (nvs_config.c) is the ONE place a suffix is turned into a
+ * number; every address, label and HW_ID derives from it, so the cloud's
+ * HW_ID and the bus address cannot disagree. Every runtime loop walks the
+ * DU_MAX_DISPENSERS slots and skips the OFF ones (du_slot_on). */
 #define DU_MAX_DISPENSERS  6
 
 /* ── Dispenser nozzle status gate ─────────────────────────────────────────
@@ -490,65 +495,6 @@
 #define YN_TOTAL_RETRIES  3
 #define YN_RETRY_MS       300
 
-/* ── Yenen RSP (unit price) update ────────────────────────────────────────
- * The one command this firmware WRITES to a pump. Everything else on this bus
- * is read-only, so the budgets below are chosen to keep a price change from
- * costing the dispenser cadence — see yenen.h for the frame and the sequence.
- *
- * One update on one nozzle is three transactions: read (idle + current price),
- * write, read back to verify. The stages do NOT stack their worst cases — each
- * aborts on failure, so a pump that is silent fails the first read and never
- * reaches the write. Measured on a host harness driving the real driver
- * against a simulated pump (2026-09-02), bus hold per nozzle:
- *
- *   healthy, confirmed                    ~0 s   (early exit on ETX)
- *   nozzle dispensing (refused)           ~0 s
- *   nozzle silent / no ACK               4.3 s
- *   flaky line, every stage retries once  6.9 s  <- true worst case
- *
- * 6.9 s sits well inside du_task's RS485_BUS_LOCK_TIMEOUT_MS (25 s), so a price
- * push can never make the acquisition task DROP a round — the case the whole
- * two-budget split in the RS485 section exists to prevent. Radar and genset
- * cannot be blocked by this at all: they run on the SAME task as the update, so
- * they are sequenced with it rather than contending for the lock. The bus is
- * taken and released per nozzle, not per command, so the two sides of a
- * dispenser never hold it back to back.
- *
- * RETRIES is 2, not the 3 the poll path uses: a write is issued while someone
- * is standing at the pump waiting for the new price, and a third attempt buys
- * little against 2.3 s more of dead air on a bus the pumps are sharing.
- *
- * BUSY_WINDOW_S / RETRY_PACE_MS cover the ONE transient worth waiting out: a
- * nozzle that is mid-delivery, or a bus held by a poll round. Both mean the
- * hardware is healthy and the update will simply succeed a moment later, so
- * failing the command back to the cloud would just make the operator push it
- * again. Deliberately NOT applied to a silent nozzle or a NAK: those re-probe
- * at full retry cost every pace tick, which would spend the bus on a nozzle
- * that is not going to answer.
- *
- * 300 s, raised from 120 (2026-09-03). The window exists to avoid the ONE
- * outcome in this feature that is commercially harmful: a PARTIAL update, where
- * one side of a dispenser takes the new price and the other times out still
- * holding the old one. The dispenser then sells at two different prices, which
- * is a billing and Weights-&-Measures problem, not a cosmetic one.
- *
- * 120 s did not comfortably outlast an LPG fill — a bulk fill runs well past
- * two minutes, so nozzle_busy on a genuinely healthy pump was a routine
- * outcome rather than an edge case. 300 s rides out essentially all of them.
- *
- * The cost is bounded and understood: the unit's update slot stays held for the
- * whole window, so a second push to the SAME dispenser is refused with
- * reason "busy" for up to five minutes (other dispensers are unaffected — the
- * slot is per unit). That is the right trade: a refused duplicate push is
- * recoverable by retrying, a split-price dispenser is not.
- *
- * This does NOT remove the partial case, it only makes it rarer. The cloud
- * still owns the real fix — verify each nozzle's live price from its telemetry
- * (data[6:10], Appendix B) and re-push only the nozzle that disagrees. */
-#define YN_RSP_RETRIES        2
-#define YN_RSP_BUSY_WINDOW_S  300
-#define YN_RSP_RETRY_PACE_MS  5000
-
 /* ── Radar ─────────────────────────────────────────────────────────────────
  * Ztech and Pantech are standard Modbus RTU on the shared RS485 bus.
  * THE SLAVE ADDRESS IS THE HW_ID SUFFIX: a tank whose sfx is "04" is polled at
@@ -600,9 +546,12 @@
  * the DG integration spec each poll issues up to THREE reads, and each is
  * published as its OWN message: a measurement block under "registers", the
  * alarm registers under "Alarms" (Mahindra only; the spec's capital A) and a
- * DG status block under "status". Each carries the read's DATA bytes as a
- * comma-separated hex string (Modbus header and CRC stripped) — the same shape
- * radar uses. The firmware never interprets a genset register; the cloud owns
+ * DG status block under "status". Each carries the read's complete validated
+ * reply frame as a comma-separated hex string (slave, FC, byte count, data and
+ * CRC, nothing removed) — the same shape radar and the dispensers use. The
+ * suffix (sfxGenset) is the slave ID the request is addressed to: "08" sends
+ * 08 03/04 ... and only a controller set to slave 8 answers. The firmware
+ * never interprets a genset register; the cloud owns
  * every register map and all scaling. Reads per model (all CRC-verified against
  * the spec's documented captures):
  *   GC1211        → Mahindra, FC04: registers 1..36 (72 B), Alarms 57..59
@@ -790,7 +739,7 @@
  *          inbound panel-unlock, and keeps a 4-tank radar round (4 x this,
  *          worst case) comfortably inside WDT_TIMEOUT_MS. */
 #define RS485_BUS_LOCK_TIMEOUT_MS  25000   /* du_task — acquisition, must not skip */
-#define RS485_BUS_WAIT_MAIN_MS      9000   /* radar / genset / passthrough         */
+#define RS485_BUS_WAIT_MAIN_MS      9000   /* radar / genset / rsp tunnel          */
 
 /* ── Thermal zones (°C) — tuned for 24/7 enclosed operation, no heatsink ─── */
 #define THERMAL_NORMAL_MAX_C    65.0f

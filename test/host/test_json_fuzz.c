@@ -32,8 +32,6 @@ static uint32_t rnd(void) {
 static void run_all(const char *json) {
     char     sbuf[8];        /* deliberately tiny: forces the truncation path */
     char     sbig[128];
-    uint16_t price = 0;
-    int      i;
     bool     b;
 
     static const char *keys[] = {
@@ -42,15 +40,12 @@ static void run_all(const char *json) {
         "aVeryLongKeyNameThatExceedsTheInternalSearchBufferUsedByTheseHelpers",
     };
     for (unsigned k = 0; k < sizeof(keys)/sizeof(keys[0]); k++) {
-        i = json_get_int(json, keys[k], -1);            (void)i;
         b = json_get_bool(json, keys[k], false);        (void)b;
         b = json_has_key(json, keys[k]);                (void)b;
         if (json_get_str(json, keys[k], sbuf, sizeof(sbuf)))
             CHECK(strlen(sbuf) < sizeof(sbuf), "json_get_str overran the small buffer");
         if (json_get_str(json, keys[k], sbig, sizeof(sbig)))
             CHECK(strlen(sbig) < sizeof(sbig), "json_get_str overran the large buffer");
-        if (json_get_price_x100(json, keys[k], &price))
-            CHECK(price >= 1 && price <= 9999, "price %u escaped its range", price);
     }
     b = setcfg_has_secret(json);            (void)b;
     b = payload_is_one_json_object(json);   (void)b;

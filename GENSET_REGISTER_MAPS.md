@@ -4,7 +4,12 @@ Companion to `CLOUD_INTEGRATION_GUIDE.md` section 6.4, which defines the
 `genset` messages themselves. This file only covers how to decode the bytes
 inside them. You need it only on sites where `gensetType` is 1.
 
-`register[k] = data[2k]<<8 | data[2k+1]`, 0-based within the message. The
+Each message is the complete Modbus reply as the controller sent it:
+`frame[0]` slave (the genset suffix), `frame[1]` function code, `frame[2]` byte
+count, then the register data, then the CRC (low byte, high byte). The gateway
+has checked CRC, slave, function code and length before publishing.
+
+`register[k] = frame[3+2k]<<8 | frame[3+2k+1]`, 0-based within the message. The
 `registers` read starts at Modbus offset 1, so `register[k]` is protocol offset
 `k+1` (in `Alarms` it is `k+57`, in `status` `k+67`). For signed fields,
 subtract 65536 if the value is above 32767. For 32-bit fields,
@@ -49,7 +54,7 @@ register 22 reads 7.3 kVA. At 0.1 A (30.5 A) every power register agrees
 Confirm on a Mahindra under load; its capture had no load.
 
 `Alarms`, Mahindra only: 3 registers, offsets 57-59. A healthy, running GC1211
-sent `11,10,11,11,11,11`. The bit layout is in the Sedemac protocol document,
+sent `0a,04,06,11,10,11,11,11,11,48,44` (data `11,10,11,11,11,11`). The bit layout is in the Sedemac protocol document,
 not in this repo. Decode from that document rather than guessing from the
 capture.
 
@@ -58,12 +63,14 @@ capture.
 only `[0]`. DG status bits: 15 available/loadOnDG, 14 running, 13
 stoppedNormally, 12 stoppedWithFault, 11 mode (1 = Auto). Command status,
 Mahindra only: 1 Started, 2 Stopped, 3 AlreadyON, 4 AlreadyOFF, 5 Manual,
-6 NotStarted, anything else Unknown. Captured: Mahindra `c0,00,00,00` (0xC000,
-available and running) and Ashok Leyland `40,00` (0x4000, running).
+6 NotStarted, anything else Unknown. Captured: Mahindra `0a,04,04,c0,00,00,00,7d,44`
+(0xC000, available and running) and Ashok Leyland `0a,04,02,40,00,2d,31` (0x4000,
+running).
 
-Worked example: `registers` of `01,3f,00,3e,00,22,...` gives oil 0x013F = 319 =
-3.19 Bar, temp 0x003E = 62 C, fuel 0x0022 = 34 %. A `status` of `c0,00,00,00` is
-0xC000, bits 15 and 14 set, so available and running.
+Worked example: `registers` of `0a,04,48,01,3f,00,3e,00,22,...` is slave 10, FC
+04, 72 data bytes, then oil 0x013F = 319 = 3.19 Bar, temp 0x003E = 62 C, fuel
+0x0022 = 34 %. A `status` of `0a,04,04,c0,00,00,00,7d,44` is 0xC000, bits 15 and
+14 set, so available and running.
 
 GC902 is not in the spec. It is read like the Ashok Leyland, but an older
 driver gave it its own map, with the status word at offset 68. Treat any GC902

@@ -19,6 +19,7 @@ sdkconfig.esp32-s3-devkitc-1*
 .clangd
 .cache/
 .claude/
+__pycache__/
 
 # ── Merged flash image (handover artifact, not source) ────────────────────────
 # Produced by `esptool merge_bin` from build/ output. Regenerate per release

@@ -51,22 +51,28 @@ static void assert_invariants(const DeviceConfig *c, const char *ctx) {
     CHECK(c->du_count <= DU_MAX_DISPENSERS, "%s: du_count=%u indexes past g_hw_du", ctx, c->du_count);
     for (int i = 0; i < DU_MAX_DISPENSERS; i++)
         CHECK(c->du_make[i] <= DU_MAKE_MAX, "%s: du_make[%d]=%u outside the enum", ctx, i, c->du_make[i]);
-    /* THE dispenser-plan contract du_task relies on: every entry inside
-     * du_count names a dispenser the bus can address (BlueSky 1..6, Yenen
-     * 1..5) and no two entries name the same one. A violation here is a
-     * nozzle polled at address 0/13+, or one pump published under two HW_IDs. */
+    /* THE dispenser-plan contract du_task relies on: every ON slot (suffix
+     * set) names a dispenser the bus can address (BlueSky 1..6, Yenen 1..5),
+     * no two slots name the same one, and du_count is exactly the slots ON. A
+     * violation here is a nozzle polled at address 0/13+, one pump published
+     * under two HW_IDs, or "configured" disagreeing with what is polled. */
     {
         bool used[DU_MAX_DISPENSERS + 1] = {0};
-        for (int i = 0; i < c->du_count; i++) {
+        int  on = 0;
+        for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
+            if (!du_slot_on(c, i)) continue;
+            on++;
             int n = du_number_of(c, i);
             int max_n = (c->du_make[i] == DU_MAKE_YENEN) ? DU_YENEN_MAX : DU_MAX_DISPENSERS;
-            CHECK(n >= 1 && n <= max_n, "%s: DU entry %d -> dispenser %d (sfx '%s', make %u) unaddressable",
+            CHECK(n >= 1 && n <= max_n, "%s: DU slot %d -> dispenser %d (sfx '%s', make %u) unaddressable",
                   ctx, i + 1, n, c->du_sfx[i], c->du_make[i]);
             if (n >= 1 && n <= DU_MAX_DISPENSERS) {
-                CHECK(!used[n], "%s: DU entry %d names dispenser %d twice", ctx, i + 1, n);
+                CHECK(!used[n], "%s: DU slot %d names dispenser %d twice", ctx, i + 1, n);
                 used[n] = true;
             }
         }
+        CHECK(c->du_count == on, "%s: du_count %u but %d slots ON", ctx, c->du_count, on);
+        CHECK(c->du_plan == DU_PLAN_SLOTS, "%s: du_plan %u after load (must be slots)", ctx, c->du_plan);
     }
     CHECK(c->ztech_count      <= RADAR_MAX,      "%s: ztech=%u", ctx, c->ztech_count);
     CHECK(c->pantech_count    <= RADAR_MAX,      "%s: pantech=%u", ctx, c->pantech_count);

@@ -1,4 +1,5 @@
 #include "diagnostics.h"
+#include "cpu_load.h"
 #include "di.h"
 #include "du_task.h"
 #include "store.h"
@@ -32,6 +33,39 @@ static esp_pm_lock_handle_t        s_pm_lock      = NULL;
 static int                         s_reset_reason = 0;
 static uint32_t                    s_boot_count   = 0;
 
+/* ── CPU load per core (cpu_load.h) ────────────────────────────────────────
+ * The window opens at boot and again at every PUBLISHED report; a one-minute
+ * sample (diag_cpu_sample, every CPU_LOAD_SAMPLE_CYCLES main cycles) keeps the
+ * busiest minute. Main task only — the task table below is static. */
+static CpuWindow_t s_cpu;
+
+/* The task table as a snapshot. False when run-time stats are off in sdkconfig
+ * (the report then simply has no "cpu" key) or the table outgrew the buffer. */
+static bool cpu_snapshot(CpuSnap_t *s) {
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+    /* One entry per task: about a dozen exist (main, du_task, di_task, relay,
+     * esp_timer, ipc0/1, IDLE0/1, ...), 24 leaves room for anything a future
+     * IDF adds. Static: ~1.5 KB that must not live on the stack. */
+    static TaskStatus_t tasks[24];
+    configRUN_TIME_COUNTER_TYPE total = 0;
+    UBaseType_t n = uxTaskGetSystemState(tasks, sizeof(tasks) / sizeof(tasks[0]), &total);
+    if (n == 0) return false;
+    memset(s, 0, sizeof(*s));
+    s->total_us = (uint64_t)total;
+    for (UBaseType_t i = 0; i < n; i++)
+        cpu_snap_add_task(s, tasks[i].pcTaskName, (uint64_t)tasks[i].ulRunTimeCounter);
+    return true;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+void diag_cpu_sample(void) {
+    CpuSnap_t now = {0};
+    if (cpu_snapshot(&now)) cpu_window_sample(&s_cpu, &now);
+}
+
 /* ── Init (diag_init + sysmon_init merged) ──────────────────────────────── */
 void diag_init(void) {
     memset(&g_diag, 0, sizeof(g_diag));
@@ -42,6 +76,10 @@ void diag_init(void) {
      * after nvs_flash_init(). Lets the fleet spot a reboot loop that telemetry
      * gaps alone wouldn't reveal. */
     s_boot_count = nvs_boot_count_bump();
+
+    CpuSnap_t cpu_now = {0};
+    if (cpu_snapshot(&cpu_now)) cpu_window_begin(&s_cpu, &cpu_now);
+    else ESP_LOGW(TAG, "CPU load not measured — FreeRTOS run-time stats are off in sdkconfig");
 
     temperature_sensor_config_t tcfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
     if (temperature_sensor_install(&tcfg, &s_temp_hdl) == ESP_OK)
@@ -209,6 +247,22 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
                           ? (uint32_t)(g_diag.loop_sum_ms / g_diag.loop_count)
                           : 0;
 
+    /* CPU load per core over this report's window (cpu_load.h), in "sys". No
+     * "cpu" key at all when it cannot be measured — never a made-up number. */
+    CpuSnap_t   cpu_now = {0};
+    CpuReport_t cpu     = {0};
+    char        cpu_json[112] = "";
+    bool        cpu_have = cpu_snapshot(&cpu_now) && cpu_window_report(&s_cpu, &cpu_now, &cpu);
+    if (cpu_have) {
+        snprintf(cpu_json, sizeof(cpu_json),
+                 ",\"cpu\":{\"window_s\":%lu,\"core0_avg\":%d,\"core1_avg\":%d,"
+                 "\"core0_peak\":%d,\"core1_peak\":%d}",
+                 (unsigned long)cpu.window_s, cpu.avg[0], cpu.avg[1], cpu.peak[0], cpu.peak[1]);
+        ESP_LOGI(TAG, "CPU load over the last %lu s: core0 %d%% (busiest minute %d%%), "
+                      "core1 %d%% (busiest minute %d%%)",
+                 (unsigned long)cpu.window_s, cpu.avg[0], cpu.peak[0], cpu.avg[1], cpu.peak[1]);
+    }
+
     /* ── Health verdict ───────────────────────────────────────────────────
      *   fault    — data is being lost now, or the last stop was a real hang.
      *   degraded — something is wrong that has not cost data yet.
@@ -254,21 +308,17 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
     char stop[224];
     int  stop_len = forensics_stop_json(stop, sizeof(stop));
 
-    /* Under the "diagnostics" key — the cloud identifies a message kind by which
-     * top-level key is present (nozzles/tanks/genset/di/diagnostics). */
-    /* 640 -> 768 for the six acquisition/queue fields, -> 832 for store_ok and
-     * rtc_synced. Still far under the modem's ~1400-byte ceiling
-     * (MQTT_MODEM_PAYLOAD_SAFE_MAX), and the truncation guard below catches it
-     * if that ever stops being true. */
+    /* Under the "diagnostics" key, on <base>/logs — the cloud identifies a
+     * message kind by which top-level key is present. */
     /* Measured, not guessed: 774 bytes for a healthy report, 790 with one
      * issue flagged, and 1180 for an absolute worst case (every `why` token
      * set, a last_stop object present, all 22 nozzles listed absent, and a
-     * 23-character operator name). 1360 leaves ~180 bytes over that worst case
-     * while staying under MQTT_MODEM_PAYLOAD_SAFE_MAX (1400), past which the
-     * modem itself rejects the publish. The guard below still catches any
-     * overrun and degrades to a valid minimal report rather than emitting
-     * broken JSON. */
-    char buf[1360];
+     * 23-character operator name). The "cpu" object (2026-10-16) adds at most
+     * 96, so ~1276. Sized to the modem's own ceiling, MQTT_MODEM_PAYLOAD_SAFE_MAX
+     * (1400), past which the modem itself rejects the publish; the guard below
+     * still catches any overrun and degrades to a valid minimal report rather
+     * than emitting broken JSON. */
+    char buf[MQTT_MODEM_PAYLOAD_SAFE_MAX];
     int written = snprintf(buf, sizeof(buf),
         "{\"HW_ID\":\"%s\",\"diagnostics\":{"
         "\"health\":\"%s\",\"why\":[%s],"
@@ -284,7 +334,7 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
         "\"bus\":{\"nozzles_absent\":%s,\"lock_timeouts\":%lu,"
                  "\"cycle_max_ms\":%lu,\"cycle_avg_ms\":%lu,\"cycles\":%lu},"
         "\"sys\":{\"heap_free\":%lu,\"heap_min_ever\":%lu,\"stack_min\":%lu,"
-                 "\"temp_c\":%.1f,\"vbat_mv\":%d},"
+                 "\"temp_c\":%.1f,\"vbat_mv\":%d%s},"
         "\"subsystems\":{\"du\":%s,\"radar\":%s,\"genset\":%s,\"di\":%s,\"gps\":%s}"
         "},\"TS\":\"%s\"}",
         hw_id,
@@ -306,7 +356,7 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
         (unsigned long)g_diag.loop_count,
         (unsigned long)heap_free, (unsigned long)heap_min_ever,
         (unsigned long)stack_min,
-        temp_c, vbat_mv,
+        temp_c, vbat_mv, cpu_json,
         g_diag.du_ok     ? "true" : "false",
         g_diag.radar_ok  ? "true" : "false",
         g_diag.genset_ok ? "true" : "false",
@@ -342,6 +392,8 @@ void diag_publish(const char *hw_id, const char *ts, const char *topic) {
          * NOT cleared — they are cumulative since boot so the backend can diff
          * consecutive reports, which windowed values would make impossible. */
         forensics_stop_clear();
+        /* The next report's CPU window starts here, like the counters above. */
+        if (cpu_have) cpu_window_begin(&s_cpu, &cpu_now);
     } else {
         ESP_LOGW(TAG, "Diagnostics publish failed — counters retained for next attempt");
     }

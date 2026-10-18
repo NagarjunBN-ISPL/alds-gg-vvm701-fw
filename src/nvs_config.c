@@ -32,9 +32,81 @@ static void clamp_sfx(char *s) {
 
 int du_number_of(const DeviceConfig *c, int i) {
     if (!c || i < 0 || i >= DU_MAX_DISPENSERS) return 0;
-    if (!c->du_sfx[i][0]) return i + 1;
-    if (!sfx_is_number(c->du_sfx[i])) return 0;
+    if (!c->du_sfx[i][0] || !sfx_is_number(c->du_sfx[i])) return 0;   /* OFF, or not a number */
     return (c->du_sfx[i][0] - '0') * 10 + (c->du_sfx[i][1] - '0');
+}
+
+bool du_slot_on(const DeviceConfig *c, int i) {
+    return c && i >= 0 && i < DU_MAX_DISPENSERS && c->du_sfx[i][0] != '\0';
+}
+
+/* ── A plan stored before the slot rule ───────────────────────────────────
+ * Such a blob is a LIST: entries 0..du_count-1, an empty suffix meaning the
+ * entry's position (entry N = dispenser N), and anything past du_count is
+ * ignored even when a suffix is still stored there. Rewritten as slots that
+ * poll exactly the same dispensers: an empty suffix inside the list becomes
+ * its position, a suffix past the list is cleared (that slot was never
+ * polled). Runs after clamp_sfx(), as the old loader did, so a suffix it
+ * cleared still means "the position". Duplicates are left for du_slot_plan()
+ * — the old loader refused them too (it cut the plan there). */
+static void du_list_to_slots(DeviceConfig *cfg) {
+    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
+        if (i >= cfg->du_count) {
+            if (cfg->du_sfx[i][0])
+                ESP_LOGW(TAG, "old plan: DU%d suffix '%s' lay past duCount %u and was never "
+                              "polled — slot %d stays OFF", i + 1, cfg->du_sfx[i],
+                         (unsigned)cfg->du_count, i + 1);
+            cfg->du_sfx[i][0] = '\0';
+        } else if (!cfg->du_sfx[i][0]) {
+            /* The position as two digits, written directly (i + 1 is 1..6). */
+            cfg->du_sfx[i][0] = (char)('0' + (i + 1) / 10);
+            cfg->du_sfx[i][1] = (char)('0' + (i + 1) % 10);
+            cfg->du_sfx[i][2] = '\0';
+        }
+    }
+    if (cfg->du_count)
+        ESP_LOGW(TAG, "dispenser plan stored by an older build (a list of %u) — read as slots "
+                      "polling the same dispensers; saved in the new form on the next setconfig",
+                 (unsigned)cfg->du_count);
+}
+
+/* ── Dispenser slots, the way-out guard ───────────────────────────────────
+ * A slot is ON when its suffix is set (clamp_sfx() has already cleared any
+ * that is not two digits). Every ON slot must name a dispenser the bus can
+ * address (1..DU_MAX_DISPENSERS; Yenen 1..DU_YENEN_MAX — head 6 has no nozzle
+ * code) that no earlier slot names: two slots on one address would poll one
+ * pump twice and publish it under two HW_IDs. parse_setconfig() refuses such a
+ * plan on the way in; this catches a blob damaged in flash. A bad slot is
+ * turned OFF, loudly, never re-addressed — a guessed address is the "looks
+ * healthy, polls the wrong pump" failure this whole block exists to avoid.
+ *
+ * du_count is then re-derived as the slots left ON. The poll loops go by the
+ * suffixes; the count is what "is anything configured" reads, so it must
+ * never disagree with them. */
+static void du_slot_plan(DeviceConfig *cfg) {
+    bool used[DU_MAX_DISPENSERS + 1] = {0};
+    int  on = 0;
+    for (int i = 0; i < DU_MAX_DISPENSERS; i++) {
+        if (!cfg->du_sfx[i][0]) continue;                       /* slot OFF */
+        int n     = du_number_of(cfg, i);
+        int max_n = (cfg->du_make[i] == DU_MAKE_YENEN) ? DU_YENEN_MAX : DU_MAX_DISPENSERS;
+        const char *why = NULL;
+        if (n < 1 || n > DU_MAX_DISPENSERS) why = "not addressable";
+        else if (n > max_n)                why = "Yenen cannot address head 6";
+        else if (used[n])                  why = "already named by an earlier slot";
+        if (why) {
+            ESP_LOGE(TAG, "DU slot %d names dispenser %d [sfx '%s'] — %s; slot turned OFF",
+                     i + 1, n, cfg->du_sfx[i], why);
+            cfg->du_sfx[i][0] = '\0';
+            continue;
+        }
+        used[n] = true;
+        on++;
+    }
+    if (cfg->du_count != on)
+        ESP_LOGW(TAG, "dispenser plan: count %u stored, %d slot(s) with a suffix — polling %d "
+                      "(a slot without a suffix is OFF)", (unsigned)cfg->du_count, on, on);
+    cfg->du_count = (uint8_t)on;
 }
 
 void nvs_config_defaults(DeviceConfig *cfg) {
@@ -222,6 +294,7 @@ bool nvs_config_load(DeviceConfig *cfg) {
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
         ESP_LOGW(TAG, "No config in NVS, using defaults");
+        cfg->du_plan = DU_PLAN_SLOTS;   /* nothing to convert; a later save stores slots */
         return false;
     }
 
@@ -356,7 +429,7 @@ bool nvs_config_load(DeviceConfig *cfg) {
     if (cfg->du_count > DU_MAX_DISPENSERS) cfg->du_count = DU_MAX_DISPENSERS;
     /* A make outside the enum (bit-rot, or a value from a build that once
      * defined more makes) is not dangerous — du_task simply matches neither
-     * branch — but a position the operator counted in duCount and that then
+     * branch — but a slot the operator turned on and that then
      * silently polls nothing is exactly the "looks healthy" failure the whole
      * clamp block exists to avoid. Fall back to BlueSky, the make every
      * earlier build of this product family defaulted to, and say so. */
@@ -392,34 +465,15 @@ bool nvs_config_load(DeviceConfig *cfg) {
         clamp_sfx(cfg->sfx_pantech[i]);
     }
 
-    /* ── Dispenser plan, the way-out guard ─────────────────────────────────
-     * Every entry inside du_count must name a dispenser the bus can address
-     * (1..DU_MAX_DISPENSERS; Yenen 1..DU_YENEN_MAX — head 6 has no nozzle
-     * code) and no two entries may name the same one: two entries on one
-     * address would poll one pump twice and publish it under two HW_IDs.
-     * parse_setconfig() refuses such a plan on the way in; this catches a blob
-     * damaged in flash. The plan is CUT at the first bad entry rather than
-     * patched — a guessed address is the "looks healthy, polls the wrong pump"
-     * failure this whole block exists to avoid — and the cut is loud. */
-    {
-        bool used[DU_MAX_DISPENSERS + 1] = {0};
-        for (int i = 0; i < cfg->du_count; i++) {
-            int n = du_number_of(cfg, i);
-            int max_n = (cfg->du_make[i] == DU_MAKE_YENEN) ? DU_YENEN_MAX : DU_MAX_DISPENSERS;
-            const char *why = NULL;
-            if (n < 1 || n > DU_MAX_DISPENSERS) why = "not addressable";
-            else if (n > max_n)                why = "Yenen cannot address head 6";
-            else if (used[n])                  why = "already named by an earlier entry";
-            if (why) {
-                ESP_LOGE(TAG, "DU entry %d names dispenser %d [sfx '%s'] — %s; "
-                              "cutting the plan to %d dispenser(s)",
-                         i + 1, n, cfg->du_sfx[i], why, i);
-                cfg->du_count = (uint8_t)i;
-                break;
-            }
-            used[n] = true;
-        }
-    }
+    /* ── Dispenser slots ───────────────────────────────────────────────────
+     * A plan from a build before the slot rule is a list (du_plan reads back
+     * DU_PLAN_LIST = 0, its default, because the field lies past the old blob's
+     * end): convert it first, so a FOTA'd station keeps polling exactly the
+     * pumps it polled before. Only 0 means "list" — only an old blob can hold
+     * it — so any other value is taken as slots. Then the way-out guard. */
+    if (cfg->du_plan == DU_PLAN_LIST) du_list_to_slots(cfg);
+    cfg->du_plan = DU_PLAN_SLOTS;
+    du_slot_plan(cfg);
 
     /* A corrupt/truncated connectivity field would otherwise brick the
      * device with no way to recover remotely (no WiFi fallback, no physical
@@ -454,14 +508,22 @@ bool nvs_config_load(DeviceConfig *cfg) {
         cfg->conn_pending  = false;
     }
 
-    /* Persist the clamped result as a blob when this boot either migrated from
-     * the legacy keys or read a short blob written by an older, smaller
-     * DeviceConfig. Both cases are one-shot: a normal blob boot writes nothing,
-     * so this costs no flash wear on the 99% path. Writing only AFTER the clamp
-     * means a damaged source can never be re-persisted in its damaged form. */
-    if (!from_blob || blob_sz != sizeof(DeviceConfig)) {
-        ESP_LOGI(TAG, "Persisting config as blob (%s)",
-                 from_blob ? "struct grew since last write" : "migrated from legacy keys");
+    /* Persist the clamped result as a blob when this boot migrated from the
+     * legacy keys (one-shot: a normal blob boot writes nothing, so this costs
+     * no flash wear on the 99% path). Writing only AFTER the clamp means a
+     * damaged source can never be re-persisted in its damaged form.
+     *
+     * A SHORT blob (written by an older, smaller DeviceConfig) is deliberately
+     * NOT rewritten here any more. This runs on the first boot of a FOTA'd
+     * image, before that image has confirmed itself; were it to fail and be
+     * rolled back, the old build would find a blob LONGER than its struct,
+     * refuse it, and come up unconfigured — and its own persist would then
+     * overwrite the good plan with defaults. Left alone, the short blob loads
+     * the same way on every boot (the prefix copy plus the plan conversion
+     * above are deterministic), and the next setconfig stores the full struct
+     * — confirming the image before the restart that applies it. */
+    if (!from_blob) {
+        ESP_LOGI(TAG, "Persisting config as blob (migrated from legacy keys)");
         nvs_handle_t hw;
         if (nvs_open(NS, NVS_READWRITE, &hw) == ESP_OK) {
             if (nvs_set_blob(hw, "cfg_blob", cfg, sizeof(DeviceConfig)) == ESP_OK) {

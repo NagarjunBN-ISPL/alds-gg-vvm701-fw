@@ -75,8 +75,8 @@ typedef enum {
     F_STORE_ENQ,       /* littlefs append                                     */
     F_STORE_FLUSH,     /* draining the offline queue                          */
     F_STORE_COMPACT,   /* whole-log rewrite — the long one                    */
-    F_SETRSP,          /* Yenen price write; detail = global nozzle label     */
-    F_PASSTHRU,        /* raw rsp/kfactor command; detail = nozzle label      */
+    F_SETRSP,          /* retired with setrsp (2026-10-18); value kept        */
+    F_PASSTHRU,        /* raw rsp/kfactor tunnel command                      */
     F_MS51,            /* Nuvoton transaction (panel lock / DI)               */
     F_FOTA_DL,         /* HTTPS download                                      */
     F_FOTA_WRITE,      /* flash write of the new image                        */

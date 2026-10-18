@@ -1,6 +1,6 @@
 # alds-gg VVM701 gateway: cloud integration guide
 
-Firmware 1.0.0, product id `alds-gg-vvm701/1`. Updated 25 September 2026.
+Firmware 1.0.0, product id `alds-gg-vvm701/1`. Updated 18 October 2026.
 
 Everything the gateway publishes and every command it accepts, copied from the
 firmware source. If a payload differs, the firmware is right and this doc is wrong.
@@ -12,6 +12,53 @@ on a backlog drain, repair of a queue record torn by a power cut, and catching a
 inbound command that lands while the modem is mid-diagnostics. Nothing on the wire
 changed: no new topic, payload, key or status, and nothing in the pipeline needs
 touching.
+
+**Wire change after that build:** genset messages now carry the complete Modbus
+reply as received (`slave, fc, byte count, data, crc`), like radar and the
+dispensers, instead of the data bytes alone. Register decoding moves by 3 bytes:
+register k is `frame[3+2k]<<8 | frame[3+2k+1]`. Section 6.4.
+
+**Wire change, 8 October 2026:** the diagnostics report (health, `why`, forensics
+`last_stop`, all counters) is published on `<base>/logs`, no longer on
+`<base>/data`. Payload unchanged. Subscribe to `<base>/logs`; the broker account
+must be allowed to publish there. Same as the CNG and Senseflow firmware.
+Section 7. Also: before a FOTA hands the gateway to another product, the modem's
+GNSS engine, autogps and AGPS are switched off; `fota_completed` is re-sent until
+delivered if the new image confirmed itself while offline.
+
+**Wire change, 8 October 2026: setconfig is strict.** A push with a typo'd or
+unknown key, a value out of range or of the wrong type, a string too long for its
+field, or a cut-short JSON is refused whole with `config_failed` and a `reason`;
+it is never clamped or partly applied. Send only documented keys. Section 8.1.
+
+**Wire changes, 16 October 2026 — act on all three:**
+
+1. **`<base>/data` carries polled readings only** (nozzles, tanks, genset, DI,
+   GPS). Everything else — every `status` (`ready`, `unconfigured`,
+   `config_*`, `config_report`, `fota_*`, `restarting`, ...) — moved to
+   `<base>/logs`, next to diagnostics. Payloads unchanged. Lock events stay on
+   `.../lock/out`, rsp/kfactor replies on their `.../out`. Section 3.
+2. **Dispenser slots.** `du<N>Sfx` set = slot N ON, polling dispenser `<sfx>`;
+   `du<N>Sfx` `""` = slot N OFF. An empty suffix no longer means "the position".
+   `duCount` must equal the slots ON or the push is refused
+   (`duCount 3 but 2 dispenser suffixes set ...`). A unit configured before this
+   build keeps polling exactly the dispensers it polled (converted on boot; its
+   `config_report` now shows the suffixes). Sections 4 and 8.1.
+3. **Diagnostics `sys.cpu`**: per-core CPU load (`core0_avg`, `core1_avg`,
+   `core0_peak`, `core1_peak` in %, `window_s`). Section 7.
+
+**Wire change, 18 October 2026: rsp and kfactor are a plain tunnel, and
+`setrsp` is gone.** The cloud builds every dispenser command (RSP write,
+k-factor write, any read); the gateway sends the frame from
+`.../rsp/imei/<hw_id>/in` (BlueSky and Yenen) or `.../kfactor/imei/<hw_id>/in`
+(BlueSky) to the pump once, unchanged, and answers `.../out` with the pump's
+reply exactly as received, or `404`. It no longer checks the frame, its address
+or that the nozzle is idle, never retries and never reads back — don't write
+mid-sale: read the status through the tunnel first. Removed:
+`<base>/setrsp/imei/<hw_id>/in` and its `RSP_*` acks (a Yenen price is now a
+cloud-built frame on the rsp topic, as in the pilot), and the `busy`,
+`rsp_rejected`/`kfactor_rejected` and `rsp_readback`/`kfactor_readback`
+statuses. Yenen has no kfactor topic. Section 8.5.
 
 Against the previous GG firmware the ingestion still works unchanged — same
 telemetry topic, `HW_ID` + `TS` envelope and payload shapes. Its deltas, each
@@ -27,7 +74,7 @@ documented in its own section:
 - Outage readings replay from flash oldest-first, at-least-once — expect bursts of
   old-`TS` records afterwards. Section 5.
 - Also, each optional to consume: Yenen dispensers beside BlueSky (6.2), grouped
-  diagnostics (7), the fleet-FOTA/lock/Yenen-price topics (3, 8.3), GPS
+  diagnostics (7), the fleet-FOTA/lock topics (3, 8.3), GPS
   `hdop`/`nsat`/`spd` (6.6), compiled credentials overriding stored config (2), `rfid` always `"404"`.
 
 ## 2. Connection
@@ -55,19 +102,23 @@ IMEI plus a 2-digit suffix.
 
 | Topic | Direction | Payload |
 |---|---|---|
-| `<base>/data` | device to cloud | all telemetry, diagnostics, status and events (JSON) |
+| `<base>/data` | device to cloud | polled readings only: `nozzles`, `tanks`, `genset`, `di`, `gps` (JSON, section 6) |
+| `<base>/logs` | device to cloud | everything else: diagnostics (section 7) and every `status` message (section 8) (JSON) |
 | `<base>/<imei>/setconfig` | cloud to device | config, `restart`, `factory_reset`, `getconfig` (JSON) |
 | `<base>/<imei>/update` | cloud to device | FOTA for one gateway (URL string or JSON) |
 | `<base>/fleet/gg/update` | cloud to device | FOTA for every GG gateway on this base topic |
 | `<base>/<imei>/lock` | cloud to device | panel box lock: string containing `unlock` or `lock` |
 | `<base>/<imei>/lock/out` | device to cloud | lock ack/events (`unlocked`/`locked`/`ignored_retained`/`bad_command`/`safety_restart`) |
-| `<base>/setrsp/imei/<hw_id>/in` / `out` | both | Yenen price update and its ack (JSON) |
-| `<base>/rsp/imei/<hw_id>/in` / `out` | both | dispenser raw command passthrough (hex in, hex or `404` out) |
-| `<base>/kfactor/imei/<hw_id>/in` / `out` | both | BlueSky k-factor passthrough (hex in, hex or `404` out) |
+| `<base>/rsp/imei/<hw_id>/in` / `out` | both | dispenser command tunnel, BlueSky and Yenen: cloud-built frame as hex in, the pump's reply as hex or `404` out (section 8.5) |
+| `<base>/kfactor/imei/<hw_id>/in` / `out` | both | the same tunnel, BlueSky only |
 
-Everything the device says arrives on `<base>/data`. Identify the sender from
-`HW_ID` and the message kind from the one top-level key present: `nozzles`,
-`tanks`, `genset`, `di`, `gps`, `diagnostics`, `status` or `event`.
+Readings arrive on `<base>/data` (`nozzles`, `tanks`, `genset`, `di`, `gps`);
+diagnostics and every `status` message arrive on `<base>/logs` — subscribe to
+both (firmware before 16 October 2026 sent status on `/data`, and before
+8 October diagnostics too, so accept them on either during a mixed fleet).
+Identify the sender from `HW_ID` and the message kind from the one top-level key
+present: `nozzles`, `tanks`, `genset`, `di`, `gps`, `diagnostics`, `status` or
+`event`.
 
 ## 4. HW_ID and suffixes
 
@@ -76,30 +127,34 @@ Everything the device says arrives on `<base>/data`. Identify the sender from
 
 | Unit | setconfig key | Default | Meaning of the number |
 |---|---|---|---|
-| Dispenser entry 1-6 | `du1Sfx`..`du6Sfx` | the entry's position `01`..`06` | the dispenser number. BlueSky dispenser N is nozzle addresses 2N-1 and 2N; Yenen dispenser N is head N. Range `01`..`06`, Yenen `01`..`05` |
+| Dispenser slot 1-6 | `du1Sfx`..`du6Sfx` | `""` = slot OFF (no default) | the dispenser number. BlueSky dispenser N is nozzle addresses 2N-1 and 2N; Yenen dispenser N is head N. Range `01`..`06`, Yenen `01`..`05` |
 | Ztech tank 1-4 | `sfxZtech1`..`4` | `04`, `05`, ... | Modbus slave |
 | Pantech tank 1-4 | `sfxPantech1`..`4` | continues after the last Ztech tank | Modbus slave |
 | Genset | `sfxGenset` (= `gensetSlave`) | `10` | Modbus slave |
 | Digital inputs | `sfxDI` | `11` | label only, not on the bus |
 
-For dispensers the suffix picks the pump, not the list position. This
-setconfig polls dispenser 1 and dispenser 3 and nothing in between:
+Dispensers use slots (the same rule as the bottling-plant meters): slot N is ON
+only when `du<N>Sfx` is set, and the suffix picks the pump. A station whose
+dispensers sit at slave ids 1, 2 and 3, with dispenser 1 out of service:
 
 ```json
-{"duCount":2,"du1Make":"bluesky","du1Sfx":"01","du2Make":"bluesky","du2Sfx":"03"}
+{"duCount":2,"du1Sfx":"","du2Make":"bluesky","du2Sfx":"02","du3Make":"bluesky","du3Sfx":"03"}
 ```
 
-Dispenser 3 publishes under `<imei>03` with nozzle labels `"5"`/`"6"`. An empty
-suffix means "dispenser N at position N", the normal case — a typical station (up
-to 3 dispensers, radars `04`/`05`, genset `10`, DI `11`) needs no suffixes at all.
-Two units can never share a suffix (the device refuses it, section 8.1). Status,
-diagnostics, GPS and lock messages use the bare IMEI.
+Only dispensers 2 and 3 are polled; they publish under `<imei>02` (nozzles
+`"3"`/`"4"`) and `<imei>03` (nozzles `"5"`/`"6"`). Nothing is changed at the pump.
+Turning dispenser 1 back on is `{"du1Sfx":"01","duCount":3}`. `duCount` is a
+cross-check: it must equal the number of slots with a suffix (after merging this
+push over what is stored), else `config_failed`. Send every slot key each time
+to be safe. Two units can never share a suffix (the device refuses it, section
+8.1). Status, diagnostics, GPS and lock messages use the bare IMEI.
 
 ## 5. Parsing rules
 
 - One equipment unit per message, one top-level key per message.
 - Hex is lowercase, 2 digits per byte, comma separated, and is the complete
-  frame the device received (for genset: register data only, section 6.4).
+  frame the device received, for every device: validated, then published with
+  nothing removed (Modbus: slave, function code, byte count, data and CRC).
 - `"404"` in a field means that read failed. A unit that did not answer at all
   publishes a compact `"data":"404"`; a genset message keeps its own key
   (`{"genset":{"Alarms":"404"}}`); DI uses the number `404`.
@@ -145,7 +200,7 @@ record from idle frames.
 
 Nozzle labels (both makes): `label = (N-1)*2 + side + 1` with N the dispenser
 number, so dispenser `01` publishes `"1"`/`"2"` and dispenser `03` `"5"`/`"6"`,
-up to `"12"`. The label is the key inside `nozzles` and the `nz` of `setrsp`.
+up to `"12"`. The label is the key inside `nozzles`.
 
 ### 6.3 Radar, one message per tank, every 10 min
 
@@ -162,15 +217,19 @@ does not move. Take the latest reading as current.
 ### 6.4 Genset, every 5 min, up to three messages
 
 ```json
-{"HW_ID":"86071008133255610","genset":{"registers":"01,3f,00,3e,00,22,..."},"TS":"..."}
-{"HW_ID":"86071008133255610","genset":{"Alarms":"11,10,11,11,11,11"},"TS":"..."}
-{"HW_ID":"86071008133255610","genset":{"status":"c0,00,00,00"},"TS":"..."}
+{"HW_ID":"86071008133255610","genset":{"registers":"0a,04,48,01,3f,00,3e,00,22,...,1b,08,5e,2c"},"TS":"..."}
+{"HW_ID":"86071008133255610","genset":{"Alarms":"0a,04,06,11,10,11,11,11,11,48,44"},"TS":"..."}
+{"HW_ID":"86071008133255610","genset":{"status":"0a,04,04,c0,00,00,00,7d,44"},"TS":"..."}
 ```
 
-One message per Modbus read, in this order, same `TS`; register data bytes only
-(framing and CRC stripped), register k is `data[2k]<<8 | data[2k+1]`. `Alarms` has
-a capital A, as the DG spec does. A failed read gives `"404"` for that message (the
-key stays), with the same 60 s re-poll.
+One message per Modbus read, in this order, same `TS`. Each is the complete
+reply exactly as the controller sent it: `slave, fc, byte count, data..., crc lo,
+crc hi`. The gateway has already checked the CRC, the slave and function-code
+echo and the length; a reply that fails any check is a `"404"`, never published.
+Register k is `frame[3+2k]<<8 | frame[3+2k+1]`. The slave byte is the genset
+suffix (`10` → `0a`, `08` → `08`). `Alarms` has a capital A, as the DG spec does.
+A failed read gives `"404"` for that message (the key stays), with the same 60 s
+re-poll.
 
 | `gensetModel` | Controller | FC | `registers` | `Alarms` | `status` |
 |---|---|---|---|---|---|
@@ -203,7 +262,11 @@ on `lat`/`lon`. `spd` 0.0 is real (stopped), not missing. No fix gives
 `{"gps":{"data":"404"}}`. Off unless `gpsEnable` is set. Same payload as the bowser
 gateway (bwsr).
 
-## 7. Diagnostics, every 15 min
+## 7. Diagnostics, every 15 min, on `<base>/logs`
+
+One message on `<base>/logs` (not `/data`) carrying everything about the
+gateway's own health: the `health` verdict and its `why` list, the forensics
+record of the last stop (`last_stop`) and every counter.
 
 ```json
 {"HW_ID":"860710081332556","diagnostics":{
@@ -214,7 +277,8 @@ gateway (bwsr).
   "records":{"q_ram":0,"q_flash":0,"q_bytes":0,"q_pct":0,"spilled":0,"dropped":0,"trimmed":0,"store_ok":true,"rtc_synced":true},
   "link":{"rssi":22,"operator":"Airtel","connected_s":86300,"recov_l1":0,"recov_l2":0,"recov_l3":0,"bearer_distrust":0,"pub_ok":1450,"pub_fail":0},
   "bus":{"nozzles_absent":[],"lock_timeouts":0,"cycle_max_ms":4210,"cycle_avg_ms":3100,"cycles":90},
-  "sys":{"heap_free":248000,"heap_min_ever":236000,"stack_min":2400,"temp_c":46.5,"vbat_mv":3820},
+  "sys":{"heap_free":248000,"heap_min_ever":236000,"stack_min":2400,"temp_c":46.5,"vbat_mv":3820,
+         "cpu":{"window_s":900,"core0_avg":3,"core1_avg":1,"core0_peak":9,"core1_peak":2}},
   "subsystems":{"du":true,"radar":true,"genset":false,"di":true,"gps":false}},
  "TS":"2026-09-21 12:55:06"}
 ```
@@ -231,6 +295,10 @@ reasons in `why`: `store_unmounted`, `records_dropped`, `records_trimmed`,
   count reconnects, network rebuilds and modem power cycles since boot.
   `pub_ok`/`pub_fail` are for this 15-minute window.
 - `bus.nozzles_absent` lists the nozzle labels currently not answering.
+- `sys.cpu` is each core's load in % over `window_s` (since the last report
+  that was delivered): `core0_avg`/`core1_avg` the average, `*_peak` the busiest
+  minute. Single digits are normal (the firmware mostly waits on serial lines);
+  the key is absent if the build cannot measure it.
 - `last_stop` appears once after a reboot: what the device was doing when it
   stopped. `fault:true` is a crash, watchdog or brownout; `false` a planned
   restart. `phase:"recover"`, `detail:4` means the connectivity ladder gave up.
@@ -240,7 +308,8 @@ reasons in `why`: `store_unmounted`, `records_dropped`, `records_trimmed`,
 
 ## 8. Status messages and events
 
-All on `<base>/data`, bare IMEI unless noted, one-shot.
+All on `<base>/logs` (on `<base>/data` before 16 October 2026), bare IMEI unless
+noted, one-shot.
 
 | Payload | When |
 |---|---|
@@ -254,13 +323,10 @@ All on `<base>/data`, bare IMEI unless noted, one-shot.
 | `{"status":"connectivity_rollback","reason":"new_settings_unreachable"}` | a pushed APN/broker change did not reach a broker; reverted |
 | `fota_initiated`, `fota_successful` (`"handover":true` on a product swap), `fota_completed` | section 8.3 |
 | `fota_failed` (`reason`), `fota_skip_known_bad`, `fota_skip_already_applied`, `fota_skip_reverted`, `fota_ignored_retained`, `fota_reverted` (`image`) | section 8.3 |
-| `{"status":"busy"}` | a second `rsp`/`kfactor` passthrough arrived while one was in flight; no `/out` reply follows |
-| `{"HW_ID":"<hw_id>","status":"rsp_rejected","reason":".."}` / `kfactor_rejected` | passthrough frame refused or unanswered, section 8.6 |
-| `{"HW_ID":"<hw_id>","status":"rsp_readback","data":".."}` / `kfactor_readback` | value read back after a passthrough write |
-| lock events on `<base>/<imei>/lock/out` (not `<base>/data`): `unlocked` (+`window_ms`), `locked`, `ignored_retained`, `bad_command`, and `safety_restart` on the next boot if an unlock window never closed | panel lock, section 8.4 |
+| lock events on `<base>/<imei>/lock/out` (not `<base>/logs`): `unlocked` (+`window_ms`), `locked`, `ignored_retained`, `bad_command`, and `safety_restart` on the next boot if an unlock window never closed | panel lock, section 8.4 |
 
-`RSP_updated` / `RSP_update_failed` / `RSP_update_rejected` go to the
-`setrsp .../out` topic, not to `<base>/data` (section 8.5).
+rsp/kfactor replies go to their own `.../out` topic, never to `<base>/logs`
+(section 8.5).
 
 ### 8.1 setconfig
 
@@ -268,9 +334,9 @@ Publish JSON to `<base>/<imei>/setconfig`. Only the keys sent are changed.
 
 | Key | Type | Values |
 |---|---|---|
-| `duCount` | int | 0-6 entries |
+| `duCount` | int | 0-6; must equal the dispenser slots with a suffix (cross-check, not a switch) |
 | `du1Make`..`du6Make` | str | `bluesky` or `yenen` |
-| `du1Sfx`..`du6Sfx` | str | `01`..`06` (Yenen `01`..`05`), or `""` = position |
+| `du1Sfx`..`du6Sfx` | str | `01`..`06` (Yenen `01`..`05`) = slot ON, polling that dispenser; `""` = slot OFF |
 | `ztechCount`, `pantechCount` | int | 0-4 each |
 | `radarType` + `tankCount` | str + int | `ztech`/`pantech`/`none`, 0-4. Alternative to the counts, never mixed with them |
 | `sfxZtech1..4`, `sfxPantech1..4` | str | `01`..`99` = Modbus slave, or `""` |
@@ -282,11 +348,35 @@ Publish JSON to `<base>/<imei>/setconfig`. Only the keys sent are changed.
 | `apn`, `apnUser`, `apnPass` | str | `apn` non-empty |
 | `mqttHost`, `mqttPort`, `mqttUser`, `mqttPass`, `mqttBaseTopic`, `mqttTls` | str/int/bool | host and base topic non-empty, port 1-65535, no `#` or `+` in the base topic |
 
-Numbers may be quoted (`"duCount":"2"`). Counts, `gensetModel` and `gensetBaud` out
-of range are clamped (`gensetModel` 7 → 0, a bad baud → 9600). `gensetType`,
-`gensetSlave` and `diEnable` out of range are refused (`gensetType must be 0..1`,
-`gensetSlave must be 1..247`, `diEnable must be 0..15`) — a clamp would silently
-switch equipment off or move its address. A suffix that is not a 2-character string
+**A bad push is refused whole; nothing in it is applied** — `config_failed` with
+a `reason`, the current configuration keeps running, no reboot. Nothing is
+clamped, defaulted or ignored (changed 8 October 2026; counts, `gensetModel`,
+`gensetBaud` and switches used to be clamped or skipped and still acked
+`config_successful`):
+
+| Refused | `reason` |
+|---|---|
+| Not one complete JSON object (cut short, two objects, a bare URL) | `bad_payload` |
+| A key this firmware does not know (a typo such as `du1make`) | `unknown_key_<key>` |
+| The same key twice | `duplicate_key_<key>` |
+| Whitespace between a key and its `:` (`"duCount" :2`) | `bad_payload` |
+| An object or array as a value | `<key> must be a plain value` |
+| A number that is not a whole number, or out of range (`"duCount":9`, `-1`, `"two"`, `2.5`) | `<key> must be a whole number <lo>..<hi>` / `<key> must be <lo>..<hi>` |
+| `gensetBaud` other than 4800, 9600, 19200 | `gensetBaud must be 4800, 9600 or 19200` |
+| A switch that is not `true`/`false`/`1`/`0` | `<key> must be true or false` |
+| A string key sent as a number | `<key> must be a string` |
+| A string longer than its field (never cut to size) | `<key> is longer than <n> characters` |
+| `cmd` together with config keys | `cmd_must_be_sent_alone` |
+| An unknown `cmd` | `unknown_cmd` |
+| `duCount` not equal to the dispenser slots with a suffix (since 16 October 2026) | `duCount <n> but <m> dispenser suffixes set (a dispenser slot is ON only with its duNSfx)` |
+
+A `config_report` may be edited and sent back as a setconfig: its read-only keys
+(`HW_ID`, `status`, `fw`, `apnPassSet`, `mqttPassSet`, `connPending`) are accepted
+and ignored. Numbers and switches may be quoted (`"duCount":"2"`, `"gpsEnable":"true"`). Field
+limits: `apn` 47, `apnUser`/`apnPass` 31, `mqttHost`/`mqttPass` 63,
+`mqttUser`/`mqttBaseTopic` 31 characters. `gensetType`, `gensetSlave` and
+`diEnable` out of range read `gensetType must be 0..1`, `gensetSlave must be
+1..247`, `diEnable must be 0..15`. A suffix that is not a 2-character string
 is refused (`sfxZtech1 must be 2 digits as a string, e.g. 05`), so `"045"` never
 becomes `04`; a `sfxGenset`/`gensetSlave` pair must agree (`sfxGenset 03 and
 gensetSlave 4 disagree, send one of them`). Suffix/address clashes name the units:
@@ -316,8 +406,8 @@ scheduled reboot on the device; if you want one, push `restart` in batches.
 `du1Sfx` .. `du6Make`, `du6Sfx`, `sfxZtech1..4`, `sfxPantech1..4`, `apn`,
 `apnUser`, `apnPassSet`, `mqttHost`, `mqttPort`, `mqttUser`, `mqttPassSet`,
 `mqttBaseTopic`, `mqttTls`, `connPending`. Passwords are never echoed; an
-empty suffix means the default; entries past `duCount` still appear. Use it
-as the equipment list for the dashboard.
+empty suffix means the default (for a dispenser slot: OFF). `duCount` is the
+number of dispenser slots ON. Use it as the equipment list for the dashboard.
 
 ### 8.3 FOTA
 
@@ -370,45 +460,51 @@ payload is `bad_command`, an unlock within 5 s of subscribing is `ignored_retain
 and a `safety_restart` next boot means an unlock window never closed (deadman
 forced a restart). `unlocked` = command reached the relay (bolt not sensed); every reboot re-locks.
 
-### 8.5 Yenen price update
+### 8.5 rsp / kfactor tunnel
 
-Publish to `<base>/setrsp/imei/<hw_id>/in`:
+The cloud builds every dispenser command; the gateway only carries it.
 
-```json
-{"rsp":65.32}            both nozzles
-{"rsp":65.32,"nz":1}     one nozzle: 1/2 = side A/B, or the global label
+| Publish to | Dispensers |
+|---|---|
+| `<base>/rsp/imei/<hw_id>/in` | BlueSky and Yenen |
+| `<base>/kfactor/imei/<hw_id>/in` | BlueSky only (Yenen has no k-factor) |
+
+The payload is the frame as hex, retain off. These all send the same bytes:
+
+```
+f5,02,a4,68,80,b2,09        F5 02 A4 68 80 B2 09        F502A46880B209
+0xF5,0x02,0xA4,...          f5,2,a4,68,80,b2,9          "f5,02,a4,68,80,b2,09"
+{"Status":"lock","NZ1":"02,30,38,30,31,30,4B,36,35,33,32,03,37,31"}
 ```
 
-`rsp` is rupees, 0.01..99.99. The device checks the nozzle is idle, writes,
-reads back, and answers once on `.../out`:
+The last is the pilot's wrapper: the first `NZ<n>` string is the frame, other
+keys are ignored. Anything else (a letter that is not hex, an odd digit run, a
+JSON object without `NZ<n>`) is refused: nothing is sent, `404`.
 
-```json
-{"HW_ID":"86071008133255603","status":"RSP_updated","rsp":"65.32",
- "nz":{"5":{"result":"RSP_updated","rsp":"65.32"},"6":{"result":"RSP_updated","rsp":"65.32"}},
- "TS":"2026-09-21 12:55:06"}
-```
+The gateway sets the line (BlueSky 9600 8E1, Yenen 9600 8N1), sends the frame
+once and reads until the line has been quiet for 2 s. The same topic with `out`
+for `in` then gets the reply exactly as received, lowercase comma hex — an ack
+(`f5,02,a3,59,b2,3f`, `06,30,31`), a NAK (`15`), a damaged frame, whatever came.
+It gets `404` when the payload is not a frame of 1-64 bytes, 16 commands are
+already waiting, the bus stayed busy for 9 s, nothing came back within 2 s, more
+than 128 bytes came, or the line was still talking after 6 s. Nothing is
+checked, retried or read back, and nothing goes to `<base>/logs`.
 
-`status` is `RSP_updated` only if every requested nozzle confirmed, else
-`RSP_update_failed`; per-nozzle `result` is `RSP_updated`, `nozzle_busy`,
-`no_response`, `nak`, `no_ack`, `verify_failed`, `bad_value` or `bus_busy`, and
-`rsp` is the price read back. A busy nozzle is retried up to 5 min. Pre-write
-refusals are `{"status":"RSP_update_rejected","reason":..}` — `bad_rsp`, `bad_nz`,
-`busy` or `unit_not_configured_as_yenen`. Verify from the next telemetry frame,
-re-push only a nozzle that disagrees.
+Commands run one at a time in arrival order, ~2 s each, so replies arrive in
+the order the commands were sent. There is no request id: to pair a reply with
+its command, keep one command in flight per dispenser.
 
-### 8.6 Raw passthrough (rsp, kfactor)
+Safety is the cloud's job now. A write is sent even mid-sale, so read the nozzle
+first and write only when it is idle:
 
-Send a hex frame to `.../in`, read the reply from `.../out` as hex or `404`.
-Separators and case do not matter. One command at a time per unit.
+- BlueSky status: `F5 <nz> A2 D5 <cs>` (`cs = nz ^ D5 ^ D7`, e.g. `f5,01,a2,d5,03`);
+  idle when the 4th reply byte is `80` (or `00`).
+- Yenen: Command 2 (appendix); idle when the status field is `00`.
 
-A BlueSky frame reaches the bus only if it is complete (`f5`, length nibble
-matching), addressed to one of that dispenser's two nozzles, and that nozzle polls
-idle. Retried once if unanswered; after a write (frame > 5 bytes) the value is read
-back. On refusal `/out` gets `404` and `<base>/data` gets `rsp_rejected` (or
-`kfactor_rejected`) with `reason` `bad_hex`, `bad_frame`, `addr_not_this_dispenser`,
-`nozzle_busy`, `nozzle_absent`, `no_reply` or `bus_busy`; after a write,
-`rsp_readback`/`kfactor_readback` carries the pump's value. Yenen frames forward
-as-is; use `setrsp` for a Yenen price.
+Then confirm the new value from telemetry: `rsp` (BlueSky) or `data[6:10]`
+(Yenen) on the next message. After any BlueSky tunnel command the gateway
+re-reads the k-factor on the next round, so `kfact` shows a change within one
+round instead of 15 min.
 
 ## 9. Operating notes
 
@@ -449,3 +545,10 @@ Example `49010A67720260000035902431187433322182451110990`: head 1 side A, price
 67.72, 3.59 L for 243.11, totalizer 874,333 L, status `11` so mid-sale. Record only
 from `00` frames; derive sales by differencing totalizers. The device verifies the
 checksum and address echo; anything else is `404`.
+
+RSP write (Command K) — built by the cloud, sent through the rsp tunnel (8.5):
+`02 30 38 30 <'0'+head> <side code> 4B <price as 4 digits, rupees x100> 03 <ck1> <ck2>`,
+the checksum being the XOR of STX..ETX with each nibble + `0x30` (head 1 side A,
+65.32: `02,30,38,30,31,30,4b,36,35,33,32,03,37,31`). The pump answers `06,30,31`
+(accepted) or `15` (refused). The ack covers the frame, not the stored price —
+confirm from the next `data`.

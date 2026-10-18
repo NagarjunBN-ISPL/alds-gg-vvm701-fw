@@ -64,6 +64,12 @@ void diag_pm_release(void);
 /* Feed the per-cycle loop duration; tracks the window maximum after boot grace. */
 void diag_record_loop_time(int64_t iter_us);
 
+/* One-minute CPU sample — call every CPU_LOAD_SAMPLE_CYCLES main cycles, from
+ * the main task. Feeds the busiest-minute peak of the per-core CPU load the
+ * report carries over its own window (sys.cpu; see cpu_load.h). A no-op when
+ * FreeRTOS run-time stats are off in sdkconfig. */
+void diag_cpu_sample(void);
+
 /* Publish the single combined diagnostics report to `topic` and clear the window
  * counters on a confirmed publish. Replaces diag_publish() + sysmon_publish(). */
 void diag_publish(const char *hw_id, const char *ts, const char *topic);
