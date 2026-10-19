@@ -74,10 +74,10 @@
  * MQTT Configuration
  * ========================================================================== */
 
-/* DEV broker. Production credentials are set here before a release build —
- * they are shared with alds-ggy (same broker, user and base topic). Every
+/* PRODUCTION broker — the same broker, user and base topic as alds-ggy. Every
  * unit running this build is FORCED onto these values (see the credential
- * guard below), so a dev image reaching a production site re-points it. */
+ * guard below), so an image built with any other set (a dev image) re-points
+ * every station it reaches. */
 #define MQTT_HOST   "mqtt.iotronsys.com"
 #define MQTT_PORT   8777
 #define MQTT_USER   "gogas"

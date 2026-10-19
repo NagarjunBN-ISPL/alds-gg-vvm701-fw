@@ -1,6 +1,6 @@
 # alds-gg VVM701 gateway: cloud integration guide
 
-Firmware 1.0.0, product id `alds-gg-vvm701/1`. Updated 18 October 2026.
+Firmware 1.0.0, product id `alds-gg-vvm701/1`. Updated 19 October 2026.
 
 Everything the gateway publishes and every command it accepts, copied from the
 firmware source. If a payload differs, the firmware is right and this doc is wrong.
@@ -81,8 +81,7 @@ documented in its own section:
 
 | | Value |
 |---|---|
-| Broker (this image) | `dev-fuelsense.iotronsys.com:8777`, user `iotrondev`, base topic `fuelsense` |
-| Production | same broker, user and base topic as alds-ggy; set at release |
+| Broker (this image) | `mqtt.iotronsys.com:8777`, user `gogas`, base topic `gogas` (production, the same set as alds-ggy) |
 | Client id | `iotronics-<imei>` |
 | Protocol | MQTT 3.1.1 over TLS, QoS 1 everywhere, persistent session, keepalive 60 s |
 | Retain | the device never sets it; the cloud must not either (section 8.3) |

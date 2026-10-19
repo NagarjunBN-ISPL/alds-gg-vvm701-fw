@@ -169,15 +169,15 @@ release, and roll it out. Equipment config (dispensers/radars) is left intact �
 only the connectivity fields are forced. Announced to the cloud as
 `firmware_credentials_applied`.
 
-The current image ships **development** credentials (`dev-fuelsense.iotronsys.com:8777`,
-user `iotrondev`, base topic `fuelsense`, TLS on). **Before the production
-release, set the production credentials in `src/config.h`** — GG shares them
-with alds-ggy (same broker, user and base topic; ~300 GG stations and ~20 GGY
-stations on one tree). The production broker's certificate is ECDSA and chains
-to **ISRG Root X2**, which `src/tls_ca.c` already bundles alongside ISRG Root X1
-(dev broker) and Amazon Root CA 1 (S3 FOTA) — verified against the live endpoint
-2026-09-12 for ggy. Moving to a different broker is a config.h edit + a version
-bump, released the normal way; check its cert root is in the bundle first
+The current image ships **production** credentials (`mqtt.iotronsys.com:8777`,
+user `gogas`, base topic `gogas`, TLS on) — the same set as alds-ggy (same
+broker, user and base topic; ~300 GG stations and ~20 GGY stations on one tree).
+The production broker's certificate is ECDSA and chains leaf -> YE1 -> **ISRG
+Root YE** (cross-signed by ISRG Root X2 until 2032-09-02); `src/tls_ca.c`
+bundles both, alongside ISRG Root X1 (dev broker), ISRG Root YR (GitHub Pages)
+and Amazon Root CA 1 (S3 FOTA) — verified against the live endpoints
+2026-09-28. Moving to a different broker is a config.h edit + a version bump,
+released the normal way; check its cert root is in the bundle first
 (section 6).
 
 Because GG and GGY share one base topic, what keeps the two fleets apart is:
