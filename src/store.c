@@ -430,8 +430,19 @@ bool store_init(void) {
         ESP_LOGI(TAG, "mounted: %u/%u bytes used", (unsigned)used, (unsigned)total);
 
     s_lock = xSemaphoreCreateMutex();
-    if (!s_lock)
-        ESP_LOGE(TAG, "queue mutex alloc failed — store will be unarbitrated");
+    if (!s_lock) {
+        /* No mutex means du_task (core 1) and the main task (core 0) would reach
+         * the littlefs log unserialised, and a compaction/rename racing an append
+         * can corrupt the log or the read cursor. Unlike the RS485/MS51 bus locks,
+         * where proceeding unarbitrated costs at worst a garbled UART frame, a
+         * cross-core filesystem must NOT run unlocked. Disable the flash queue and
+         * fall back to RAM-only — exactly the degrade a mount failure takes
+         * (s_ready stays false; the caller already logs "offline queue
+         * unavailable"). Realistic only under boot heap exhaustion. */
+        ESP_LOGE(TAG, "queue mutex alloc failed (heap OOM?) — flash queue DISABLED "
+                      "(RAM-only); not running littlefs unarbitrated across cores");
+        return false;
+    }
 
     /* Delete any orphaned compaction temp. compact() renames STORE_TMP over
      * STORE_LOG atomically, so a STORE_TMP still present at boot means a previous

@@ -39,10 +39,15 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 # relay) and the longest unfed stretch anywhere is modem_hard_reset()'s ~10.2 s
 # against a 120 s timeout.
 #
-# The one thing to watch in a soak: CHECK_IDLE_TASK_CPU0/1 below are both on, so
-# 120 s of idle starvation on either core now reboots too. That is the correct
-# behaviour — 120 s without an idle tick IS a hang — but it is the only path
-# that could turn a slow, non-yielding code path into a field reboot loop.
+# A note on idle-task coverage, easy to misread: the runtime
+# esp_task_wdt_reconfigure() in app_main() passes idle_core_mask = 0, and IDF
+# 5.5's reconfigure() UNSUBSCRIBES whatever idle task CHECK_IDLE_TASK_CPU0/1
+# subscribed at init (task_wdt.c: unsubscribe_idle(old_core_mask)). So after boot
+# the TWDT watches ONLY the four explicitly-subscribed long-lived tasks (main,
+# du_task, di_task, relay) — idle starvation does NOT reboot. That is the
+# intended, safer choice: a legitimately long non-yielding operation cannot turn
+# into a reboot loop, while a genuinely wedged real task is still caught by its
+# own subscription, and a stuck ISR / interrupts-disabled is caught by INT_WDT.
 CONFIG_ESP_TASK_WDT_PANIC=y
 
 # ── The other two watchdog layers, pinned explicitly ──────────────────────

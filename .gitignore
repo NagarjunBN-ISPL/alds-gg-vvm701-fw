@@ -28,6 +28,16 @@ __pycache__/
 # for someone to hand support the wrong firmware.
 *-FULL.bin
 
+# ── Per-release flash set (handover artifact, not source) ─────────────────────
+# flash-set-<version>/ holds the compiled .bin images (bootloader, partition
+# table, ota_data, app) plus SHA256SUMS, produced per release. The app image
+# carries the MQTT broker credentials baked in as cleartext (no flash
+# encryption), so it must NEVER land in git — a stale or leaked copy exposes the
+# fleet password, and it bloats history (~0.5 MB/release). Hand the flash set
+# over out of band or as a private release asset, not from the source tree.
+flash-set-*/
+*-flash-set.zip
+
 # ── IDF Component Manager ─────────────────────────────────────────────────────
 # Fetched dependency sources (currently joltwallet/littlefs). Not committed —
 # they are re-downloaded from the registry on build. NOTE: dependencies.lock IS
