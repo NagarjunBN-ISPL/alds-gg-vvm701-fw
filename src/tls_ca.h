@@ -7,17 +7,22 @@
  * — one upload, two contexts, both roots available to each. */
 #define TLS_CA_FILE "UFS:ca_root.pem"
 
-/* Uploads the embedded root CA bundle (ISRG Root X1/X2/YE/YR for the MQTT
- * brokers and GitHub Pages + Amazon Root CA 1 for S3 — see tls_ca.c) to the
- * modem's UFS and points both SSL contexts at it. Call once at boot, after
- * the modem is confirmed up and before the first TLS connection attempt —
- * mqtt_connect()/fota_download() both assume TLS_CA_FILE already exists by
- * the time they run.
+/* Uploads the embedded root CA bundle (14 roots: ISRG for the MQTT brokers and
+ * GitHub, Amazon for S3, DigiCert/Microsoft/Google for the other storage
+ * clouds — see tls_ca.c) to the modem's UFS and points both SSL contexts at
+ * it. Call once at boot, after the modem is confirmed up and before the first
+ * TLS connection attempt — mqtt_connect()/fota_download() both assume
+ * TLS_CA_FILE already exists by the time they run.
  *
  * Re-uploads unconditionally on every boot rather than trying to detect
- * whether the file is already present and correct: it's a ~6.5 KB write, and
+ * whether the file is already present and correct: it's a ~18 KB write, and
  * "always write the known-good bytes" is simpler and harder to get wrong
  * than a freshness check that could itself be wrong. modem_upload_file()
  * deletes before writing, since QFUPL refuses to overwrite (the file DOES
  * survive ESP resets — the modem stays powered across them). */
 bool tls_ca_provision(void);
+
+/* After a failed FOTA, before MQTT reconnects: uploads the bundle again only
+ * if the modem's copy is missing or not the bundle's size (a mid-update
+ * upload cut short), two tries. True when the modem holds the whole bundle. */
+bool tls_ca_ensure(void);

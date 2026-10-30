@@ -144,6 +144,19 @@ void nvs_config_note_reverted_foreign_image(const char *project_name);
 
 bool nvs_config_load(DeviceConfig *cfg);
 bool nvs_config_save(const DeviceConfig *cfg);
+
+/* erase_config: every station-equipment field back to its default — the
+ * dispenser slots, radar tanks, genset, DI, GPS and every suffix — while the
+ * connectivity run (apn .. cred_fp: APN, broker, their rollback copies, the
+ * trial flags and the credential stamp) is kept byte for byte, so the gateway
+ * restarts on the network and broker it is on now, "unconfigured". Pure, no
+ * NVS: the caller saves. */
+void nvs_config_clear_equipment(DeviceConfig *cfg);
+
+/* factory_reset: erases this firmware's whole NVS namespace — the config
+ * blob, the boot counter, the FOTA URL memory and the product tag — and the
+ * sibling product's. The next boot comes up on the compiled-in defaults, as a
+ * freshly flashed unit does. The caller restarts. */
 void nvs_config_factory_reset(void);
 
 /* True if nvs_config_load() found NVS stamped with a DIFFERENT product and

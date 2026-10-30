@@ -44,7 +44,7 @@
  * fleet/ggy), the FOTA JSON "target" belt (gg vs ggy), and the distinct
  * PRODUCT_ID above (a GG<->GGY swap by FOTA wipes equipment config and comes up
  * unconfigured, which is correct — the two store different config layouts). */
-#define MQTT_TOPIC_BASE     "gogas"
+#define MQTT_TOPIC_BASE     "fuelsense"
 /* Start-to-start pacing of one dispenser poll round on du_task. Yenen nozzles
  * are read every round (10 s); BlueSky nozzles every SECOND round (20 s), see
  * du_task.c — a BlueSky nozzle costs up to 7 RS485 reads and the site mix
@@ -78,10 +78,10 @@
  * unit running this build is FORCED onto these values (see the credential
  * guard below), so an image built with any other set (a dev image) re-points
  * every station it reaches. */
-#define MQTT_HOST   "mqtt.iotronsys.com"
+#define MQTT_HOST   "dev-fuelsense.iotronsys.com"
 #define MQTT_PORT   8777
-#define MQTT_USER   "gogas"
-#define MQTT_PASS   "ZA6WwzNdc0"
+#define MQTT_USER   "iotrondev"
+#define MQTT_PASS   "iotrondev@1234"
 #define MQTT_QOS    1
 /* Use TLS by default. Like the server address, this is baked in —
  * changing it is a credential change like any other. */
@@ -354,7 +354,7 @@
 /* ── Inbound command retain-grace ─────────────────────────────────────────
  * A broker re-delivers a RETAINED message on every (re)subscribe. For a
  * one-shot command that is a loop: a retained restart reboots the gateway
- * forever, a retained factory_reset wipes it on every boot, a retained unlock
+ * forever, a retained erase_config or factory_reset wipes it on every boot, a retained unlock
  * opens the panel box unattended on every reconnect, a retained FOTA URL
  * re-flashes the same image on every boot. The cloud contract is retain=false
  * on every command topic; this is the device-side backstop. Anything arriving
@@ -370,7 +370,7 @@
  * byte-for-byte (lock_cmd.h LOCK_RETAIN_GRACE_MS): a human pressing unlock and a
  * broker re-delivering a retained one are told apart by the 5 s window, and the
  * lock ack/refusal rides <base>/<imei>/lock/out, not <base>/data. The other
- * one-shot commands (restart/factory_reset/FOTA) keep CMD_RETAIN_GRACE_MS. */
+ * one-shot commands (restart/erase_config/factory_reset/FOTA) keep CMD_RETAIN_GRACE_MS. */
 #define LOCK_RETAIN_GRACE_MS  5000
 
 /* ── Connectivity recovery (layered escalation) ──────────────────────────── */

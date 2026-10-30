@@ -113,14 +113,15 @@ uint32_t store_trimmed(void);
  * STORE_MAX_BYTES, not the partition size. */
 size_t store_queue_bytes(void);
 
-/* Discard the entire queue. The ONLY caller is the boot path that detects the
- * firmware's compiled credentials pointing at a different broker than the one
- * NVS was configured for (see nvs_config_enforce_firmware_creds): whatever is
- * buffered belongs to the previous deployment, and publishing it to the new one
- * would leak one client's sales into another's account. That is the one case
- * where destroying buffered records is the correct action — everywhere else in
- * this module the rule is the opposite. Returns false if the queue was not
- * mounted or the lock could not be taken. */
+/* Discard the entire queue. Only where the buffered records belong to a
+ * deployment this gateway is leaving, and publishing them would leak one
+ * client's or station's sales into another's account: the boot path that
+ * finds the firmware's compiled credentials pointing at a different broker
+ * (see nvs_config_enforce_firmware_creds) or NVS stamped by another product,
+ * a cross-product FOTA handover (fota.c), and the operator's confirmed
+ * factory_reset (main.c). Everywhere else in this module the rule is the
+ * opposite. Returns false if the queue was not mounted or the lock could not
+ * be taken. */
 bool store_purge(void);
 
 /* Release the partition's ownership marker before a CROSS-PRODUCT FOTA hands

@@ -6,8 +6,12 @@
  * this size, so anything longer is silently truncated and would download from
  * a URL nobody asked for. Exposed so the caller can REJECT an over-long URL up
  * front (with a reason) rather than discover the truncation as a failed
- * download. Real URLs are well under 200 bytes. */
-#define FOTA_URL_MAX 511
+ * download. 1535 since 2026-10-30 (was 511): an S3 link presigned with an
+ * IAM-user key is ~360 characters, one signed with a role key (it carries
+ * X-Amz-Security-Token) ~1.1-1.4 KB, other clouds' signed links up to ~800.
+ * The whole update message must still fit mqtt.c's 2 KB PAYLOAD_MAX, and
+ * 1535 leaves ~500 bytes of it for the other keys. */
+#define FOTA_URL_MAX 1535
 
 /* Plausible image sizes, from cng-cpil's fota.h (field-proven there). A reply
  * outside them is refused before anything is saved: an error page served with
@@ -30,7 +34,12 @@ bool fota_last_image_foreign(void);
  *               here (e.g. "http_404_err_0", "image_verify_failed") for the
  *               caller to include in its fota_failed message. Untouched on
  *               success. Pass NULL to ignore.
+ *   allow_handover = the push said "handover":true. Without it an image of
+ *               ANOTHER VVM701 product is refused ("not_this_product") after
+ *               it is verified and before the boot slot is switched, so a
+ *               wrong file cannot turn a station into a different product.
  * Returns true only if the OTA image was written and the boot partition set
- * (the caller then publishes fota_successful and reboots). */
+ * (the caller then reboots; the new image reports fota_successful once it has
+ * confirmed itself). */
 bool fota_perform(const char *url, const char *pub_topic,
-                  char *reason, size_t reason_size);
+                  char *reason, size_t reason_size, bool allow_handover);

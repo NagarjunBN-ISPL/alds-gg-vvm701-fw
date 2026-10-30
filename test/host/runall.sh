@@ -44,6 +44,7 @@ python3 extract.py "$SRC/main.c" func:json_get_str func:json_has_key \
     func:setcfg_get_sfx func:setcfg_value func:setcfg_value_ends func:setcfg_word \
     func:setcfg_int_in_range func:setcfg_get_bool func:setcfg_get_text \
     func:setcfg_genset_addr func:setcfg_check_members func:payload_is_one_json_object \
+    func:factory_reset_refusal \
     > extracted_setcfg_all.inc || rc=1
 python3 extract.py "$SRC/dispenser.c" func:du_bytes_to_hex func:clamp_pos \
     func:du_build_nozzle_payload > extracted_payload.inc || rc=1

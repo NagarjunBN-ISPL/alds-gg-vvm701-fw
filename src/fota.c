@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -50,6 +51,14 @@ static void fota_set_reason(char *reason, size_t size, const char *fmt, ...) {
  * wall-clock cap bounds the whole flash independently so a stall aborts
  * cleanly instead of tying up an unattended station indefinitely. */
 #define FOTA_FLASH_MAX_MS  300000
+/* How long the modem may take to save the body to UFS (QHTTPREADFILE), and
+ * how long we wait for its result line: 120 s failed every try at a weak site
+ * — ~450 KB at 30 kbit/s is 2 min on its own. 300 s, as btpl-gg (field-proven
+ * there); the whole update stays bounded by FOTA_TOTAL_BUDGET_MS. */
+#define FOTA_READFILE_WAIT_S 300
+/* UFS room asked for beyond the image itself: the filesystem's own overhead
+ * (btpl-gg). */
+#define FOTA_UFS_MARGIN    (16 * 1024)
 
 /* ── HTTPS download → EC200U UFS ──────────────────────────────────────────
  * Ported from the proven OTA_Integration flow: full QSSLCFG setup on a
@@ -83,6 +92,90 @@ static void fota_pdp_refresh(void) {
     network_build_qicsgp(cmd, sizeof(cmd));
     modem_at(cmd, "OK", 5000, NULL, 0);
     modem_at("AT+QIACT=1", "OK", 60000, NULL, 0);
+}
+
+/* True when `resp` holds a complete line starting with `marker` — a URC that
+ * arrived inside an earlier command's reply (alds-sr). */
+static bool urc_line_in(const char *resp, const char *marker) {
+    const char *p = strstr(resp, marker);
+    return p && strchr(p, '\n') != NULL;
+}
+
+/* "+QFLDS: <free>,<total>" -> free bytes, or -1 when the modem did not say. */
+static long ufs_free_bytes(void) {
+    char resp[128];
+    if (!modem_at("AT+QFLDS=\"UFS\"", "OK", 5000, resp, sizeof(resp))) return -1;
+    const char *p = strstr(resp, "+QFLDS:");
+    long free_b = -1;
+    if (!p || sscanf(p, "+QFLDS: %ld", &free_b) != 1 || free_b < 0) return -1;
+    return free_b;
+}
+
+/* True for a name ending ".bin", any case. */
+static bool ufs_name_is_bin(const char *name) {
+    size_t n = strlen(name);
+    if (n < 4) return false;
+    const char *s = name + n - 4;
+    return s[0] == '.' && (s[1] | 0x20) == 'b' && (s[2] | 0x20) == 'i' && (s[3] | 0x20) == 'n';
+}
+
+/* Makes sure UFS can hold an image of `len` bytes, once its size is known
+ * (btpl-gg, field-proven there). Normally a no-op: both FOTA file names were
+ * deleted before the download and a clean modem has ~1.5 MB. But a modem that
+ * has lived through other products or firmware generations can hold their
+ * images under names this firmware never used — the btpl office unit had
+ * ~960 KB in use with neither of ours present (2026-10-15), room for a ~580 KB
+ * image at most, and a bigger one failed on every attempt. So when the room is
+ * short, every *.bin in UFS goes: a firmware image (any product's, any name)
+ * or a GNSS assistance cache the modem fetches again — nothing this firmware
+ * needs (its CA bundle is a .pem, re-uploaded every boot). The listing is
+ * logged first, so what was removed is on record. Still short after that: the
+ * update fails HERE, at once and without retries, with a reason that says so
+ * ("ufs_full_<free>_of_<need>"), not as a truncated file five tries later. */
+static bool ufs_make_room(int len, char *reason, size_t reason_size) {
+    const long need = (long)len + FOTA_UFS_MARGIN;
+    long free_b = ufs_free_bytes();
+    if (free_b < 0 || free_b >= need) return true;   /* unknown: the size check after the download decides */
+
+    ESP_LOGW(TAG, "UFS has %ld bytes free, the image needs %ld — removing leftover .bin files",
+             free_b, need);
+    static char list[2048];
+    /* The reply is read even when the call fails: a listing longer than the
+     * buffer never shows its closing OK and times out, yet every whole line
+     * that did arrive still names a file. */
+    list[0] = '\0';
+    modem_at("AT+QFLST=\"*\"", "OK", 5000, list, sizeof(list));
+    ESP_LOGW(TAG, "UFS holds: %s", list);
+    for (const char *p = strstr(list, "+QFLST: \""); p; p = strstr(p + 1, "+QFLST: \"")) {
+        char name[72];
+        if (sscanf(p, "+QFLST: \"%71[^\"]\"", name) != 1 || !ufs_name_is_bin(name)) continue;
+        char cmd[96];
+        /* Some modem builds list names without the "UFS:" drive prefix. */
+        snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s%s\"",
+                 strncmp(name, "UFS:", 4) == 0 ? "" : "UFS:", name);
+        ESP_LOGW(TAG, "deleting %s", name);
+        modem_at(cmd, "OK", 5000, NULL, 0);
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+    }
+    free_b = ufs_free_bytes();
+    if (free_b >= 0 && free_b < need) {
+        ESP_LOGE(TAG, "UFS still short after cleanup: %ld bytes free, %ld needed", free_b, need);
+        fota_set_reason(reason, reason_size, "ufs_full_%ld_of_%ld", free_b, need);
+        return false;
+    }
+    return true;
+}
+
+/* Both image names — this firmware's and the one GGY/SR/bwsr use — so a
+ * failed update leaves no ~450 KB file holding the room the next boot's CA
+ * upload, or the next update, needs (as alds-sr). An absent file answers
+ * "+CME ERROR: 418", which is ignored. */
+static void ufs_delete_images(void) {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s\"", FOTA_FILE);
+    modem_at(cmd, "OK", 5000, NULL, 0);
+    snprintf(cmd, sizeof(cmd), "AT+QFDEL=\"%s\"", FOTA_FILE_LEGACY);
+    modem_at(cmd, "OK", 5000, NULL, 0);
 }
 
 /* Downloads to FOTA_FILE; on success *len_out is the Content-Length, which
@@ -177,12 +270,16 @@ static bool fota_download(const char *url, int *len_out, char *reason, size_t re
     /* Kick off the GET — returns OK immediately, then a +QHTTPGET: URC
      * arrives (up to ~2 min later) with err,http_status,content_length. */
     ESP_LOGI(TAG, "Downloading firmware...");
-    if (!modem_at("AT+QHTTPGET=120", "OK", 5000, NULL, 0)) {
+    if (!modem_at("AT+QHTTPGET=120", "OK", 5000, resp, sizeof(resp))) {
         ESP_LOGE(TAG, "QHTTPGET rejected");
         fota_set_reason(reason, reason_size, "get_rejected");
         return false;
     }
-    if (!modem_read_until("+QHTTPGET:", 150000, resp, sizeof(resp))) {
+    /* The result can follow the OK so closely that modem_at() read it already
+     * (it drains the rest of the line); waiting for it again then sat out the
+     * full 150 s and failed the attempt as get_timeout (alds-sr). */
+    if (!urc_line_in(resp, "+QHTTPGET:") &&
+        !modem_read_until("+QHTTPGET:", 150000, resp, sizeof(resp))) {
         ESP_LOGE(TAG, "Timeout waiting for +QHTTPGET");
         fota_set_reason(reason, reason_size, "get_timeout");
         return false;
@@ -217,17 +314,21 @@ static bool fota_download(const char *url, int *len_out, char *reason, size_t re
         fota_set_reason(reason, reason_size, "bad_length_%d", g_len);
         return false;
     }
+    /* Room for it in the modem's UFS, before the body is saved there. */
+    if (!ufs_make_room(g_len, reason, reason_size)) return false;
     *len_out = g_len;
     ESP_LOGI(TAG, "HTTP 200 OK (%d bytes) — saving to UFS ...", g_len);
 
     /* Save the response body to a UFS file, then fota_flash() reads it out. */
-    snprintf(cmd, sizeof(cmd), "AT+QHTTPREADFILE=\"%s\",120", FOTA_FILE);
-    if (!modem_at(cmd, "OK", 5000, NULL, 0)) {
+    snprintf(cmd, sizeof(cmd), "AT+QHTTPREADFILE=\"%s\",%d", FOTA_FILE, FOTA_READFILE_WAIT_S);
+    if (!modem_at(cmd, "OK", 5000, resp, sizeof(resp))) {
         ESP_LOGE(TAG, "QHTTPREADFILE rejected");
         fota_set_reason(reason, reason_size, "readfile_rejected");
         return false;
     }
-    if (!modem_read_until("+QHTTPREADFILE:", 130000, resp, sizeof(resp))) {
+    if (!urc_line_in(resp, "+QHTTPREADFILE:") &&   /* same as +QHTTPGET above */
+        !modem_read_until("+QHTTPREADFILE:", (FOTA_READFILE_WAIT_S + 10) * 1000,
+                          resp, sizeof(resp))) {
         ESP_LOGE(TAG, "QHTTPREADFILE timeout");
         fota_set_reason(reason, reason_size, "readfile_timeout");
         return false;
@@ -329,12 +430,16 @@ static bool fota_image_allowed(const char *name, size_t name_size) {
 }
 
 /* ── UFS → OTA partition ─────────────────────────────────────────────── */
-static bool fota_flash(int expected, char *reason, size_t reason_size) {
+static bool fota_flash(int expected, bool allow_handover, char *reason, size_t reason_size) {
     char cmd[128], hdr[128];
 
     /* Open file */
     snprintf(cmd, sizeof(cmd), "AT+QFOPEN=\"%s\",0", FOTA_FILE);
-    char resp[64] = {0};
+    /* 512, not 64: modem_at() copies the reply from the START of what it read,
+     * so 63 bytes of unrelated URCs ahead of "+QFOPEN:" pushed the answer out
+     * of a small buffer — file_open_parse with the file left open (its handle
+     * unknown, so leaked until the next modem reset). As alds-sr. */
+    char resp[512] = {0};
     if (!modem_at(cmd, "+QFOPEN:", 10000, resp, sizeof(resp))) {
         ESP_LOGE(TAG, "QFOPEN failed");
         fota_set_reason(reason, reason_size, "file_open_failed");
@@ -361,13 +466,26 @@ static bool fota_flash(int expected, char *reason, size_t reason_size) {
         return false;
     }
 
+    /* ── Erase what the image needs, not the whole slot (alds-sr, cng-cpil)
+     * OTA_SIZE_UNKNOWN erases the ENTIRE 7 MB partition inside one call that
+     * cannot feed this task's watchdog: tens of seconds at typical 64 KB block
+     * erase times, and flash erase slows with temperature and wear, so a unit
+     * that passes on the bench gets closer to the 120 s task WDT in a hot panel
+     * box. The size is known exactly here — fota_download() took it from
+     * Content-Length, bounded it to FOTA_MIN/MAX_IMAGE_BYTES and checked the
+     * UFS file holds exactly that many bytes — so only that much is erased
+     * (esp_ota_begin rounds it up to a 4 KB sector): about a second for a
+     * ~450 KB image. The write loop below never goes past it. */
+    const size_t erase_len = (expected > 0) ? (size_t)expected : (size_t)OTA_SIZE_UNKNOWN;
     esp_ota_handle_t ota_hdl;
-    if (esp_ota_begin(update_part, OTA_SIZE_UNKNOWN, &ota_hdl) != ESP_OK) {
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+    if (esp_ota_begin(update_part, erase_len, &ota_hdl) != ESP_OK) {
         ESP_LOGE(TAG, "OTA begin failed");
         fota_set_reason(reason, reason_size, "ota_begin_failed");
         ufs_cleanup(fh);
         return false;
     }
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
 
     static uint8_t chunk[FOTA_CHUNK];
     bool ok = true;
@@ -463,6 +581,16 @@ static bool fota_flash(int expected, char *reason, size_t reason_size) {
             break;
         }
 
+        /* Never past the span esp_ota_begin() erased: programming flash that
+         * was not erased corrupts it silently. A file longer than the length
+         * the download reported is wrong anyway (alds-sr, cng-cpil). */
+        if (expected > 0 && written + got > expected) {
+            ESP_LOGE(TAG, "image runs past its reported %d bytes — aborting", expected);
+            fota_set_reason(reason, reason_size, "size_mismatch_%d", written + got);
+            ok = false;
+            break;
+        }
+
         if (esp_ota_write(ota_hdl, chunk, got) != ESP_OK) {
             ESP_LOGE(TAG, "OTA write error");
             fota_set_reason(reason, reason_size, "ota_write_failed");
@@ -519,6 +647,19 @@ static bool fota_flash(int expected, char *reason, size_t reason_size) {
         }
     }
 
+    /* Another product's firmware only when the push asked for it. A handover
+     * wipes this station's configuration and moves the unit to the other
+     * product's topics, so a wrong file picked on the cloud must not be able
+     * to do that by accident; a deliberate swap says "handover":true. Refused
+     * here, before the boot slot is switched: written, never booted. */
+    const bool foreign = image_is_foreign(update_part);
+    if (foreign && !allow_handover) {
+        ESP_LOGE(TAG, "the image is another product's and the push did not say "
+                      "\"handover\":true — refused, nothing changed");
+        fota_set_reason(reason, reason_size, "not_this_product");
+        return false;
+    }
+
     if (esp_ota_set_boot_partition(update_part) != ESP_OK) {
         ESP_LOGE(TAG, "Set boot partition failed");
         fota_set_reason(reason, reason_size, "set_boot_failed");
@@ -527,7 +668,7 @@ static bool fota_flash(int expected, char *reason, size_t reason_size) {
 
     /* Only once the boot slot is committed — a purge before a failed
      * set_boot would throw away a backlog for an update that never happens. */
-    s_last_image_foreign = image_is_foreign(update_part);
+    s_last_image_foreign = foreign;
     if (s_last_image_foreign) {
         /* HAND OVER AN EMPTY, UNCLAIMED QUEUE. store_disown() drops the owner
          * marker so that when this gateway comes back to this product — by
@@ -566,16 +707,25 @@ static bool fota_flash(int expected, char *reason, size_t reason_size) {
  * MQTT is torn down for the duration, du_task is buffering to flash, and the
  * queue needs the broker back more than this update needs a fifth try on a
  * link that has failed four times. And a reason that cannot change between
- * attempts — no OTA partition, an over-long QFREAD command, an image that is
- * not a VVM701 swap-set firmware — aborts at once;
- * everything else (network, HTTP status, short read, verify) is retried. */
+ * attempts aborts at once: no OTA partition, an over-long QFREAD command, an
+ * image that is not a VVM701 swap-set firmware or is another product's without
+ * "handover":true, a body whose size cannot be a firmware image or does not
+ * fit the modem's UFS even after its leftover .bin files went, and an HTTP
+ * 403 or 404 — an expired or refused signed link, a file that is not there,
+ * the same answer on every try. Everything else (network, other HTTP
+ * statuses, short read, verify) is retried. */
 #define FOTA_ATTEMPTS        5
 #define FOTA_TOTAL_BUDGET_MS (15 * 60 * 1000)
 
 static bool fota_reason_is_final(const char *reason) {
     return reason && (strcmp(reason, "no_ota_partition")   == 0 ||
                       strcmp(reason, "read_cmd_too_long")  == 0 ||
-                      strcmp(reason, "not_a_vvm701_image") == 0);
+                      strcmp(reason, "not_a_vvm701_image") == 0 ||
+                      strcmp(reason, "not_this_product")   == 0 ||
+                      strncmp(reason, "ufs_full_", 9)      == 0 ||
+                      strncmp(reason, "bad_length_", 11)   == 0 ||
+                      strncmp(reason, "http_403_", 9)      == 0 ||
+                      strncmp(reason, "http_404_", 9)      == 0);
 }
 
 /* Strip leading/trailing whitespace, quotes and CR/LF from the URL.
@@ -611,7 +761,7 @@ static void ufs_cleanup(int fh) {
 }
 
 bool fota_perform(const char *url, const char *pub_topic,
-                  char *reason, size_t reason_size) {
+                  char *reason, size_t reason_size, bool allow_handover) {
     if (reason && reason_size) reason[0] = '\0';
 
     /* Sized from FOTA_URL_MAX so the cap the caller enforces and the buffer
@@ -625,12 +775,15 @@ bool fota_perform(const char *url, const char *pub_topic,
      * plaintext FOTA means the firmware binary itself travels unencrypted
      * and unauthenticated, letting anyone on the network path (or a
      * compromised/spoofed server) hand the device arbitrary code to flash
-     * and boot. We only ever generate/expect https:// URLs. */
-    if (strncmp(clean_url, "https://", 8) != 0) {
+     * and boot. We only ever generate/expect https:// URLs. The scheme is
+     * matched in any case ("HTTPS://" is the same link) and handed to the
+     * modem in lower case, the form its HTTP stack is proven with. */
+    if (strncasecmp(clean_url, "https://", 8) != 0) {
         ESP_LOGE(TAG, "FOTA: rejecting non-HTTPS URL [%s]", clean_url);
         fota_set_reason(reason, reason_size, "non_https_url");
         return false;
     }
+    memcpy(clean_url, "https://", 8);
     ESP_LOGI(TAG, "FOTA start URL=[%s] topic=%s", clean_url, pub_topic);
 
     s_last_image_foreign = false;
@@ -662,7 +815,7 @@ bool fota_perform(const char *url, const char *pub_topic,
 
         int len = 0;
         if (fota_download(clean_url, &len, reason, reason_size) &&
-            fota_flash(len, reason, reason_size))
+            fota_flash(len, allow_handover, reason, reason_size))
             return true;
 
         ESP_LOGW(TAG, "FOTA attempt %d/%d failed (%s)", attempt, FOTA_ATTEMPTS,
@@ -679,5 +832,10 @@ bool fota_perform(const char *url, const char *pub_topic,
             }
         }
     }
+    /* The update failed: leave no image file behind. Several failures (a short
+     * UFS file, a read error, a QFOPEN that failed) return without deleting
+     * it, and the caller re-checks the CA file right after this, which needs
+     * the room (alds-sr). */
+    ufs_delete_images();
     return false;
 }

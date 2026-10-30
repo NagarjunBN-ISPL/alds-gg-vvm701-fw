@@ -15,7 +15,9 @@
  *   setcfg_get_text()      strings: not a string, or longer than the field,
  *                          refused — never cut to size;
  *   setcfg_check_members() the payload as a whole: one complete object, only
- *                          known keys, each once, plain values. */
+ *                          known keys, each once, plain values;
+ *   factory_reset_refusal() the reset's two checks: this gateway's own IMEI in
+ *                          "confirm", and no unsent readings unless "force". */
 #include "shim.h"
 #include <ctype.h>
 #define SETCFG_KEYS_MAX 64   /* = main.c's, next to s_setcfg_known_keys */
@@ -198,6 +200,35 @@ int main(void) {
           "a push cut short must not count as one complete object");
     CHECK(!payload_is_one_json_object("{\"duCount\":1}{\"duCount\":2}"), "two objects must be refused");
     CHECK(!payload_is_one_json_object("https://example.com/fw.bin"), "a URL is not a setconfig");
+
+    printf("[9] factory_reset: confirm = this gateway's IMEI, unsent readings only with force\n");
+    const char *imei = "866738089009581";
+    struct { const char *confirm; int unsent; bool force; const char *want; } fr[] = {
+        { "866738089009581",    0, false, NULL },                  /* goes ahead */
+        { "866738089009581",    0, true,  NULL },
+        { "866738089009581",  250, true,  NULL },                  /* forced: discards 250 */
+        { "866738089009581",  250, false, "unsent_readings_250" },
+        { "866738089009581",    1, false, "unsent_readings_1" },
+        { NULL,                 0, false, "confirm_required" },    /* no confirm key */
+        { "",                   0, true,  "confirm_required" },    /* empty never matches */
+        { "865510083149163",    0, false, "confirm_mismatch" },    /* another unit's IMEI */
+        { "86673808900958101",  0, false, "confirm_mismatch" },    /* a nozzle HW_ID, not the IMEI */
+        { "866738089009581 ",   0, false, "confirm_mismatch" },    /* trailing space */
+        { "865510083149163",  250, true,  "confirm_mismatch" },    /* force never excuses the IMEI */
+    };
+    for (size_t i = 0; i < sizeof(fr) / sizeof(fr[0]); i++) {
+        char why[40] = "";
+        const char *r = factory_reset_refusal(fr[i].confirm, imei, fr[i].unsent, fr[i].force,
+                                              why, sizeof(why));
+        CHECK(fr[i].want ? (r && strcmp(r, fr[i].want) == 0) : r == NULL,
+              "confirm '%s' unsent %d force %d -> '%s' (want '%s')", fr[i].confirm ? fr[i].confirm : "(none)",
+              fr[i].unsent, fr[i].force, r ? r : "(go ahead)", fr[i].want ? fr[i].want : "(go ahead)");
+    }
+    char why[40] = "";
+    CHECK(factory_reset_refusal("", "", 0, false, why, sizeof(why)) != NULL,
+          "an empty IMEI must not let an empty confirm through");
+    CHECK(factory_reset_refusal("866738089009581", NULL, 0, false, why, sizeof(why)) != NULL,
+          "no IMEI must refuse, not crash");
 
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;

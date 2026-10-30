@@ -15,7 +15,11 @@
  *   5. setcfg_du_slots()     (EXTRACTED) — duCount is a cross-check, and the
  *                            station scenario: dispensers at slave ids 1, 2, 3,
  *                            the first switched off, the other two still
- *                            publish as 02 and 03.
+ *                            publish as 02 and 03;
+ *   6. nvs_config_clear_equipment() (erase_config) — every equipment field
+ *                            back to its default, the APN/broker run kept byte
+ *                            for byte, and the next boot "unconfigured" on the
+ *                            same network and broker.
  *
  * Every refusal reason is asserted by the token the cloud will see. */
 #include "shim.h"
@@ -455,6 +459,99 @@ static void t_slots(void) {
           "an unrelated push must not touch the slots (got '%s')", err);
 }
 
+/* ── 6. erase_config: the equipment goes, the network and broker stay ───── */
+static void t_erase_config(void) {
+    printf("[6] erase_config: equipment back to defaults, connectivity byte for byte\n");
+    DeviceConfig c, before, def, boot;
+    const char *sfx[] = {"01", "02", "", "04", "", ""};
+    const uint8_t make[] = {DU_MAKE_BLUESKY, DU_MAKE_YENEN, DU_MAKE_BLUESKY,
+                            DU_MAKE_BLUESKY, DU_MAKE_BLUESKY, DU_MAKE_BLUESKY};
+    slots_blob(&c, 6, sfx, make);
+    c.ztech_count   = 2;
+    c.pantech_count = 1;
+    c.genset_type   = GENSET_SEDEMAC;
+    c.genset_model  = 2;
+    c.genset_slave  = 12;
+    c.genset_baud   = 19200;
+    c.di_enable     = 0x0F;
+    c.gps_enable    = true;
+    snprintf(c.sfx_genset,     sizeof(c.sfx_genset),     "12");
+    snprintf(c.sfx_di,         sizeof(c.sfx_di),         "11");
+    snprintf(c.sfx_ztech[0],   sizeof(c.sfx_ztech[0]),   "05");
+    snprintf(c.sfx_pantech[0], sizeof(c.sfx_pantech[0]), "07");
+    /* A station on its own APN and broker, with a rollback copy and a pending
+     * rollback notice: none of it may move. */
+    snprintf(c.apn,                 sizeof(c.apn),                 "custom.apn");
+    snprintf(c.apn_user,            sizeof(c.apn_user),            "u");
+    snprintf(c.apn_pass,            sizeof(c.apn_pass),            "p");
+    snprintf(c.mqtt_host,           sizeof(c.mqtt_host),           "broker.example.com");
+    snprintf(c.mqtt_user,           sizeof(c.mqtt_user),           "site");
+    snprintf(c.mqtt_pass,           sizeof(c.mqtt_pass),           "secret");
+    snprintf(c.mqtt_base_topic,     sizeof(c.mqtt_base_topic),     "client");
+    snprintf(c.apn_bak,             sizeof(c.apn_bak),             "old.apn");
+    snprintf(c.mqtt_host_bak,       sizeof(c.mqtt_host_bak),       "old.example.com");
+    snprintf(c.mqtt_base_topic_bak, sizeof(c.mqtt_base_topic_bak), "oldbase");
+    c.mqtt_port            = 1883;
+    c.mqtt_tls             = false;
+    c.mqtt_port_bak        = 8883;
+    c.mqtt_tls_bak         = true;
+    c.conn_rollback_notify = true;
+    c.cred_fp              = 0x5A5A1234u;
+    memcpy(&before, &c, sizeof(c));
+
+    nvs_config_clear_equipment(&c);
+    nvs_config_defaults(&def);
+
+    CHECK(c.du_count == 0, "duCount must be 0 (got %u)", c.du_count);
+    for (int i = 0; i < DU_MAX_DISPENSERS; i++)
+        CHECK(!c.du_sfx[i][0] && c.du_make[i] == def.du_make[i],
+              "DU slot %d must be OFF with the default make (got '%s', make %u)", i + 1, c.du_sfx[i], c.du_make[i]);
+    CHECK(c.ztech_count == 0 && c.pantech_count == 0, "radar tanks must be 0 (got %u/%u)",
+          c.ztech_count, c.pantech_count);
+    CHECK(c.genset_type == GENSET_OFF && c.genset_model == def.genset_model &&
+          c.genset_slave == def.genset_slave && c.genset_baud == def.genset_baud,
+          "genset must be OFF on the default model/slave/baud (got %u/%u/%u/%lu)", c.genset_type,
+          c.genset_model, c.genset_slave, (unsigned long)c.genset_baud);
+    CHECK(c.di_enable == 0 && !c.gps_enable, "DI and GPS must be off (got 0x%02x, %d)", c.di_enable, c.gps_enable);
+    CHECK(!c.sfx_genset[0] && !c.sfx_di[0], "genset/DI suffixes must be cleared (got '%s'/'%s')",
+          c.sfx_genset, c.sfx_di);
+    for (int i = 0; i < RADAR_MAX; i++)
+        CHECK(!c.sfx_ztech[i][0] && !c.sfx_pantech[i][0] && !c.reserved_sfx[i][0],
+              "tank %d suffixes must be cleared", i + 1);
+    CHECK(c.du_plan == DU_PLAN_SLOTS, "the empty plan must be stored as slots, never as an old list (got %u)",
+          c.du_plan);
+
+    const size_t from = offsetof(DeviceConfig, apn);
+    const size_t to   = offsetof(DeviceConfig, cred_fp) + sizeof(c.cred_fp);
+    CHECK(memcmp((const char *)&c + from, (const char *)&before + from, to - from) == 0,
+          "APN, broker, rollback copy, trial flags and credential stamp must be kept byte for byte");
+    CHECK(strcmp(c.apn, "custom.apn") == 0 && strcmp(c.mqtt_host, "broker.example.com") == 0 &&
+          c.mqtt_port == 1883 && strcmp(c.mqtt_base_topic, "client") == 0 && !c.mqtt_tls &&
+          c.conn_rollback_notify && c.cred_fp == 0x5A5A1234u,
+          "the connectivity values must read back unchanged");
+
+    DeviceConfig again;
+    memcpy(&again, &c, sizeof(c));
+    nvs_config_clear_equipment(&again);
+    CHECK(memcmp(&again, &c, sizeof(c)) == 0, "erasing an erased configuration must change nothing");
+
+    /* The next boot: the saved blob loads as "unconfigured" (main.c's rule),
+     * on the same network and broker. */
+    save_and_load(&c, &boot);
+    CHECK(boot.du_count == 0 && boot.ztech_count == 0 && boot.pantech_count == 0 &&
+          boot.genset_type == GENSET_OFF && !boot.di_enable && !boot.gps_enable,
+          "the next boot must come up unconfigured (du %u zt %u pt %u gen %u di 0x%02x gps %d)",
+          boot.du_count, boot.ztech_count, boot.pantech_count, boot.genset_type, boot.di_enable,
+          boot.gps_enable);
+    for (int i = 0; i < DU_MAX_DISPENSERS; i++)
+        CHECK(!du_slot_on(&boot, i), "after the boot DU slot %d must be OFF", i + 1);
+    CHECK(strcmp(boot.apn, "custom.apn") == 0 && strcmp(boot.mqtt_host, "broker.example.com") == 0 &&
+          boot.mqtt_port == 1883 && strcmp(boot.mqtt_base_topic, "client") == 0 && !boot.mqtt_tls &&
+          strcmp(boot.mqtt_host_bak, "old.example.com") == 0 && boot.cred_fp == 0x5A5A1234u,
+          "after the boot the network and broker must be the ones it had (apn '%s' host '%s' port %u)",
+          boot.apn, boot.mqtt_host, boot.mqtt_port);
+}
+
 int main(void) {
     printf("== alds-gg dispenser plan: slot ON with its suffix, suffix = number = address ==\n");
     t_number();
@@ -462,6 +559,7 @@ int main(void) {
     t_validator();
     t_setcfg();
     t_slots();
+    t_erase_config();
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

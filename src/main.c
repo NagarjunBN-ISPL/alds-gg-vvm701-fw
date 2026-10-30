@@ -223,7 +223,7 @@ static void build_topics(void) {
      *     fixes. The record stream the cloud stores.
      *   <base>/logs (e.g. "gogas/logs") — everything else: the diagnostics
      *     report, every lifecycle "status" (ready/unconfigured, restarting,
-     *     factory_resetting, connectivity_rollback, firmware_credentials_
+     *     erasing_config, factory_resetting, connectivity_rollback, firmware_credentials_
      *     applied), every setconfig reply (config_received/_successful/
      *     _failed, config_report) and every FOTA status. Split 2026-10-16
      *     (btpl's layout) so /data carries device readings only. The broker
@@ -263,6 +263,9 @@ static void mqtt_reconnect_if_needed(void);
 static void poll_incoming_mqtt(void);
 static bool ota_is_pending_verify(void);
 static void ota_confirm_before_restart(const char *why);
+static void fota_owed_answers_drop(void);
+static void fota_failed_owe(const char *json);
+static void publish_fota_failed_owed(void);
 
 /* ── Fruitless-restart cap ─────────────────────────────────────────────────
  * Every self-restart this firmware performs for a NETWORK reason — the boot
@@ -378,6 +381,33 @@ static bool json_get_str(const char *json, const char *key,
                 case '"':  c = '"';  break;
                 case '\\': c = '\\'; break;
                 case '/':  c = '/';  break;
+                case 'u': {
+                    /* \uXXXX, which Go, .NET and HTML-safe JSON encoders write
+                     * for '&', '<', '>', '=' and '+' — "\u0026" between the
+                     * parameters of a presigned link. Decoded only when it is
+                     * printable ASCII; anything else (a NUL, a control byte, a
+                     * non-ASCII character) keeps the old result, the 'u'
+                     * literally. Each hex digit is read only after the one
+                     * before it was one, so this never reads past the string. */
+                    unsigned v = 0;
+                    int k = 1;
+                    for (; k <= 4; k++) {
+                        const char h = p[k];
+                        unsigned d;
+                        if      (h >= '0' && h <= '9') d = (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') d = (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') d = (unsigned)(h - 'A' + 10);
+                        else break;
+                        v = v * 16u + d;
+                    }
+                    if (k == 5 && v >= 0x20 && v <= 0x7E) {
+                        c = (char)v;
+                        p += 4;                   /* the p++ below steps past the last digit */
+                    } else {
+                        c = 'u';
+                    }
+                    break;
+                }
                 default:   c = *p;   break;   /* unknown escape: keep the char literal */
             }
         } else {
@@ -594,7 +624,9 @@ static bool setcfg_has_secret(const char *json) {
 
 /* Parse a JSON boolean. Accepts true/false and 1/0 — an atoi()-style reader
  * can't be used here because atoi("true") is 0, i.e. it can't tell true from
- * false. */
+ * false — bare or quoted: some cloud libraries write "true" as a string, and
+ * the only readers (FOTA's "force" and "handover") would otherwise take a
+ * deliberate swap for a refusal. */
 static bool json_get_bool(const char *json, const char *key, bool def) {
     char search[64];
     snprintf(search, sizeof(search), "\"%s\":", key);
@@ -602,6 +634,7 @@ static bool json_get_bool(const char *json, const char *key, bool def) {
     if (!p) return def;
     p += strlen(search);
     while (*p == ' ') p++;
+    if (*p == '"') p++;
     if (*p == 't' || *p == 'T' || *p == '1') return true;
     if (*p == 'f' || *p == 'F' || *p == '0') return false;
     return def;
@@ -629,23 +662,27 @@ static const char * const s_setcfg_known_keys[] = {
     "apn","apnUser","apnPass",
     "mqttHost","mqttPort","mqttUser","mqttPass","mqttBaseTopic","mqttTls",
 };
-/* The read-only keys of a config_report. A report can be copied, edited and
- * sent back as a setconfig (passwords are reported only as *Set booleans for
- * exactly that reason), so these are accepted and IGNORED — they set nothing
- * and do not count as config keys. */
-static const char * const s_setcfg_report_keys[] = {
+/* Keys the member check accepts that are not config keys and set nothing:
+ *  - the read-only keys of a config_report. A report can be copied, edited and
+ *    sent back as a setconfig (passwords are reported only as *Set booleans
+ *    for exactly that reason), so these are accepted and IGNORED;
+ *  - factory_reset's arguments, "confirm" and "force". parse_setconfig()
+ *    reads them for that command only; with any other payload it refuses them
+ *    as unknown_key_confirm / unknown_key_force, as before they existed. */
+static const char * const s_setcfg_extra_keys[] = {
     "HW_ID", "status", "fw", "apnPassSet", "mqttPassSet", "connPending",
+    "confirm", "force",
 };
 #define SETCFG_KEYS_MAX 64
 _Static_assert(sizeof(s_setcfg_known_keys) / sizeof(s_setcfg_known_keys[0]) +
-               sizeof(s_setcfg_report_keys) / sizeof(s_setcfg_report_keys[0]) < SETCFG_KEYS_MAX,
+               sizeof(s_setcfg_extra_keys) / sizeof(s_setcfg_extra_keys[0]) < SETCFG_KEYS_MAX,
                "setcfg_check_members() tracks at most SETCFG_KEYS_MAX - 1 keys");
 
 /* Walks the top level of a setconfig payload — already proven ONE complete
  * JSON object by payload_is_one_json_object() — and checks every member: a key
  * from `keys` or `extra` (or "cmd"), named only once, holding a plain value (a
  * string, or a bare number / true / false). The typed readers then judge each
- * value; `extra` keys are read by nobody (s_setcfg_report_keys).
+ * value; `extra` keys set no configuration (s_setcfg_extra_keys).
  *
  * Refusing an unknown key is the point: the readers look keys up by name, so a
  * typo ("du1make", "gpsenable") used to be skipped without a word and the push
@@ -979,6 +1016,24 @@ static void setcfg_fail(const char *reason) {
     mqtt_publish(t_logs, err);
 }
 
+/* factory_reset's two checks, because nothing it erases can be undone. The
+ * refusal reason, or NULL when the reset may go ahead:
+ *   confirm  must be this gateway's own IMEI — a reset published to the wrong
+ *            unit's topic, or copied from another unit's page, wipes nothing;
+ *   unsent   readings still queued are sales not yet delivered: refused, with
+ *            the count, unless the push says "force":true to discard them.
+ * `why` holds the counted reason. Pure, so the host tests run it. */
+static const char *factory_reset_refusal(const char *confirm, const char *imei, int unsent,
+                                         bool force, char *why, size_t why_size) {
+    if (!confirm || !confirm[0])             return "confirm_required";
+    if (!imei || strcmp(confirm, imei) != 0) return "confirm_mismatch";
+    if (unsent > 0 && !force) {
+        snprintf(why, why_size, "unsent_readings_%d", unsent);
+        return why;
+    }
+    return NULL;
+}
+
 static const char *du_make_str(uint8_t make) {
     if (make == DU_MAKE_BLUESKY) return "bluesky";
     if (make == DU_MAKE_YENEN)   return "yenen";
@@ -1060,8 +1115,8 @@ static void parse_setconfig(const char *json) {
     }
     if (!setcfg_check_members(json, s_setcfg_known_keys,
                               sizeof(s_setcfg_known_keys) / sizeof(s_setcfg_known_keys[0]),
-                              s_setcfg_report_keys,
-                              sizeof(s_setcfg_report_keys) / sizeof(s_setcfg_report_keys[0]),
+                              s_setcfg_extra_keys,
+                              sizeof(s_setcfg_extra_keys) / sizeof(s_setcfg_extra_keys[0]),
                               verr, sizeof(verr))) {
         ESP_LOGW(TAG, "setconfig: rejected — %s", verr);
         setcfg_fail(verr);
@@ -1092,11 +1147,25 @@ static void parse_setconfig(const char *json) {
         setcfg_fail("cmd_must_be_sent_alone");
         return;
     }
+    /* "confirm" and "force" belong to factory_reset alone (s_setcfg_extra_keys
+     * lets them through the member check for it). Anywhere else they are
+     * refused as the unknown keys they were before. */
+    if (!(cmd_present && strcmp(cmdbuf, "factory_reset") == 0)) {
+        const char *stray = json_has_key(json, "confirm") ? "unknown_key_confirm"
+                          : json_has_key(json, "force")   ? "unknown_key_force"
+                          : NULL;
+        if (stray) {
+            ESP_LOGW(TAG, "setconfig: rejected — %s", stray);
+            setcfg_fail(stray);
+            return;
+        }
+    }
     if (cmd_present) {
         /* One-shot commands: a RETAINED copy would re-run them on every
          * reconnect (a reboot loop, a wipe on every boot). Dropped inside the
          * grace window with an ack that says why — see CMD_RETAIN_GRACE_MS. */
-        if ((strcmp(cmdbuf, "restart") == 0 || strcmp(cmdbuf, "factory_reset") == 0) &&
+        if ((strcmp(cmdbuf, "restart") == 0 || strcmp(cmdbuf, "erase_config") == 0 ||
+             strcmp(cmdbuf, "factory_reset") == 0) &&
             cmd_in_retain_grace(cmdbuf)) {
             char ack[160];
             snprintf(ack, sizeof(ack),
@@ -1119,16 +1188,81 @@ static void parse_setconfig(const char *json) {
             du_task_flush_to_store();
             esp_restart();
         }
-        if (strcmp(cmdbuf, "factory_reset") == 0) {
-            ESP_LOGI(TAG, "Factory reset");
-            /* ACK before wiping NVS + rebooting, same reasoning as restart. */
+        if (strcmp(cmdbuf, "erase_config") == 0) {
+            /* The station's equipment configuration only — dispenser slots,
+             * radar tanks, genset, DI, GPS and their suffixes, all back to OFF
+             * (nvs_config_clear_equipment). The APN and broker are kept, so the
+             * gateway comes back on the network and broker it is on now,
+             * "unconfigured", ready for the station's new setconfig. Also kept:
+             * the unsent readings (the RAM ones go to flash first, as on a
+             * restart, and all of them are delivered after it), the FOTA URL
+             * memory and the boot counter. Saved BEFORE the ack, as a setconfig
+             * is, so "erasing_config" is only ever said for a stored erase. */
+            DeviceConfig nc;
+            memcpy(&nc, &g_cfg, sizeof(nc));
+            nvs_config_clear_equipment(&nc);
+            if (!nvs_config_save(&nc)) {
+                ESP_LOGE(TAG, "erase_config: NVS save failed — configuration left as it was");
+                setcfg_fail("nvs_save_failed");
+                return;
+            }
+            ESP_LOGW(TAG, "Remote erase_config — equipment configuration erased, restarting");
             char ack[128];
             snprintf(ack, sizeof(ack),
-                     "{\"HW_ID\":\"%s\",\"status\":\"factory_resetting\"}", g_imei);
+                     "{\"HW_ID\":\"%s\",\"status\":\"erasing_config\"}", g_imei);
             mqtt_publish(t_logs, ack);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            ota_confirm_before_restart("erase config");
+            du_task_flush_to_store();
+            esp_restart();
+        }
+        if (strcmp(cmdbuf, "factory_reset") == 0) {
+            /* Everything this gateway has stored goes: the configuration, the
+             * unsent readings (flash and RAM), the FOTA URL memory and the boot
+             * counter. Kept: the installed firmware and the compiled-in
+             * APN/broker it comes back on, "unconfigured", as a freshly flashed
+             * unit does. Only past factory_reset_refusal()'s two checks. */
+            char confirm[24] = "";
+            bool confirm_present = false, force = false;
+            if (!setcfg_get_text(json, "confirm", confirm, sizeof(confirm), &confirm_present,
+                                 verr, sizeof(verr)) ||
+                !setcfg_get_bool(json, "force", &force, verr, sizeof(verr))) {
+                ESP_LOGW(TAG, "factory_reset: rejected — %s", verr);
+                setcfg_fail(verr);
+                return;
+            }
+            int  unsent = store_pending();
+            char why[40];
+            const char *refusal = factory_reset_refusal(confirm, g_imei, unsent, force,
+                                                        why, sizeof(why));
+            if (refusal) {
+                ESP_LOGW(TAG, "factory_reset: rejected — %s", refusal);
+                setcfg_fail(refusal);
+                return;
+            }
+            /* The queue first, the configuration last, and no RAM spill. A
+             * queue that cannot be emptied stops the reset here, with nothing
+             * erased; cut short after it, the gateway comes back still
+             * configured and says "ready" — visibly not reset, so the command
+             * is sent again — and never "unconfigured" while still holding the
+             * old station's readings. */
+            int discarded = unsent + du_task_pending();
+            if (store_ready() && !store_purge()) {
+                ESP_LOGE(TAG, "factory_reset: the unsent readings could not be erased — nothing erased");
+                setcfg_fail("store_purge_failed");
+                return;
+            }
+            ESP_LOGW(TAG, "Remote factory_reset — erasing everything, %d unsent reading(s) discarded",
+                     discarded);
+            /* ACK before wiping NVS + rebooting, same reasoning as restart. */
+            char ack[160];
+            snprintf(ack, sizeof(ack),
+                     "{\"HW_ID\":\"%s\",\"status\":\"factory_resetting\",\"discarded\":%d}",
+                     g_imei, discarded);
+            mqtt_publish(t_logs, ack);
+            vTaskDelay(pdMS_TO_TICKS(500));
             ota_confirm_before_restart("factory reset");
             nvs_config_factory_reset();
-            vTaskDelay(pdMS_TO_TICKS(500));
             esp_restart();
         }
         /* Pure read — publishes current config and returns WITHOUT touching
@@ -1137,6 +1271,20 @@ static void parse_setconfig(const char *json) {
         if (strcmp(cmdbuf, "getconfig") == 0) {
             ESP_LOGI(TAG, "Remote getconfig");
             publish_config_report();
+            return;
+        }
+        /* Pure read too: the diagnostics report (guide 4.2) now instead of at
+         * the end of its window. It IS that report — the window counters clear
+         * on a confirmed publish and the next periodic one follows a full
+         * DIAG_CYCLE_INTERVAL later — so every report still covers exactly the
+         * time since the one before it. */
+        if (strcmp(cmdbuf, "diagnostics") == 0) {
+            ESP_LOGI(TAG, "Remote diagnostics");
+            char ts[32];
+            rtc_timestamp(ts, sizeof(ts));
+            forensics_mark(FSLOT_MAIN, F_DIAG, 0);
+            diag_publish(g_imei, ts, t_logs);
+            g_diag_cycle = 0;
             return;
         }
         ESP_LOGW(TAG, "setconfig: rejected — unknown cmd '%s'", cmdbuf);
@@ -1510,6 +1658,29 @@ static void tunnel_accept(int unit, uint8_t kind, const char *payload) {
     }
 }
 
+/* The running image's build id — the app version the build stamps in
+ * (git describe, e.g. "4ab54b7" or "v1.0.1"; "-dirty" when built from
+ * uncommitted code). Sent beside "fw" so the cloud can tell two builds apart
+ * even when FW_VERSION was not bumped. Never contains a quote. */
+static const char *running_build(void) {
+    const esp_app_desc_t *d = esp_app_get_description();
+    return (d && d->version[0]) ? d->version : "unknown";
+}
+
+/* An update refused without being started: its answer on /logs. Not sent
+ * while the running image is still on trial — the push in flight then is the
+ * update that brought it, whose one answer is that update's own
+ * (check_post_ota, or a rollback), and a refusal of a stray copy (retained,
+ * re-delivered) would be read as that push's answer. */
+static void fota_refusal_publish(const char *json) {
+    if (ota_is_pending_verify()) {
+        ESP_LOGW(TAG, "FOTA: refusal not sent — the new image is on trial and its update "
+                      "is the push in flight: %s", json);
+        return;
+    }
+    mqtt_publish(t_logs, json);
+}
+
 /* ── MQTT message router ──────────────────────────────────────────────── */
 static void handle_msg(const char *topic, const char *payload) {
     /* An OFF dispenser slot's command topics are "" (build_topics), so an empty
@@ -1524,34 +1695,51 @@ static void handle_msg(const char *topic, const char *payload) {
         char url_buf[FOTA_URL_MAX + 2] = {0};
         const char *url_to_use = payload;
         bool force = false;
-        char fota_msg[160];
+        bool handover_ok = false;
+        char fota_msg[224];
 
-        /* ── Retained-message backstop #1: the grace window ──────────────────
-         * A retained URL is re-delivered on every reconnect, and the FOTA path
-         * tears MQTT down for minutes each time. Dropped, with an ack that
-         * names the cause, if it lands right after subscribing. */
-        if (cmd_in_retain_grace(fleet ? "fleet update" : "update")) {
-            snprintf(fota_msg, sizeof(fota_msg),
-                     "{\"HW_ID\":\"%s\",\"status\":\"fota_ignored_retained\"}", g_imei);
-            mqtt_publish(t_logs, fota_msg);
-            return;
-        }
+        /* ── What the cloud hears back ───────────────────────────────────────
+         * The cloud stops waiting on a push at the first message whose status
+         * is fota_successful or fota_failed, so every push this unit takes gets
+         * exactly one of those two on /logs, with the detail in "reason";
+         * fota_initiated is the only progress message. fota_successful comes
+         * from the new image once it has confirmed itself after the reboot
+         * (check_post_ota), never before it: a rollback must not follow a
+         * success. A refusal is answered through fota_refusal_publish(), which
+         * stays quiet while the new image is on trial. The checks of what a URL
+         * already did (backstop #1) run BEFORE the retained-message window
+         * (backstop #2), so a copy of an update this gateway knows gets that
+         * update's answer rather than "retained". Every check only skips, so
+         * their order changes the answer, never what the unit does. */
 
         /* Two payload forms: a bare URL, or JSON —
-         *   {"url":"https://...","target":"gg","force":true}
+         *   {"url":"https://...","target":"gg","force":true,"handover":true}
          * target: a fleet message meant for another product is ignored. GG
          *         and GGY share one base topic in production, so with a
          *         mistyped fleet topic this belt is what keeps a GGY image off
          *         a GG unit. An absent target is accepted (bare URL contract).
          * force:  re-apply a URL this gateway has already applied, one whose
          *         image was rolled back, or one that failed earlier this boot
-         *         (all three guards below). Operator-only. */
+         *         (all three guards below). Operator-only.
+         * handover: the link may be ANOTHER product's firmware (a deliberate
+         *         swap). Without it such an image is refused as
+         *         not_this_product (fota.c), so a wrong file cannot convert a
+         *         station. A bare URL never allows it. */
         if (payload[0] == '{') {
             char target[32] = "";
             if (json_get_str(payload, "target", target, sizeof(target)) && target[0]) {
                 if (!streq_ci(target, "gg") && !streq_ci(target, "alds-gg") &&
-                    !streq_ci(target, "alds-gg-vvm701")) {
+                    !streq_ci(target, "alds-gg-vvm701") &&
+                    !streq_ci(target, "alds-gg-vvm701-fw")) {
                     ESP_LOGI(TAG, "FOTA target '%s' is not this product (gg) — ignored", target);
+                    /* On this unit's own topic it is a push the cloud waits on;
+                     * a fleet message for another product is not ours to answer. */
+                    if (!fleet) {
+                        snprintf(fota_msg, sizeof(fota_msg),
+                                 "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"wrong_target\"}",
+                                 g_imei);
+                        fota_refusal_publish(fota_msg);
+                    }
                     return;
                 }
             }
@@ -1559,14 +1747,15 @@ static void handle_msg(const char *topic, const char *payload) {
                 ESP_LOGW(TAG, "FOTA JSON payload missing 'url'");
                 snprintf(fota_msg, sizeof(fota_msg),
                          "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"no_url\"}", g_imei);
-                mqtt_publish(t_logs, fota_msg);
+                fota_refusal_publish(fota_msg);
                 return;
             }
-            url_to_use = url_buf;
-            force = json_get_bool(payload, "force", false);
+            url_to_use  = url_buf;
+            force       = json_get_bool(payload, "force", false);
+            handover_ok = json_get_bool(payload, "handover", false);
         }
 
-        /* ── Retained-message backstop #2: what this URL already did ─────────
+        /* ── Retained-message backstop #1: what this URL already did ─────────
          * The grace window is a heuristic; this is the memory. Every URL that
          * SUCCEEDED is recorded in NVS before the restart it triggers, so the
          * image that boots next — same NVS — recognises its own URL and skips
@@ -1584,11 +1773,16 @@ static void handle_msg(const char *topic, const char *payload) {
             ESP_LOGW(TAG, "FOTA: this URL was already %s on this gateway — skipping "
                           "(publish a new URL, or the same one with \"force\":true)",
                      st == FOTA_URL_APPLIED ? "applied" : "applied and rolled back");
+            /* Already installed is the outcome the push asked for. A copy of
+             * the update still on trial gets no answer here (see
+             * fota_refusal_publish): check_post_ota() gives that push's. */
             snprintf(fota_msg, sizeof(fota_msg),
-                     "{\"HW_ID\":\"%s\",\"status\":\"%s\",\"fw\":\"%s\"}", g_imei,
+                     "{\"HW_ID\":\"%s\",\"status\":\"%s\",\"reason\":\"%s\",\"fw\":\"%s\","
+                     "\"build\":\"%.32s\"}", g_imei,
+                     st == FOTA_URL_APPLIED ? "fota_successful" : "fota_failed",
                      st == FOTA_URL_APPLIED ? "fota_skip_already_applied" : "fota_skip_reverted",
-                     FW_VERSION);
-            mqtt_publish(t_logs, fota_msg);
+                     FW_VERSION, running_build());
+            fota_refusal_publish(fota_msg);
             return;
         }
 
@@ -1611,15 +1805,30 @@ static void handle_msg(const char *topic, const char *payload) {
             snprintf(fota_msg, sizeof(fota_msg),
                      "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"url_too_long\"}",
                      g_imei);
-            mqtt_publish(t_logs, fota_msg);
+            fota_refusal_publish(fota_msg);
             return;
         }
         if (!force && s_fota_blocked[0] && strcmp(url_to_use, s_fota_blocked) == 0) {
             ESP_LOGW(TAG, "FOTA: identical URL already failed this boot — skipping "
                           "(clear the retained message, publish a new URL, or force)");
             snprintf(fota_msg, sizeof(fota_msg),
-                     "{\"HW_ID\":\"%s\",\"status\":\"fota_skip_known_bad\"}", g_imei);
-            mqtt_publish(t_logs, fota_msg);
+                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"fota_skip_known_bad\"}",
+                     g_imei);
+            fota_refusal_publish(fota_msg);
+            return;
+        }
+
+        /* ── Retained-message backstop #2: the grace window ──────────────────
+         * A retained URL is re-delivered on every reconnect, and the FOTA path
+         * tears MQTT down for minutes each time. Dropped, with an answer that
+         * names the cause, if it lands right after subscribing. After
+         * backstop #1, so a copy of a URL this gateway already knows has had
+         * that URL's own answer above. */
+        if (cmd_in_retain_grace(fleet ? "fleet update" : "update")) {
+            snprintf(fota_msg, sizeof(fota_msg),
+                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"fota_ignored_retained\"}",
+                     g_imei);
+            fota_refusal_publish(fota_msg);
             return;
         }
 
@@ -1640,8 +1849,22 @@ static void handle_msg(const char *topic, const char *payload) {
             }
         }
 
+        /* esp_ota_begin() REFUSES an update while the running image is still
+         * PENDING_VERIFY (ESP_ERR_OTA_ROLLBACK_INVALID_STATE). Receiving and
+         * acting on this command proves the image alive as surely as the
+         * poll cycle that normally confirms it — same argument as the other
+         * deliberate-restart paths. */
+        ota_confirm_before_restart("fota requested");
+        /* This push supersedes any answer still owed to an EARLIER one (the
+         * confirm just above creates one when the image was on trial): the
+         * messages carry no push id, so one sent from here on would be read as
+         * THIS push's answer. Dropped, not sent. */
+        fota_owed_answers_drop();
+
         /* Last message before MQTT is torn down for the HTTP download — the
-         * device goes radio-silent until fota_successful/fota_failed. */
+         * device goes radio-silent until this push's answer: fota_failed from
+         * here, or fota_successful from the new image once it has confirmed
+         * itself after the reboot. */
         snprintf(fota_msg, sizeof(fota_msg),
                  "{\"HW_ID\":\"%s\",\"status\":\"fota_initiated\"}", g_imei);
         mqtt_publish(t_logs, fota_msg);
@@ -1656,15 +1879,9 @@ static void handle_msg(const char *topic, const char *payload) {
         mqtt_disconnect();
         vTaskDelay(pdMS_TO_TICKS(1000));
 
-        /* esp_ota_begin() REFUSES an update while the running image is still
-         * PENDING_VERIFY (ESP_ERR_OTA_ROLLBACK_INVALID_STATE). Receiving and
-         * acting on this command proves the image alive as surely as the
-         * poll cycle that normally confirms it — same argument as the other
-         * deliberate-restart paths. */
-        ota_confirm_before_restart("fota requested");
-
         char fota_reason[48] = "unknown";
-        bool fota_ok = fota_perform(url_to_use, t_logs, fota_reason, sizeof(fota_reason));
+        bool fota_ok = fota_perform(url_to_use, t_logs, fota_reason, sizeof(fota_reason),
+                                    handover_ok);
 
         led_blink_stop();   /* FOTA end — back to per-push blinks / reboot */
 
@@ -1672,29 +1889,36 @@ static void handle_msg(const char *topic, const char *payload) {
             const bool foreign = fota_last_image_foreign();
 
             /* Remember the URL BEFORE the restart — the next boot is what
-             * has to recognise it (backstop #2 above). Recorded for a
+             * has to recognise it (backstop #1 above). Recorded for a
              * cross-product handover too: the incoming firmware never reads
              * it, but if the bootloader throws that image away and falls
-             * back to us, it is what turns a retained copy of the URL into
+             * back to us, it is what answers a retained copy of the URL with
              * fota_skip_reverted instead of another download-and-rollback. */
             nvs_fota_url_set(this_fp, FOTA_URL_APPLIED);
 
-            /* Boot partition already set — reconnect just to notify, then
-             * restart into the new image regardless of publish success.
-             * Try twice: the first QMTOPEN right after the HTTP session
-             * teardown can transiently fail (seen in the field: 0,1). */
-            for (int i = 0; i < 2; i++) {
-                if (mqtt_connect()) {
-                    snprintf(fota_msg, sizeof(fota_msg),
-                             "{\"HW_ID\":\"%s\",\"status\":\"fota_successful\",\"handover\":%s}",
-                             g_imei, foreign ? "true" : "false");
-                    mqtt_publish(t_logs, fota_msg);
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(3000));
-            }
+            /* Boot partition already set. An update of this product is answered
+             * by the new image — fota_successful once it has confirmed itself
+             * (check_post_ota), or fota_failed from this one if the bootloader
+             * rolls it back — so nothing is sent now. A cross-product handover
+             * is the exception: the incoming firmware reports on its own
+             * product's topics, never here, so this is the last chance for this
+             * push to be answered — reconnect just for that, then restart
+             * regardless of publish success. Try twice: the first QMTOPEN right
+             * after the HTTP session teardown can transiently fail (seen in the
+             * field: 0,1). */
             if (foreign) {
+                for (int i = 0; i < 2; i++) {
+                    if (mqtt_connect()) {
+                        snprintf(fota_msg, sizeof(fota_msg),
+                                 "{\"HW_ID\":\"%s\",\"status\":\"fota_successful\","
+                                 "\"reason\":\"handover\",\"handover\":true}", g_imei);
+                        mqtt_publish(t_logs, fota_msg);
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                }
+
                 /* Leave the MODEM neutral for the incoming product. With
                  * gpsEnable on, this firmware saved autogps/AGPS on in the
                  * modem's own NVRAM, and those switches outlive the app: a
@@ -1723,12 +1947,24 @@ static void handle_msg(const char *topic, const char *payload) {
         strncpy(s_fota_blocked, url_to_use, sizeof(s_fota_blocked) - 1);
         s_fota_blocked[sizeof(s_fota_blocked) - 1] = '\0';
 
+        /* This push's answer. Kept until a publish goes through: if this
+         * reconnect fails, the poll loop sends it once the ladder has the
+         * broker back, rather than the cloud never hearing why. Sent before
+         * the subscriptions, so it precedes the answer to any retained copy
+         * they bring back. */
+        snprintf(fota_msg, sizeof(fota_msg),
+                 "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"%s\"}",
+                 g_imei, fota_reason);
+        fota_failed_owe(fota_msg);
+        /* The CA file before the reconnect: an attempt that power-cycled the
+         * modem uploaded it again mid-update, and one cut short there would
+         * leave every TLS connect failing until the next boot (tls_ca.c).
+         * fota_perform() has already deleted its image file, which is what
+         * makes room for it. */
+        tls_ca_ensure();
         if (mqtt_connect()) {
+            publish_fota_failed_owed();
             subscribe_all();
-            snprintf(fota_msg, sizeof(fota_msg),
-                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"%s\"}",
-                     g_imei, fota_reason);
-            mqtt_publish(t_logs, fota_msg);
         } else {
             mqtt_reconnect_if_needed();
         }
@@ -1854,8 +2090,9 @@ static bool ota_is_pending_verify(void) {
  * The bootloader writes ABORTED into the other slot's otadata entry when an
  * image reached PENDING_VERIFY and reset without confirming itself — that is
  * the only trace a silent rollback leaves. Read once at boot, surfaced to the
- * cloud as fota_reverted (cng-cpil does the same), and used to flip the
- * remembered URL to REVERTED so a retained copy cannot loop the download.
+ * cloud as fota_failed with reason fota_reverted (cng-cpil reports it too),
+ * and used to flip the remembered URL to REVERTED so a retained copy cannot
+ * loop the download.
  * esp_ota_get_last_invalid_partition() keeps answering until that slot is
  * written again, so the URL state transition is what makes this fire once. */
 static char s_reverted_image[36] = "";
@@ -1876,8 +2113,27 @@ static void note_reverted_image_at_boot(void) {
                   "— its URL is now refused unless re-sent with force", s_reverted_image, bad->label);
 }
 
+/* The final fota_successful is the cloud's only proof that an update took.
+ * The image confirms itself on its first poll cycle whether or not the link is
+ * up (a weak site must not roll a good update back), so the answer can find no
+ * broker at that moment — it is then kept and re-sent each cycle until a
+ * publish is confirmed. It is also owed when ota_confirm_before_restart()
+ * confirms the image instead, and the restart right after it would swallow
+ * it: a setconfig pushed straight after an update, and the cloud never hears
+ * that the update took. So the debt is kept in RTC memory too, which survives
+ * esp_restart() (not a power cut), and the next boot of the same image —
+ * confirmed by then — pays it (app_main). Same as alds-sr. */
+#define FOTA_OWED_MAGIC 0x464F5441u   /* "FOTA" */
+RTC_NOINIT_ATTR static uint32_t s_fota_owed;
+static bool s_fota_completed_unsent = false;
+
+static void fota_completed_owe(bool owed) {
+    s_fota_completed_unsent = owed;
+    s_fota_owed             = owed ? FOTA_OWED_MAGIC : 0;
+}
+
 /* Every DELIBERATE restart this firmware performs on a cloud command
- * (setconfig save, restart, factory_reset, a FOTA it just applied) goes
+ * (setconfig save, restart, erase_config, factory_reset, a FOTA it just applied) goes
  * through here first. An OTA image that has not confirmed itself yet is
  * thrown away by the bootloader on the next reset — so a setconfig pushed the
  * moment a freshly swapped gateway announced "unconfigured", before its first
@@ -1887,36 +2143,62 @@ static void note_reverted_image_at_boot(void) {
  * confirms it, so confirm here rather than let the restart undo the update. */
 static void ota_confirm_before_restart(const char *why) {
     if (!ota_is_pending_verify()) return;
-    esp_ota_mark_app_valid_cancel_rollback();
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not confirm the pending OTA image before a deliberate restart "
+                      "(%s): %s — that restart will roll the update back", why, esp_err_to_name(err));
+        return;
+    }
+    fota_completed_owe(true);
     ESP_LOGW(TAG, "confirmed the pending OTA image before a deliberate restart (%s) — "
                   "a restart of an unconfirmed image would roll it back", why);
 }
 
-/* fota_completed is the cloud's only proof that an update took. The image
- * confirms itself on its first poll cycle whether or not the link is up (a
- * weak site must not roll a good update back), so the notice can find no
- * broker at that moment — it is then kept and re-sent each cycle until a
- * publish is confirmed. */
-static bool s_fota_completed_unsent = false;
-
 static void publish_fota_completed(void) {
     if (!s_fota_completed_unsent || !mqtt_is_connected()) return;
-    char msg[128];
+    char msg[192];
     snprintf(msg, sizeof(msg),
-             "{\"HW_ID\":\"%s\",\"status\":\"fota_completed\",\"fw\":\"%s\"}",
-             g_imei, FW_VERSION);
-    if (mqtt_publish(t_logs, msg)) s_fota_completed_unsent = false;
+             "{\"HW_ID\":\"%s\",\"status\":\"fota_successful\",\"reason\":\"update_confirmed\","
+             "\"fw\":\"%s\",\"build\":\"%.32s\"}", g_imei, FW_VERSION, running_build());
+    if (mqtt_publish(t_logs, msg)) fota_completed_owe(false);
 }
 
-static void check_post_ota(void) {
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_img_states_t   state;
-    if (esp_ota_get_state_partition(running, &state) == ESP_OK
-        && state == ESP_OTA_IMG_PENDING_VERIFY) {
-        esp_ota_mark_app_valid_cancel_rollback();
-        s_fota_completed_unsent = true;
-        publish_fota_completed();
+/* A final fota_failed that found no broker: why a download failed (when the
+ * reconnect after it failed too), or a rollback noticed at boot. Kept, like
+ * the success above, until a publish goes through. RAM only: a restart before
+ * then loses it, and the cloud's own timeout is what answers that push. */
+static char s_fota_failed_unsent[200] = "";
+
+static void fota_failed_owe(const char *json) {
+    snprintf(s_fota_failed_unsent, sizeof(s_fota_failed_unsent), "%s", json ? json : "");
+}
+
+static void publish_fota_failed_owed(void) {
+    if (!s_fota_failed_unsent[0] || !mqtt_is_connected()) return;
+    if (mqtt_publish(t_logs, s_fota_failed_unsent)) s_fota_failed_unsent[0] = '\0';
+}
+
+/* A new push supersedes every answer still owed to earlier ones (handle_msg). */
+static void fota_owed_answers_drop(void) {
+    fota_completed_owe(false);
+    s_fota_failed_unsent[0] = '\0';
+}
+
+/* Confirms a freshly flashed image. True when there is nothing left to do —
+ * the image was not pending, or the mark took — so the caller stops calling.
+ * A failed mark is retried next cycle rather than announced: fota_successful
+ * for an image the bootloader would still roll back is a lie (alds-sr). */
+static bool check_post_ota(void) {
+    if (!ota_is_pending_verify()) return true;
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not confirm the new image (%s) — retrying next cycle",
+                 esp_err_to_name(err));
+        return false;
     }
+    fota_completed_owe(true);
+    publish_fota_completed();
+    return true;
 }
 
 /* ── Publish dispenser data ────────────────────────────────────────
@@ -2927,6 +3209,14 @@ void app_main(void) {
         ESP_LOGW(TAG, "running an UNCONFIRMED OTA image — network faults will not "
                       "restart until the first poll cycle confirms it");
 
+    /* A fota_successful the previous boot owed when it restarted (see
+     * s_fota_owed) — paid by this one if it runs that same image, confirmed.
+     * An image still pending is a NEW update: its own confirm announces it. */
+    if (s_fota_owed == FOTA_OWED_MAGIC && !pending_verify)
+        s_fota_completed_unsent = true;          /* s_fota_owed stays until it is sent */
+    else
+        s_fota_owed = 0;
+
     bool creds_forced = false, creds_new_dest = false;
     if (nvs_config_enforce_firmware_creds(&g_cfg, &creds_new_dest)) {
         creds_forced = true;
@@ -3279,14 +3569,15 @@ void app_main(void) {
     mqtt_publish(t_logs, ready_msg);
 
     /* The previous update was thrown away by the bootloader (see
-     * note_reverted_image_at_boot). Best effort: if the link is not up yet the
-     * console line and the refused-URL state are what remain. */
+     * note_reverted_image_at_boot) — that push's answer. Kept until a publish
+     * goes through (the poll loop retries it) rather than tried once. */
     if (s_reverted_image[0]) {
         char rv[200];
         snprintf(rv, sizeof(rv),
-                 "{\"HW_ID\":\"%s\",\"status\":\"fota_reverted\",\"image\":\"%s\",\"fw\":\"%s\"}",
-                 g_imei, s_reverted_image, FW_VERSION);
-        mqtt_publish(t_logs, rv);
+                 "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"fota_reverted\","
+                 "\"image\":\"%s\",\"fw\":\"%s\"}", g_imei, s_reverted_image, FW_VERSION);
+        fota_failed_owe(rv);
+        publish_fota_failed_owed();
     }
 
     /* Announce a credential takeover to whoever the device now reports to. On a
@@ -3334,11 +3625,12 @@ void app_main(void) {
              * image survived a real pass through dispenser/radar/genset/DI
              * polling without crashing. That's the actual bar for "this
              * build works", so only now do we cancel the bootloader
-             * rollback and tell the cloud fota_completed. */
-            check_post_ota();
-            post_ota_checked = true;
+             * rollback and tell the cloud fota_successful (a mark that did
+             * not take is retried next cycle — check_post_ota). */
+            post_ota_checked = check_post_ota();
         }
-        publish_fota_completed();   /* no-op unless the notice is still owed */
+        publish_fota_completed();    /* no-op unless the success is still owed */
+        publish_fota_failed_owed();  /* no-op unless a failure is still owed */
 
         /* Start-to-start pacing, not a flat post-work sleep.
          *

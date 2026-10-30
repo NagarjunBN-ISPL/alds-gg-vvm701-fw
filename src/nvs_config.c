@@ -3,6 +3,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include <stddef.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -650,14 +651,36 @@ bool nvs_config_enforce_firmware_creds(DeviceConfig *cfg, bool *destination_chan
     return true;
 }
 
+/* ── erase_config ─────────────────────────────────────────────────────────
+ * Starts from the defaults and carries over ONLY the connectivity run, apn ..
+ * cred_fp, which is contiguous in DeviceConfig (the layout is a flash
+ * contract, see nvs_config.h). Everything else — including any field appended
+ * to the struct later — is equipment and comes back at its default; a new
+ * connectivity field must be added to the kept run here. du_plan is the one
+ * default that is not 0: this build never stores DU_PLAN_LIST, which means "a
+ * plan from an older build". */
+void nvs_config_clear_equipment(DeviceConfig *cfg) {
+    DeviceConfig fresh;
+    nvs_config_defaults(&fresh);
+    const size_t keep_from = offsetof(DeviceConfig, apn);
+    const size_t keep_to   = offsetof(DeviceConfig, cred_fp) + sizeof(cfg->cred_fp);
+    memcpy((char *)&fresh + keep_from, (const char *)cfg + keep_from, keep_to - keep_from);
+    fresh.du_plan = DU_PLAN_SLOTS;
+    memcpy(cfg, &fresh, sizeof(*cfg));
+}
+
 void nvs_config_factory_reset(void) {
     nvs_handle_t h;
+    bool ok = false;
     if (nvs_open(NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_erase_all(h);
-        nvs_commit(h);
+        ok = nvs_erase_all(h) == ESP_OK && nvs_commit(h) == ESP_OK;
         nvs_close(h);
     }
-    ESP_LOGI(TAG, "Factory reset done");
+    erase_sibling_namespaces();
+    if (ok)
+        ESP_LOGI(TAG, "Factory reset done");
+    else
+        ESP_LOGE(TAG, "factory reset: NVS not erased — the gateway restarts still configured");
 }
 
 uint32_t nvs_boot_count_bump(void) {

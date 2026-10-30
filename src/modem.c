@@ -52,6 +52,22 @@ void modem_set_flush_rescue(void (*cb)(const char *data)) {
     s_flush_rescue = cb;
 }
 
+/* Remove NUL bytes from buf[from .. *total) and re-terminate. Every reply here
+ * is searched with strstr(), which stops at the first NUL — so one NUL from
+ * line noise or a modem glitch ahead of the "OK" made a command that SUCCEEDED
+ * read as a timeout (a FOTA wait for +QHTTPGET or +QHTTPREADFILE then sat out
+ * its whole 150/310 s and spent an attempt), and hid any +QMTRECV behind it
+ * from the URC rescue (a lost inbound command). The AT channel never carries a
+ * meaningful NUL; the binary FOTA transfer does not come through here (fota.c
+ * reads the UART itself). Same as alds-sr and cng-cpil. */
+static void strip_nuls(char *buf, int from, int *total) {
+    int w = from;
+    for (int r = from; r < *total; r++)
+        if (buf[r] != '\0') buf[w++] = buf[r];
+    *total = w;
+    buf[w] = '\0';
+}
+
 void modem_flush(void) {
     /* Bound the drain TWO ways: "read until silent" never terminates if the
      * modem streams continuously (URC storm / firmware fault), so total bytes
@@ -77,20 +93,21 @@ void modem_flush(void) {
     /* A +QMTRECV: URC can land on the wire between unrelated AT commands.
      * Accumulate what would otherwise be silently discarded and let the
      * rescue callback pull any complete message out of it before we
-     * actually throw the rest away. Sized to mqtt.c's PAYLOAD_MAX (2048) —
-     * a setconfig with the full connectivity block (apn/mqttHost/mqttPass/
-     * mqttBaseTopic etc.) can approach ~600 bytes on its own, and this used
-     * to be sized at exactly 600 with no margin: any URC landing in this
-     * rescue path (rather than the normal drain_recv() receive path, which
-     * is already sized to PAYLOAD_MAX) larger than that was silently
-     * truncated and dropped, with no retry. */
-    static char acc[2048 + 400];
+     * actually throw the rest away. Room for TWO of mqtt.c's PAYLOAD_MAX
+     * (2048) messages plus their URC headers: a setconfig with the full
+     * connectivity block can approach ~600 bytes, and an update carrying a
+     * long presigned link (FOTA_URL_MAX 1535) ~1.7-1.9 KB, so one of those
+     * beside another message did not fit the 2448 bytes this used to be. A
+     * URC that does not fit is silently cut and dropped, with no retry. */
+    static char acc[4096 + 400];
     int total = 0;
     int n;
     while ((n = uart_read_bytes(MODEM_UART, tmp, sizeof(tmp), pdMS_TO_TICKS(30))) > 0) {
         if (total + n < (int)sizeof(acc) - 1) {
             memcpy(acc + total, tmp, n);
+            int before = total;
             total += n;
+            strip_nuls(acc, before, &total);
         }
         drained += n;
         if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
@@ -161,8 +178,9 @@ static void drain_rest_of_line(char *buf, size_t buf_size, int *total) {
         int n2 = uart_read_bytes(MODEM_UART, (uint8_t *)buf + *total,
                                   space, pdMS_TO_TICKS(20));
         if (n2 <= 0) break;
+        int before = *total;
         *total += n2;
-        buf[*total] = '\0';
+        strip_nuls(buf, before, total);          /* re-terminates */
         space = (int)buf_size - 1 - *total;
     }
 }
@@ -189,7 +207,11 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
     log_at_cmd(cmd);
     uart_write_bytes(MODEM_UART, line, n);
 
-    static char buf[2048];
+    /* 4 KB, not 2: an inbound update message carrying a long presigned link
+     * (~1.7-1.9 KB) that lands while this command waits must fit beside its
+     * reply, or it is cut, and a cut +QMTRECV is lost for good (the modem has
+     * already acked it to the broker). */
+    static char buf[4096];
     memset(buf, 0, sizeof(buf));
     int  total = 0;
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
@@ -198,6 +220,7 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
         if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
+            if (ch == 0) continue;               /* see strip_nuls() */
             if (total < (int)sizeof(buf) - 1) {
                 buf[total++] = (char)ch;
                 buf[total]   = '\0';
@@ -248,8 +271,9 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
 
 bool modem_read_until(const char *expect, int timeout_ms,
                       char *resp, size_t resp_size) {
-    /* Like modem_at but sends nothing — just reads until pattern found */
-    static char buf[2048];
+    /* Like modem_at but sends nothing — just reads until pattern found.
+     * 4 KB for the same reason as modem_at(). */
+    static char buf[4096];
     memset(buf, 0, sizeof(buf));
     int  total = 0;
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
@@ -258,6 +282,7 @@ bool modem_read_until(const char *expect, int timeout_ms,
         if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
+            if (ch == 0) continue;               /* see strip_nuls() */
             if (total < (int)sizeof(buf) - 1) {
                 buf[total++] = (char)ch;
                 buf[total]   = '\0';
@@ -278,8 +303,9 @@ bool modem_read_until(const char *expect, int timeout_ms,
                     int n2 = uart_read_bytes(MODEM_UART, (uint8_t *)buf + total,
                                               space, pdMS_TO_TICKS(20));
                     if (n2 <= 0) break;
+                    int before = total;
                     total += n2;
-                    buf[total] = '\0';
+                    strip_nuls(buf, before, &total);   /* re-terminates */
                     space = (int)sizeof(buf) - 1 - total;
                     if (strchr(strstr(buf, expect), '\n')) break;
                 }

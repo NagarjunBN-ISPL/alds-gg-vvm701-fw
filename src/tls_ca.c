@@ -3,13 +3,18 @@
 #include "esp_log.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static const char *TAG = "tls_ca";
 
 /* ── Trusted root CA bundle ───────────────────────────────────────────────
- * FIVE roots, concatenated into one PEM file. The TLS endpoints this firmware
- * talks to are issued by different CAs, verified by directly inspecting each
- * one's live TLS handshake (all re-checked 2026-09-28):
+ * FOURTEEN roots, concatenated into one PEM file (~18 KB): the five below,
+ * then (added 2026-10-30, at the end) the other four Amazon Trust Services
+ * roots and the five that Azure, DigitalOcean, Oracle and Google storage
+ * chain to, so the FOTA host can move off AWS without a firmware update.
+ * The TLS endpoints this firmware talks to are issued by different CAs,
+ * verified by directly inspecting each one's live TLS handshake (all
+ * re-checked 2026-09-28; S3 again 2026-10-30):
  *
  *   PROD MQTT broker (mqtt.iotronsys.com:8777, SSL ctx 2)
  *   DEV  MQTT broker (dev-fuelsense.iotronsys.com:8777, SSL ctx 2)
@@ -183,6 +188,232 @@ static const char *k_ca_bundle =
 "awuw1EawTDrs13VUlJVEsbQ0/O/1aaV73mCdOQ8azqL2KTv1Ewu1xbquE2S+kdQU\n"
 "To9TUwat3wUA6cwXh1EfpS/3fJ0aGah5hdpRyoCLDlsSn8tkrjMfFFX0viC+GxHc\n"
 "sI1ANRYvqSFC2X1VRZfDg+wD6E21BccmifG4yWc=\n"
+"-----END CERTIFICATE-----\n"
+/* The rest of the Amazon Trust Services roots, which AWS asks clients to
+ * trust as a set. S3 is issued under Amazon Root CA 1 today (above); these
+ * keep FOTA downloads verifying if S3 moves to another Amazon root or serves
+ * an ECDSA certificate, and Starfield G2 is the root CA 1 is cross-signed by.
+ * Appended last, so every root above loads exactly as before. Fetched
+ * 2026-10-30 from https://www.amazontrust.com/repository/ and checked
+ * against Mozilla's root store (same SHA-256 in both). */
+/* Amazon Root CA 2 — RSA 4096, valid until 2040-05-26; SHA-256
+ * 1B:A5:B2:AA:8C:65:40:1A:82:96:01:18:F8:0B:EC:4F:62:30:4D:83:CE:C4:71:3A:19:C3:9C:01:1E:A4:6D:B4 */
+"-----BEGIN CERTIFICATE-----\n"
+"MIIFQTCCAymgAwIBAgITBmyf0pY1hp8KD+WGePhbJruKNzANBgkqhkiG9w0BAQwF\n"
+"ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6\n"
+"b24gUm9vdCBDQSAyMB4XDTE1MDUyNjAwMDAwMFoXDTQwMDUyNjAwMDAwMFowOTEL\n"
+"MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv\n"
+"b3QgQ0EgMjCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK2Wny2cSkxK\n"
+"gXlRmeyKy2tgURO8TW0G/LAIjd0ZEGrHJgw12MBvIITplLGbhQPDW9tK6Mj4kHbZ\n"
+"W0/jTOgGNk3Mmqw9DJArktQGGWCsN0R5hYGCrVo34A3MnaZMUnbqQ523BNFQ9lXg\n"
+"1dKmSYXpN+nKfq5clU1Imj+uIFptiJXZNLhSGkOQsL9sBbm2eLfq0OQ6PBJTYv9K\n"
+"8nu+NQWpEjTj82R0Yiw9AElaKP4yRLuH3WUnAnE72kr3H9rN9yFVkE8P7K6C4Z9r\n"
+"2UXTu/Bfh+08LDmG2j/e7HJV63mjrdvdfLC6HM783k81ds8P+HgfajZRRidhW+me\n"
+"z/CiVX18JYpvL7TFz4QuK/0NURBs+18bvBt+xa47mAExkv8LV/SasrlX6avvDXbR\n"
+"8O70zoan4G7ptGmh32n2M8ZpLpcTnqWHsFcQgTfJU7O7f/aS0ZzQGPSSbtqDT6Zj\n"
+"mUyl+17vIWR6IF9sZIUVyzfpYgwLKhbcAS4y2j5L9Z469hdAlO+ekQiG+r5jqFoz\n"
+"7Mt0Q5X5bGlSNscpb/xVA1wf+5+9R+vnSUeVC06JIglJ4PVhHvG/LopyboBZ/1c6\n"
+"+XUyo05f7O0oYtlNc/LMgRdg7c3r3NunysV+Ar3yVAhU/bQtCSwXVEqY0VThUWcI\n"
+"0u1ufm8/0i2BWSlmy5A5lREedCf+3euvAgMBAAGjQjBAMA8GA1UdEwEB/wQFMAMB\n"
+"Af8wDgYDVR0PAQH/BAQDAgGGMB0GA1UdDgQWBBSwDPBMMPQFWAJI/TPlUq9LhONm\n"
+"UjANBgkqhkiG9w0BAQwFAAOCAgEAqqiAjw54o+Ci1M3m9Zh6O+oAA7CXDpO8Wqj2\n"
+"LIxyh6mx/H9z/WNxeKWHWc8w4Q0QshNabYL1auaAn6AFC2jkR2vHat+2/XcycuUY\n"
+"+gn0oJMsXdKMdYV2ZZAMA3m3MSNjrXiDCYZohMr/+c8mmpJ5581LxedhpxfL86kS\n"
+"k5Nrp+gvU5LEYFiwzAJRGFuFjWJZY7attN6a+yb3ACfAXVU3dJnJUH/jWS5E4ywl\n"
+"7uxMMne0nxrpS10gxdr9HIcWxkPo1LsmmkVwXqkLN1PiRnsn/eBG8om3zEK2yygm\n"
+"btmlyTrIQRNg91CMFa6ybRoVGld45pIq2WWQgj9sAq+uEjonljYE1x2igGOpm/Hl\n"
+"urR8FLBOybEfdF849lHqm/osohHUqS0nGkWxr7JOcQ3AWEbWaQbLU8uz/mtBzUF+\n"
+"fUwPfHJ5elnNXkoOrJupmHN5fLT0zLm4BwyydFy4x2+IoZCn9Kr5v2c69BoVYh63\n"
+"n749sSmvZ6ES8lgQGVMDMBu4Gon2nL2XA46jCfMdiyHxtN/kHNGfZQIG6lzWE7OE\n"
+"76KlXIx3KadowGuuQNKotOrN8I1LOJwZmhsoVLiJkO/KdYE+HvJkJMcYr07/R54H\n"
+"9jVlpNMKVv/1F2Rs76giJUmTtt8AF9pYfl3uxRuw0dFfIRDH+fO6AgonB8Xx1sfT\n"
+"4PsJYGw=\n"
+"-----END CERTIFICATE-----\n"
+/* Amazon Root CA 3 — ECDSA P-256, valid until 2040-05-26; SHA-256
+ * 18:CE:6C:FE:7B:F1:4E:60:B2:E3:47:B8:DF:E8:68:CB:31:D0:2E:BB:3A:DA:27:15:69:F5:03:43:B4:6D:B3:A4 */
+"-----BEGIN CERTIFICATE-----\n"
+"MIIBtjCCAVugAwIBAgITBmyf1XSXNmY/Owua2eiedgPySjAKBggqhkjOPQQDAjA5\n"
+"MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6b24g\n"
+"Um9vdCBDQSAzMB4XDTE1MDUyNjAwMDAwMFoXDTQwMDUyNjAwMDAwMFowOTELMAkG\n"
+"A1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJvb3Qg\n"
+"Q0EgMzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABCmXp8ZBf8ANm+gBG1bG8lKl\n"
+"ui2yEujSLtf6ycXYqm0fc4E7O5hrOXwzpcVOho6AF2hiRVd9RFgdszflZwjrZt6j\n"
+"QjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMB0GA1UdDgQWBBSr\n"
+"ttvXBp43rDCGB5Fwx5zEGbF4wDAKBggqhkjOPQQDAgNJADBGAiEA4IWSoxe3jfkr\n"
+"BqWTrBqYaGFy+uGh0PsceGCmQ5nFuMQCIQCcAu/xlJyzlvnrxir4tiz+OpAUFteM\n"
+"YyRIHN8wfdVoOw==\n"
+"-----END CERTIFICATE-----\n"
+/* Amazon Root CA 4 — ECDSA P-384, valid until 2040-05-26; SHA-256
+ * E3:5D:28:41:9E:D0:20:25:CF:A6:90:38:CD:62:39:62:45:8D:A5:C6:95:FB:DE:A3:C2:2B:0B:FB:25:89:70:92 */
+"-----BEGIN CERTIFICATE-----\n"
+"MIIB8jCCAXigAwIBAgITBmyf18G7EEwpQ+Vxe3ssyBrBDjAKBggqhkjOPQQDAzA5\n"
+"MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6b24g\n"
+"Um9vdCBDQSA0MB4XDTE1MDUyNjAwMDAwMFoXDTQwMDUyNjAwMDAwMFowOTELMAkG\n"
+"A1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJvb3Qg\n"
+"Q0EgNDB2MBAGByqGSM49AgEGBSuBBAAiA2IABNKrijdPo1MN/sGKe0uoe0ZLY7Bi\n"
+"9i0b2whxIdIA6GO9mif78DluXeo9pcmBqqNbIJhFXRbb/egQbeOc4OO9X4Ri83Bk\n"
+"M6DLJC9wuoihKqB1+IGuYgbEgds5bimwHvouXKNCMEAwDwYDVR0TAQH/BAUwAwEB\n"
+"/zAOBgNVHQ8BAf8EBAMCAYYwHQYDVR0OBBYEFNPsxzplbszh2naaVvuc84ZtV+WB\n"
+"MAoGCCqGSM49BAMDA2gAMGUCMDqLIfG9fhGt0O9Yli/W651+kI0rz2ZVwyzjKKlw\n"
+"CkcO8DdZEv8tmZQoTipPNU0zWgIxAOp1AE47xDqUEpHJWEadIRNyp4iciuRMStuW\n"
+"1KyLa2tJElMzrdfkviT8tQp21KW8EA==\n"
+"-----END CERTIFICATE-----\n"
+/* Starfield Services Root Certificate Authority - G2 — RSA 2048, valid until 2037-12-31; SHA-256
+ * 56:8D:69:05:A2:C8:87:08:A4:B3:02:51:90:ED:CF:ED:B1:97:4A:60:6A:13:C6:E5:29:0F:CB:2A:E6:3E:DA:B5 */
+"-----BEGIN CERTIFICATE-----\n"
+"MIID7zCCAtegAwIBAgIBADANBgkqhkiG9w0BAQsFADCBmDELMAkGA1UEBhMCVVMx\n"
+"EDAOBgNVBAgTB0FyaXpvbmExEzARBgNVBAcTClNjb3R0c2RhbGUxJTAjBgNVBAoT\n"
+"HFN0YXJmaWVsZCBUZWNobm9sb2dpZXMsIEluYy4xOzA5BgNVBAMTMlN0YXJmaWVs\n"
+"ZCBTZXJ2aWNlcyBSb290IENlcnRpZmljYXRlIEF1dGhvcml0eSAtIEcyMB4XDTA5\n"
+"MDkwMTAwMDAwMFoXDTM3MTIzMTIzNTk1OVowgZgxCzAJBgNVBAYTAlVTMRAwDgYD\n"
+"VQQIEwdBcml6b25hMRMwEQYDVQQHEwpTY290dHNkYWxlMSUwIwYDVQQKExxTdGFy\n"
+"ZmllbGQgVGVjaG5vbG9naWVzLCBJbmMuMTswOQYDVQQDEzJTdGFyZmllbGQgU2Vy\n"
+"dmljZXMgUm9vdCBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkgLSBHMjCCASIwDQYJKoZI\n"
+"hvcNAQEBBQADggEPADCCAQoCggEBANUMOsQq+U7i9b4Zl1+OiFOxHz/Lz58gE20p\n"
+"OsgPfTz3a3Y4Y9k2YKibXlwAgLIvWX/2h/klQ4bnaRtSmpDhcePYLQ1Ob/bISdm2\n"
+"8xpWriu2dBTrz/sm4xq6HZYuajtYlIlHVv8loJNwU4PahHQUw2eeBGg6345AWh1K\n"
+"Ts9DkTvnVtYAcMtS7nt9rjrnvDH5RfbCYM8TWQIrgMw0R9+53pBlbQLPLJGmpufe\n"
+"hRhJfGZOozptqbXuNC66DQO4M99H67FrjSXZm86B0UVGMpZwh94CDklDhbZsc7tk\n"
+"6mFBrMnUVN+HL8cisibMn1lUaJ/8viovxFUcdUBgF4UCVTmLfwUCAwEAAaNCMEAw\n"
+"DwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFJxfAN+q\n"
+"AdcwKziIorhtSpzyEZGDMA0GCSqGSIb3DQEBCwUAA4IBAQBLNqaEd2ndOxmfZyMI\n"
+"bw5hyf2E3F/YNoHN2BtBLZ9g3ccaaNnRbobhiCPPE95Dz+I0swSdHynVv/heyNXB\n"
+"ve6SbzJ08pGCL72CQnqtKrcgfU28elUSwhXqvfdqlS5sdJ/PHLTyxQGjhdByPq1z\n"
+"qwubdQxtRbeOlKyWN7Wg0I8VRw7j6IPdj/3vQQF3zCepYoUz8jcI73HPdwbeyBkd\n"
+"iEDPfUYd/x7H4c7/I9vG+o1VTqkC50cRRj70/b17KSa7qWFiNyi2LSr2EIZkyXCn\n"
+"0q23KXB56jzaYyWf/Wi3MOxw+3WKt21gZ7IeyLnp2KhvAotnDU0mV3HaIPzBSlCN\n"
+"sSi6\n"
+"-----END CERTIFICATE-----\n"
+/* Roots of the other storage clouds, so FOTA files can move off AWS without
+ * a firmware update first (live chains checked 2026-10-30): Azure Blob is
+ * issued under Microsoft TLS RSA Root G2, sent cross-signed by DigiCert
+ * Global Root G2; DigitalOcean Spaces and Oracle Object Storage chain
+ * straight to DigiCert G2; Google Cloud Storage to GTS Root R4 (RSA-only
+ * clients: R1). DigiCert G2 and GTS R1/R4 match Mozilla's root store; the two
+ * Microsoft TLS roots are from Microsoft's own repository
+ * (www.microsoft.com/pkiops/certs), and the RSA one carries the key Azure
+ * serves today. Appended last, so every root above loads exactly as before. */
+/* DigiCert Global Root G2 — RSA 2048, valid until 2038-01-15; SHA-256
+ * CB:3C:CB:B7:60:31:E5:E0:13:8F:8D:D3:9A:23:F9:DE:47:FF:C3:5E:43:C1:14:4C:EA:27:D4:6A:5A:B1:CB:5F */
+"-----BEGIN CERTIFICATE-----\n"
+"MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh\n"
+"MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3\n"
+"d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH\n"
+"MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT\n"
+"MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j\n"
+"b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG\n"
+"9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI\n"
+"2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx\n"
+"1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ\n"
+"q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz\n"
+"tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ\n"
+"vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP\n"
+"BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV\n"
+"5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY\n"
+"1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4\n"
+"NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG\n"
+"Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91\n"
+"8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe\n"
+"pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl\n"
+"MrY=\n"
+"-----END CERTIFICATE-----\n"
+/* Microsoft TLS RSA Root G2 — RSA 4096, valid until 2040-04-10; SHA-256
+ * 6A:17:05:83:DB:58:41:51:E1:C4:54:EE:CA:2A:64:CC:5D:8E:48:4A:5B:D1:15:6E:72:0B:44:58:65:4E:E9:E5 */
+"-----BEGIN CERTIFICATE-----\n"
+"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\n"
+"eM+HJyMso/L+NgtC+eHXJLur5sg=\n"
+"-----END CERTIFICATE-----\n"
+/* Microsoft TLS ECC Root G2 — ECDSA P-384, valid until 2040-04-10; SHA-256
+ * 87:75:5C:FE:88:BD:B0:D1:09:9D:CD:ED:3E:AE:11:4B:A9:76:E6:64:B3:24:8E:E3:DC:64:9E:35:7F:17:E8:A7 */
+"-----BEGIN CERTIFICATE-----\n"
+"MIICMTCCAbegAwIBAgIQcuICK8WywbBNJQVuYuJ2eTAKBggqhkjOPQQDAzBRMQsw\n"
+"CQYDVQQGEwJVUzEeMBwGA1UEChMVTWljcm9zb2Z0IENvcnBvcmF0aW9uMSIwIAYD\n"
+"VQQDExlNaWNyb3NvZnQgVExTIEVDQyBSb290IEcyMB4XDTI1MDQxMDIwNTIzNloX\n"
+"DTQwMDQxMDIwNTg1OVowUTELMAkGA1UEBhMCVVMxHjAcBgNVBAoTFU1pY3Jvc29m\n"
+"dCBDb3Jwb3JhdGlvbjEiMCAGA1UEAxMZTWljcm9zb2Z0IFRMUyBFQ0MgUm9vdCBH\n"
+"MjB2MBAGByqGSM49AgEGBSuBBAAiA2IABFHCOIT2ay617TcWSuXj100AhDtAVPwJ\n"
+"5vTFp6ZrVkROrWCeFZiOA+7iss11PVhkwBYM31rcLJ1AW75LVCrOjzy/lbyOrInv\n"
+"aT4XBvd9wbgCZSPL9R0a41Oh9Ad+CotdWaNUMFIwDgYDVR0PAQH/BAQDAgGGMA8G\n"
+"A1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFG+rftr/l0Ny7Dtnd96CYTWIR0KFMBAG\n"
+"CSsGAQQBgjcVAQQDAgEAMAoGCCqGSM49BAMDA2gAMGUCMQDYM1rR4cySss0f8PKM\n"
+"sT2ytNTKmNzaiQX0G1dx35RNInYFUElNkCmSLL8vN+W5deICMAGSaVidU7LIVWZb\n"
+"uslQWiqBto7PEdDyfoTcfzbfwy3aTfgisNizizSfnTEcrA8RGQ==\n"
+"-----END CERTIFICATE-----\n"
+/* GTS Root R1 — RSA 4096, valid until 2036-06-22; SHA-256
+ * D9:47:43:2A:BD:E7:B7:FA:90:FC:2E:6B:59:10:1B:12:80:E0:E1:C7:E4:E4:0F:A3:C6:88:7F:FF:57:A7:F4:CF */
+"-----BEGIN CERTIFICATE-----\n"
+"MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw\n"
+"CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU\n"
+"MBIGA1UEAxMLR1RTIFJvb3QgUjEwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw\n"
+"MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp\n"
+"Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjEwggIiMA0GCSqGSIb3DQEBAQUA\n"
+"A4ICDwAwggIKAoICAQC2EQKLHuOhd5s73L+UPreVp0A8of2C+X0yBoJx9vaMf/vo\n"
+"27xqLpeXo4xL+Sv2sfnOhB2x+cWX3u+58qPpvBKJXqeqUqv4IyfLpLGcY9vXmX7w\n"
+"Cl7raKb0xlpHDU0QM+NOsROjyBhsS+z8CZDfnWQpJSMHobTSPS5g4M/SCYe7zUjw\n"
+"TcLCeoiKu7rPWRnWr4+wB7CeMfGCwcDfLqZtbBkOtdh+JhpFAz2weaSUKK0Pfybl\n"
+"qAj+lug8aJRT7oM6iCsVlgmy4HqMLnXWnOunVmSPlk9orj2XwoSPwLxAwAtcvfaH\n"
+"szVsrBhQf4TgTM2S0yDpM7xSma8ytSmzJSq0SPly4cpk9+aCEI3oncKKiPo4Zor8\n"
+"Y/kB+Xj9e1x3+naH+uzfsQ55lVe0vSbv1gHR6xYKu44LtcXFilWr06zqkUspzBmk\n"
+"MiVOKvFlRNACzqrOSbTqn3yDsEB750Orp2yjj32JgfpMpf/VjsPOS+C12LOORc92\n"
+"wO1AK/1TD7Cn1TsNsYqiA94xrcx36m97PtbfkSIS5r762DL8EGMUUXLeXdYWk70p\n"
+"aDPvOmbsB4om3xPXV2V4J95eSRQAogB/mqghtqmxlbCluQ0WEdrHbEg8QOB+DVrN\n"
+"VjzRlwW5y0vtOUucxD/SVRNuJLDWcfr0wbrM7Rv1/oFB2ACYPTrIrnqYNxgFlQID\n"
+"AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E\n"
+"FgQU5K8rJnEaK0gnhS9SZizv8IkTcT4wDQYJKoZIhvcNAQEMBQADggIBAJ+qQibb\n"
+"C5u+/x6Wki4+omVKapi6Ist9wTrYggoGxval3sBOh2Z5ofmmWJyq+bXmYOfg6LEe\n"
+"QkEzCzc9zolwFcq1JKjPa7XSQCGYzyI0zzvFIoTgxQ6KfF2I5DUkzps+GlQebtuy\n"
+"h6f88/qBVRRiClmpIgUxPoLW7ttXNLwzldMXG+gnoot7TiYaelpkttGsN/H9oPM4\n"
+"7HLwEXWdyzRSjeZ2axfG34arJ45JK3VmgRAhpuo+9K4l/3wV3s6MJT/KYnAK9y8J\n"
+"ZgfIPxz88NtFMN9iiMG1D53Dn0reWVlHxYciNuaCp+0KueIHoI17eko8cdLiA6Ef\n"
+"MgfdG+RCzgwARWGAtQsgWSl4vflVy2PFPEz0tv/bal8xa5meLMFrUKTX5hgUvYU/\n"
+"Z6tGn6D/Qqc6f1zLXbBwHSs09dR2CQzreExZBfMzQsNhFRAbd03OIozUhfJFfbdT\n"
+"6u9AWpQKXCBfTkBdYiJ23//OYb2MI3jSNwLgjt7RETeJ9r/tSQdirpLsQBqvFAnZ\n"
+"0E6yove+7u7Y/9waLd64NnHi/Hm3lCXRSHNboTXns5lndcEZOitHTtNCjv0xyBZm\n"
+"2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb\n"
+"bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c\n"
+"-----END CERTIFICATE-----\n"
+/* GTS Root R4 — ECDSA P-384, valid until 2036-06-22; SHA-256
+ * 34:9D:FA:40:58:C5:E2:63:12:3B:39:8A:E7:95:57:3C:4E:13:13:C8:3F:E6:8F:93:55:6C:D5:E8:03:1B:3C:7D */
+"-----BEGIN CERTIFICATE-----\n"
+"MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD\n"
+"VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG\n"
+"A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw\n"
+"WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz\n"
+"IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi\n"
+"AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi\n"
+"QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR\n"
+"HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW\n"
+"BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D\n"
+"9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8\n"
+"p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD\n"
 "-----END CERTIFICATE-----\n";
 
 bool tls_ca_provision(void) {
@@ -208,4 +439,29 @@ bool tls_ca_provision(void) {
     else
         ESP_LOGI(TAG, "CA cert provisioned for MQTT (ctx 2) and FOTA (ctx 1)");
     return ok;
+}
+
+/* A FOTA that power-cycles the modem re-uploads the bundle in the middle of
+ * the update (fota.c), and an upload cut short there leaves the modem with no
+ * CA, or half of one: every TLS handshake fails, MQTT included, and only the
+ * next boot used to upload it again — a gateway that could no longer be
+ * reached to be told anything. So after a failed update the stored size is
+ * checked first, and the bundle goes up again only when it is missing or
+ * wrong: the upload deletes before it writes, so re-uploading an intact file
+ * would risk leaving none at all for no gain (as alds-sr's ca_ensure). */
+bool tls_ca_ensure(void) {
+    const int want = (int)strlen(k_ca_bundle);
+    char cmd[64], resp[160];
+    snprintf(cmd, sizeof(cmd), "AT+QFLST=\"%s\"", TLS_CA_FILE);
+    if (modem_at(cmd, "+QFLST:", 5000, resp, sizeof(resp))) {
+        const char *p     = strstr(resp, "+QFLST:");             /* +QFLST: "<file>",<size> */
+        const char *comma = p ? strchr(p, ',') : NULL;
+        if (comma && atoi(comma + 1) == want) return true;
+    }
+    ESP_LOGW(TAG, "CA file missing or not %d bytes in the modem — uploading it again", want);
+    for (int i = 0; i < 2; i++) {
+        if (tls_ca_provision()) return true;
+    }
+    ESP_LOGE(TAG, "CA file could not be restored — TLS connects fail until the next boot uploads it");
+    return false;
 }
