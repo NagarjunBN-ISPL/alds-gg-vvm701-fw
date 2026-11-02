@@ -4,6 +4,7 @@
 #include "tls_ca.h"
 #include "config.h"
 #include "store.h"
+#include "forensics.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -814,9 +815,15 @@ bool fota_perform(const char *url, const char *pub_topic,
         }
 
         int len = 0;
-        if (fota_download(clean_url, &len, reason, reason_size) &&
-            fota_flash(len, allow_handover, reason, reason_size))
-            return true;
+        /* Marked per stage, so a stop inside an update is reported as one
+         * (last_stop) instead of as whatever main was doing before it. */
+        forensics_mark(FSLOT_MAIN, F_FOTA_DL, (uint8_t)attempt);
+        bool ok = fota_download(clean_url, &len, reason, reason_size);
+        if (ok) {
+            forensics_mark(FSLOT_MAIN, F_FOTA_WRITE, (uint8_t)attempt);
+            ok = fota_flash(len, allow_handover, reason, reason_size);
+        }
+        if (ok) return true;
 
         ESP_LOGW(TAG, "FOTA attempt %d/%d failed (%s)", attempt, FOTA_ATTEMPTS,
                  (reason && reason[0]) ? reason : "?");
@@ -838,4 +845,11 @@ bool fota_perform(const char *url, const char *pub_topic,
      * the room (alds-sr). */
     ufs_delete_images();
     return false;
+}
+
+bool fota_url_acceptable(const char *url) {
+    static char u[FOTA_URL_MAX + 1];
+    snprintf(u, sizeof(u), "%s", url ? url : "");
+    sanitize_url(u);
+    return strncasecmp(u, "https://", 8) == 0;
 }

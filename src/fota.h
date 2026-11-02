@@ -43,3 +43,9 @@ bool fota_last_image_foreign(void);
  * confirmed itself). */
 bool fota_perform(const char *url, const char *pub_topic,
                   char *reason, size_t reason_size, bool allow_handover);
+
+/* Would fota_perform() take this URL at all — https:// in any case, once
+ * trimmed the same way? Lets the caller refuse junk on the update topic BEFORE
+ * it confirms a pending image, sends fota_initiated, closes MQTT and waits out
+ * the fleet stagger for nothing (as alds-sr). */
+bool fota_url_acceptable(const char *url);

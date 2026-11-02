@@ -1808,6 +1808,19 @@ static void handle_msg(const char *topic, const char *payload) {
             fota_refusal_publish(fota_msg);
             return;
         }
+        /* Not an https:// link: refused HERE, as alds-sr does. fota_perform()
+         * checks the same, but only after the fleet stagger, the confirm of a
+         * pending image, fota_initiated and the MQTT teardown below — all of it,
+         * and a reconnect with every subscription after, spent on text that
+         * could never download. */
+        if (!fota_url_acceptable(url_to_use)) {
+            ESP_LOGE(TAG, "FOTA: not an https:// URL — rejected, MQTT left up");
+            snprintf(fota_msg, sizeof(fota_msg),
+                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"non_https_url\"}",
+                     g_imei);
+            fota_refusal_publish(fota_msg);
+            return;
+        }
         if (!force && s_fota_blocked[0] && strcmp(url_to_use, s_fota_blocked) == 0) {
             ESP_LOGW(TAG, "FOTA: identical URL already failed this boot — skipping "
                           "(clear the retained message, publish a new URL, or force)");
