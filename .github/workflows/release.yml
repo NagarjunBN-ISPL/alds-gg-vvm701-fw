@@ -94,6 +94,20 @@ jobs:
           idf.py build
           idf.py size
 
+      # The app image published here is the one FOTA downloads, and a unit has
+      # room to stage only ~558 KB of it (see the same step in ci.yml). A
+      # release over the limit could be flashed over USB but never pushed.
+      - name: Image fits the modem's FOTA storage
+        shell: bash
+        run: |
+          limit=540000
+          size=$(stat -c %s build/alds-gg-vvm701-fw.bin)
+          echo "app image ${size} B, FOTA limit ${limit} B, $((limit - size)) B left"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::app image is ${size} B, over the ${limit} B a unit can stage for FOTA - every FOTA of it would fail ufs_full"
+            exit 1
+          fi
+
       # Offsets come from build/flash_args, which the build itself generates -
       # never retyped here, because a wrong partition-table offset is not a
       # build error, it is a board that does not boot.

@@ -37,6 +37,30 @@ jobs:
           . $IDF_PATH/export.sh
           idf.py size
 
+      # FOTA stages the downloaded image in the modem's own storage (UFS) before
+      # writing flash (fota.c), and some units have only ~574 KB of it free
+      # (574,508 B on the office unit, 2026-11-02; files nobody identified hold
+      # the rest). fota.c needs the image + 16 KB, so ~558 KB is the most such a
+      # unit can take. A bigger image still builds and flashes over USB, but
+      # every FOTA of it fails with ufs_full_<free>_of_<need>, and the fleet
+      # cannot be updated until a smaller one exists. The limit keeps ~18 KB in
+      # hand for units with less room; the warning comes early enough to plan.
+      # Same numbers in release.yml.
+      - name: Image fits the modem's FOTA storage
+        shell: bash
+        run: |
+          limit=540000
+          warn=500000
+          size=$(stat -c %s build/alds-gg-vvm701-fw.bin)
+          echo "app image ${size} B, FOTA limit ${limit} B, $((limit - size)) B left"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::app image is ${size} B, over the ${limit} B a unit can stage for FOTA - every FOTA of it would fail ufs_full"
+            exit 1
+          fi
+          if [ "$size" -gt "$warn" ]; then
+            echo "::warning::app image is ${size} B, only $((limit - size)) B below the FOTA limit"
+          fi
+
       # Keeps the built firmware for 30 days so you can download and flash
       # the exact binary a given commit produced. NOT the thing handed out for
       # a release - CI artifacts expire, release assets do not (see release.yml).
