@@ -316,16 +316,31 @@ static bool restart_streak_allow(const char *why) {
 static void restart_streak_clear(void) { s_restart_streak = 0; }
 
 
-/* When the current subscriptions were made — the anchor for the retain-grace
- * window (CMD_RETAIN_GRACE_MS, config.h). A broker delivers retained messages
- * right after SUBSCRIBE, so "arrived within a few seconds of subscribing" is
- * the signature of a retained command. Set here, read by cmd_in_retain_grace(). */
-static int64_t s_subscribed_at_us = 0;
+/* When the current subscriptions were made, and the ones before them — the
+ * anchors for the retain-grace windows (CMD_RETAIN_GRACE_MS, config.h, and
+ * the lock's own). A broker delivers retained messages right after SUBSCRIBE,
+ * so "arrived within a few seconds of subscribing" is the signature of a
+ * retained command. Set by subscribe_all(), read by msg_age_ms(). */
+static int64_t s_subscribed_at_us      = 0;
+static int64_t s_prev_subscribed_at_us = 0;
+
+/* How long after its subscription the message being handled ARRIVED, in ms
+ * (mqtt_last_rx_us), or -1 when no subscription came before it. Measured to
+ * its arrival, not to now: the boot announcements are blocking publishes (up
+ * to 25 s each on a bad link), so a retained copy can sit in the stash past
+ * the window and would then pass for a live command — a retained restart
+ * rebooting the unit on every boot. A message that came in before the latest
+ * subscribe belongs to the session before it. */
+static int64_t msg_age_ms(void) {
+    const int64_t rx     = mqtt_last_rx_us();
+    const int64_t anchor = (rx >= s_subscribed_at_us) ? s_subscribed_at_us : s_prev_subscribed_at_us;
+    if (anchor == 0 || rx < anchor) return -1;
+    return (rx - anchor) / 1000;
+}
 
 static bool cmd_in_retain_grace(const char *what) {
-    if (s_subscribed_at_us == 0) return false;
-    int64_t age_ms = (esp_timer_get_time() - s_subscribed_at_us) / 1000;
-    if (age_ms >= CMD_RETAIN_GRACE_MS) return false;
+    int64_t age_ms = msg_age_ms();
+    if (age_ms < 0 || age_ms >= CMD_RETAIN_GRACE_MS) return false;
     ESP_LOGW(TAG, "%s arrived %lld ms after subscribing — treated as a RETAINED "
                   "message and ignored (publish commands with retain=false)",
              what, (long long)age_ms);
@@ -333,7 +348,8 @@ static bool cmd_in_retain_grace(const char *what) {
 }
 
 static void subscribe_all(void) {
-    s_subscribed_at_us = esp_timer_get_time();
+    s_prev_subscribed_at_us = s_subscribed_at_us;
+    s_subscribed_at_us      = esp_timer_get_time();
     /* A LIVE broker session is what proves the network is usable; this is
      * also called on the boot path when the connect failed (the subscribes
      * then simply error), and that must not count as success. */
@@ -1734,10 +1750,25 @@ static void handle_msg(const char *topic, const char *payload) {
          * handover: the link may be ANOTHER product's firmware (a deliberate
          *         swap). Without it such an image is refused as
          *         not_this_product (fota.c), so a wrong file cannot convert a
-         *         station. A bare URL never allows it. */
-        if (payload[0] == '{') {
+         *         station. A bare URL never allows it.
+         * Whitespace ahead of the JSON is skipped (a hand-typed push); a bare
+         * URL is trimmed by fota_url_prepare() below. */
+        const char *body = payload;
+        while (*body == ' ' || *body == '\t' || *body == '\r' || *body == '\n') body++;
+        if (*body == '{') {
+            /* One whole JSON object, as setconfig demands. A push cut short — by
+             * its sender, or by mqtt.c's 2 KB clamp — can keep a whole "url"
+             * and lose the HW_ID or target that would have refused it. */
+            if (!payload_is_one_json_object(body)) {
+                ESP_LOGW(TAG, "FOTA JSON payload is not one complete object — refused");
+                snprintf(fota_msg, sizeof(fota_msg),
+                         "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"bad_payload\"}",
+                         g_imei);
+                fota_refusal_publish(fota_msg);
+                return;
+            }
             char target[32] = "";
-            if (json_get_str(payload, "target", target, sizeof(target)) && target[0]) {
+            if (json_get_str(body, "target", target, sizeof(target)) && target[0]) {
                 if (!streq_ci(target, "gg") && !streq_ci(target, "alds-gg") &&
                     !streq_ci(target, "alds-gg-vvm701") &&
                     !streq_ci(target, "alds-gg-vvm701-fw")) {
@@ -1760,7 +1791,7 @@ static void handle_msg(const char *topic, const char *payload) {
              * Absent, empty or not a string: no check (bare URL, fleet-wide
              * push). Answered like target. */
             char hw_id[24] = "";
-            if (json_get_str(payload, "HW_ID", hw_id, sizeof(hw_id)) && hw_id[0] &&
+            if (json_get_str(body, "HW_ID", hw_id, sizeof(hw_id)) && hw_id[0] &&
                 !hw_id_is_mine(hw_id)) {
                 ESP_LOGW(TAG, "FOTA push names HW_ID %s, not this unit (%s) — ignored", hw_id, g_imei);
                 if (!fleet) {
@@ -1771,7 +1802,7 @@ static void handle_msg(const char *topic, const char *payload) {
                 }
                 return;
             }
-            if (!json_get_str(payload, "url", url_buf, sizeof(url_buf))) {
+            if (!json_get_str(body, "url", url_buf, sizeof(url_buf))) {
                 ESP_LOGW(TAG, "FOTA JSON payload missing 'url'");
                 snprintf(fota_msg, sizeof(fota_msg),
                          "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"no_url\"}", g_imei);
@@ -1779,9 +1810,41 @@ static void handle_msg(const char *topic, const char *payload) {
                 return;
             }
             url_to_use  = url_buf;
-            force       = json_get_bool(payload, "force", false);
-            handover_ok = json_get_bool(payload, "handover", false);
+            force       = json_get_bool(body, "force", false);
+            handover_ok = json_get_bool(body, "handover", false);
         }
+
+        size_t url_len = strlen(url_to_use);
+        if (url_len == 0 || url_len > FOTA_URL_MAX) {
+            ESP_LOGE(TAG, "FOTA: URL is %u bytes (max %d) — rejected without downloading",
+                     (unsigned)url_len, FOTA_URL_MAX);
+            snprintf(fota_msg, sizeof(fota_msg),
+                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"url_too_long\"}",
+                     g_imei);
+            fota_refusal_publish(fota_msg);
+            return;
+        }
+        /* From here on the link is the one the modem will get: trimmed,
+         * https:// in lower case, spaces as %20 (fota_url_prepare). The memory
+         * below and the known-bad block then compare the same text whatever
+         * form a copy arrived in — a trailing newline from a dashboard, or
+         * "HTTPS://", once and not the other time. A link fota_perform() would
+         * refuse is refused HERE, as alds-sr does: fota_perform() checks the
+         * same, but only after the fleet stagger, the confirm of a pending
+         * image, fota_initiated and the MQTT teardown below — all of it, and a
+         * reconnect with every subscription after, spent on text that could
+         * never download. */
+        static char url_canon[FOTA_URL_MAX + 1];
+        const char *url_refusal = fota_url_prepare(url_to_use, url_canon, sizeof(url_canon));
+        if (url_refusal) {
+            ESP_LOGE(TAG, "FOTA: URL refused (%s) — MQTT left up", url_refusal);
+            snprintf(fota_msg, sizeof(fota_msg),
+                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"%s\"}",
+                     g_imei, url_refusal);
+            fota_refusal_publish(fota_msg);
+            return;
+        }
+        url_to_use = url_canon;
 
         /* ── Retained-message backstop #1: what this URL already did ─────────
          * The grace window is a heuristic; this is the memory. Every URL that
@@ -1823,35 +1886,15 @@ static void handle_msg(const char *topic, const char *payload) {
          * would otherwise never match and the guard would be dead for exactly
          * the fleet messages it matters most for. "force" overrides this one
          * too (the operator's explicit retry of a URL that failed on, say, a
-         * transient S3 error must not be answered fota_skip_known_bad). */
+         * transient S3 error must not be answered fota_skip_known_bad).
+         * Blocked together with its "handover": a push refused as
+         * not_this_product and sent again WITH "handover":true is the
+         * operator's correction, not a retained copy, and goes through. */
         static char s_fota_blocked[FOTA_URL_MAX + 1] = "";
+        static bool s_fota_blocked_handover = false;
 
-        size_t url_len = strlen(url_to_use);
-        if (url_len == 0 || url_len > FOTA_URL_MAX) {
-            ESP_LOGE(TAG, "FOTA: URL is %u bytes (max %d) — rejected without downloading",
-                     (unsigned)url_len, FOTA_URL_MAX);
-            snprintf(fota_msg, sizeof(fota_msg),
-                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"url_too_long\"}",
-                     g_imei);
-            fota_refusal_publish(fota_msg);
-            return;
-        }
-        /* A link fota_perform() would refuse (not https://, or too long once
-         * its spaces are encoded) is refused HERE, as alds-sr does.
-         * fota_perform() checks the same, but only after the fleet stagger, the
-         * confirm of a pending image, fota_initiated and the MQTT teardown
-         * below — all of it, and a reconnect with every subscription after,
-         * spent on text that could never download. */
-        const char *url_refusal = fota_url_refusal(url_to_use);
-        if (url_refusal) {
-            ESP_LOGE(TAG, "FOTA: URL refused (%s) — MQTT left up", url_refusal);
-            snprintf(fota_msg, sizeof(fota_msg),
-                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"%s\"}",
-                     g_imei, url_refusal);
-            fota_refusal_publish(fota_msg);
-            return;
-        }
-        if (!force && s_fota_blocked[0] && strcmp(url_to_use, s_fota_blocked) == 0) {
+        if (!force && s_fota_blocked[0] && strcmp(url_to_use, s_fota_blocked) == 0 &&
+            handover_ok == s_fota_blocked_handover) {
             ESP_LOGW(TAG, "FOTA: identical URL already failed this boot — skipping "
                           "(clear the retained message, publish a new URL, or force)");
             snprintf(fota_msg, sizeof(fota_msg),
@@ -1922,7 +1965,7 @@ static void handle_msg(const char *topic, const char *payload) {
         mqtt_disconnect();
         vTaskDelay(pdMS_TO_TICKS(1000));
 
-        char fota_reason[48] = "unknown";
+        char fota_reason[64] = "unknown";
         bool fota_ok = fota_perform(url_to_use, t_logs, fota_reason, sizeof(fota_reason),
                                     handover_ok);
 
@@ -1989,6 +2032,7 @@ static void handle_msg(const char *topic, const char *payload) {
          * can't re-trigger the loop, then bring MQTT back up. */
         strncpy(s_fota_blocked, url_to_use, sizeof(s_fota_blocked) - 1);
         s_fota_blocked[sizeof(s_fota_blocked) - 1] = '\0';
+        s_fota_blocked_handover = handover_ok;
 
         /* This push's answer. Kept until a publish goes through: if this
          * reconnect fails, the poll loop sends it once the ladder has the
@@ -2033,10 +2077,8 @@ static void handle_msg(const char *topic, const char *payload) {
              * reconnect. "lock" is safe to repeat and is not gated. The lock has
              * its OWN LOCK_RETAIN_GRACE_MS (5 s) rather than the shared 15 s, to
              * match cng-cpil's lock contract exactly. */
-            int64_t age_ms = (s_subscribed_at_us != 0)
-                             ? (esp_timer_get_time() - s_subscribed_at_us) / 1000
-                             : LOCK_RETAIN_GRACE_MS;
-            if (s_subscribed_at_us != 0 && age_ms < LOCK_RETAIN_GRACE_MS) {
+            int64_t age_ms = msg_age_ms();
+            if (age_ms >= 0 && age_ms < LOCK_RETAIN_GRACE_MS) {
                 ESP_LOGW(TAG, "unlock ignored — arrived %lld ms after subscribing, "
                               "treated as a RETAINED message", (long long)age_ms);
                 snprintf(msg, sizeof(msg),

@@ -80,7 +80,7 @@ static bool s_last_image_foreign = false;
 bool fota_last_image_foreign(void) { return s_last_image_foreign; }
 
 static void fota_pdp_refresh(void) {
-    char resp[128];
+    char resp[128] = "";
     modem_at("AT+QIACT?", "OK", 3000, resp, sizeof(resp));
     if (strstr(resp, "+QIACT: 1,1")) {
         ESP_LOGI(TAG, "PDP already active");
@@ -88,11 +88,14 @@ static void fota_pdp_refresh(void) {
     }
     ESP_LOGW(TAG, "PDP not active — reactivating for FOTA ...");
     char cmd[200];
-    modem_at("AT+QIDEACT=1", "OK", 15000, NULL, 0);
+    /* The EC200U manual's maximum response times, 40 s and 150 s: given up on
+     * any sooner, the command is still running in the modem while the SSL and
+     * HTTP setup that follows is sent, and that setup is refused. */
+    modem_at("AT+QIDEACT=1", "OK", 40000, NULL, 0);
     vTaskDelay(pdMS_TO_TICKS(2000));
     network_build_qicsgp(cmd, sizeof(cmd));
     modem_at(cmd, "OK", 5000, NULL, 0);
-    modem_at("AT+QIACT=1", "OK", 60000, NULL, 0);
+    modem_at("AT+QIACT=1", "OK", 150000, NULL, 0);
 }
 
 /* True when `resp` holds a complete line starting with `marker` — a URC that
@@ -182,7 +185,12 @@ static void ufs_delete_images(void) {
 /* Downloads to FOTA_FILE; on success *len_out is the Content-Length, which
  * fota_flash() then holds the bytes it wrote against. */
 static bool fota_download(const char *url, int *len_out, char *reason, size_t reason_size) {
-    char cmd[640], resp[256];
+    /* resp as big as modem.c's own buffer: it copies a reply from its START,
+     * and the waits below run for minutes — a few hundred bytes of network
+     * URCs ahead of "+QHTTPGET: 0,200,..." pushed it out of a 256-byte resp,
+     * and a download that worked failed as http_-1_err_-1. Static: 4 KB. */
+    static char resp[MODEM_REPLY_MAX];
+    char cmd[640];
     *len_out = 0;
 
     fota_pdp_refresh();
@@ -536,6 +544,7 @@ static bool fota_flash(int expected, bool allow_handover, char *reason, size_t r
         /* Read header line: "CONNECT <actual_bytes>\r\n" */
         int hi = 0;
         bool got_connect = false;
+        bool got_error   = false;
         int  actual = 0;
         int64_t dl = esp_timer_get_time() + 10000000LL;
         while (esp_timer_get_time() < dl) {
@@ -548,6 +557,10 @@ static bool fota_flash(int expected, bool allow_handover, char *reason, size_t r
             if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
             uint8_t ch;
             if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(20)) > 0) {
+                /* This is the text header, before any image byte: a NUL here
+                 * is line noise, and it would hide the CONNECT behind it from
+                 * strstr() (modem.c drops them the same way). */
+                if (ch == 0) continue;
                 /* Compact instead of freezing a full buffer: if an interleaved
                  * URC (+QMTSTAT/+QIURC/…) or line noise fills hdr before CONNECT
                  * arrives, a fixed accumulator would stop appending and the
@@ -569,9 +582,23 @@ static bool fota_flash(int expected, bool allow_handover, char *reason, size_t r
                     got_connect = true;
                     break;
                 }
+                /* A refused read ends now, not after the full 10 s. */
+                if (ch == '\n' && strstr(hdr, "ERROR")) { got_error = true; break; }
             }
         }
-        if (!got_connect || actual == 0) break; /* EOF or error */
+        /* Not the end of the file — that is "CONNECT 0", and the loop stops at
+         * the expected size before asking past it. The modem refused the read
+         * or never answered: say so, and how far it got (this used to surface
+         * as a size_mismatch that hid the cause). */
+        if (!got_connect) {
+            ESP_LOGE(TAG, "QFREAD %s at %d of %d bytes", got_error ? "refused" : "got no CONNECT",
+                     written, expected);
+            fota_set_reason(reason, reason_size, "%s_%d",
+                            got_error ? "qfread_error" : "qfread_no_connect", written);
+            ok = false;
+            break;
+        }
+        if (actual == 0) break; /* end of file, short of expected: caught below */
 
         /* Never trust a length parsed off the wire: one corrupted byte in
          * the "CONNECT <n>" header ("CONNECT 99999") and the read below
@@ -621,13 +648,17 @@ static bool fota_flash(int expected, bool allow_handover, char *reason, size_t r
         /* Consume trailing OK — modem sends it automatically, no TX needed */
         modem_read_until("OK", 5000, NULL, 0);
 
-        if (actual < FOTA_CHUNK) break; /* Last chunk */
+        /* Last chunk: a short one, or the whole image is in. Without the
+         * second test an image that is an exact multiple of FOTA_CHUNK (one
+         * build in 128: images are 16-byte aligned) asked for one more read
+         * past its end, which waited out the 10 s above. */
+        if (actual < FOTA_CHUNK || (expected > 0 && written >= expected)) break;
     }
 
     /* Every downloaded byte must have reached the slot, as cng-cpil checks: the
-     * loop also ends on a missing CONNECT (end of file), so a transfer that
-     * stopped early would otherwise be caught only by esp_ota_end(), and the
-     * reason would not say how far it got. */
+     * loop also ends at end of file ("CONNECT 0"), so a file shorter than the
+     * download reported would otherwise be caught only by esp_ota_end(), and
+     * the reason would not say how far it got. */
     if (ok && expected > 0 && written != expected) {
         ESP_LOGE(TAG, "size mismatch: downloaded %d bytes, wrote %d", expected, written);
         fota_set_reason(reason, reason_size, "size_mismatch_%d", written);
@@ -728,11 +759,13 @@ static bool fota_flash(int expected, bool allow_handover, char *reason, size_t r
  * link that has failed four times. And a reason that cannot change between
  * attempts aborts at once: no OTA partition, an over-long QFREAD command, an
  * image that is not a VVM701 swap-set firmware or is another product's without
- * "handover":true, a body whose size cannot be a firmware image or does not
- * fit the modem's UFS even after its leftover .bin files went, and an HTTP
- * 403 or 404 — an expired or refused signed link, a file that is not there,
- * the same answer on every try. Everything else (network, other HTTP
- * statuses, short read, verify) is retried. */
+ * "handover":true, a body whose size cannot be a firmware image (or has none
+ * stated) or does not fit the modem's UFS even after its leftover .bin files
+ * went, and the HTTP answers that refuse the request itself — 400 (a malformed
+ * or mis-signed link), 401, 403 (an expired or refused signed link), 404 (no
+ * such file), 505 (a request line the server cannot read): the same answer on
+ * every try. Everything else (network, 408/429/5xx, short read, verify) is
+ * retried. */
 #define FOTA_ATTEMPTS        5
 #define FOTA_TOTAL_BUDGET_MS (15 * 60 * 1000)
 
@@ -741,10 +774,14 @@ static bool fota_reason_is_final(const char *reason) {
                       strcmp(reason, "read_cmd_too_long")  == 0 ||
                       strcmp(reason, "not_a_vvm701_image") == 0 ||
                       strcmp(reason, "not_this_product")   == 0 ||
+                      strcmp(reason, "bad_content_length") == 0 ||
                       strncmp(reason, "ufs_full_", 9)      == 0 ||
                       strncmp(reason, "bad_length_", 11)   == 0 ||
+                      strncmp(reason, "http_400_", 9)      == 0 ||
+                      strncmp(reason, "http_401_", 9)      == 0 ||
                       strncmp(reason, "http_403_", 9)      == 0 ||
-                      strncmp(reason, "http_404_", 9)      == 0);
+                      strncmp(reason, "http_404_", 9)      == 0 ||
+                      strncmp(reason, "http_505_", 9)      == 0);
 }
 
 /* Strip leading/trailing whitespace, quotes and CR/LF from the URL.
@@ -802,7 +839,7 @@ static bool url_normalize(char *url, size_t size) {
 
 /* The link exactly as the modem gets it: trimmed (sanitize_url), normalized
  * (url_normalize), https:// in lower case. NULL when it can go, else why not.
- * fota_perform() and fota_url_refusal() both run it, so the check made before
+ * fota_perform() and fota_url_prepare() both run it, so the check made before
  * MQTT closes is the one made after.
  *
  * HTTPS only. "http" (4 chars) would also match "http://" — accepting
@@ -813,7 +850,8 @@ static bool url_normalize(char *url, size_t size) {
  * matched in any case ("HTTPS://" is the same link) and handed to the
  * modem in lower case, the form its HTTP stack is proven with. */
 static const char *prepare_url(char *out, size_t size, const char *url) {
-    snprintf(out, size, "%s", url ? url : "");
+    const int n = snprintf(out, size, "%s", url ? url : "");
+    if (n < 0 || (size_t)n >= size) return "url_too_long";   /* cut = a different link */
     sanitize_url(out);
     if (!url_normalize(out, size)) return "url_too_long";
     if (strncasecmp(out, "https://", 8) != 0) return "non_https_url";
@@ -853,7 +891,11 @@ bool fota_perform(const char *url, const char *pub_topic,
         if (attempt > 1 && esp_timer_get_time() > deadline_us) {
             ESP_LOGE(TAG, "FOTA: giving up after %d min — the queue needs the broker back "
                           "more than this update needs another try", FOTA_TOTAL_BUDGET_MS / 60000);
-            fota_set_reason(reason, reason_size, "budget_exhausted");
+            /* With what the last try died of: "budget_exhausted" alone tells
+             * the cloud nothing it can act on. */
+            char last[40];
+            snprintf(last, sizeof(last), "%s", (reason && reason[0]) ? reason : "unknown");
+            fota_set_reason(reason, reason_size, "budget_exhausted_%s", last);
             break;
         }
         if (attempt == 3 || attempt == FOTA_ATTEMPTS) {
@@ -866,10 +908,14 @@ bool fota_perform(const char *url, const char *pub_topic,
             if (!network_init())
                 ESP_LOGE(TAG, "FOTA: network rebuild failed after modem reset — "
                               "spending this attempt anyway");
-            /* The download verifies S3's certificate against the CA file in
-             * the modem's UFS. Re-provisioning after a power-cycle is cheap
-             * insurance against a module that came back without it. */
-            tls_ca_provision();
+            /* The download verifies the server's certificate against the CA
+             * file in the modem's UFS, which a power-cycle leaves in place: it
+             * is checked, and uploaded again only when missing or short
+             * (tls_ca_ensure) — an upload deletes first, so a needless one
+             * risks leaving none. The last try's partial image goes first, or
+             * on a modem with little room that upload could not fit. */
+            ufs_delete_images();
+            tls_ca_ensure();
             esp_task_wdt_reset();
         }
 
@@ -906,7 +952,7 @@ bool fota_perform(const char *url, const char *pub_topic,
     return false;
 }
 
-const char *fota_url_refusal(const char *url) {
-    static char u[FOTA_URL_MAX + 1];
-    return prepare_url(u, sizeof(u), url);
+const char *fota_url_prepare(const char *url, char *out, size_t out_size) {
+    if (!out || out_size == 0) return "url_too_long";
+    return prepare_url(out, out_size, url);
 }

@@ -16,9 +16,12 @@
 /* Plausible image sizes, from cng-cpil's fota.h (field-proven there). A reply
  * outside them is refused before anything is saved: an error page served with
  * a 200 is a few hundred bytes and would otherwise be flashed as firmware.
- * Today's images are ~450 KB. */
+ * Today's images are ~470 KB. The top is the modem's whole UFS (~1.5 MB), not
+ * the 7 MB slot, as btpl-gg: a bigger file can never be staged, and when the
+ * free space cannot be read (ufs_make_room) it would otherwise only fail
+ * part-way through the download, on every one of five tries. */
 #define FOTA_MIN_IMAGE_BYTES  65536
-#define FOTA_MAX_IMAGE_BYTES  (3 * 1024 * 1024)
+#define FOTA_MAX_IMAGE_BYTES  (1400 * 1024)
 
 /* True if the image fota_perform() just staged belongs to ANOTHER product
  * (cross-product handover — see image_is_foreign in fota.c). Valid only after
@@ -44,10 +47,11 @@ bool fota_last_image_foreign(void);
 bool fota_perform(const char *url, const char *pub_topic,
                   char *reason, size_t reason_size, bool allow_handover);
 
-/* Why fota_perform() would refuse this URL before downloading anything —
- * "non_https_url", or "url_too_long" once its spaces are encoded as %20 — or
- * NULL when it would take it. Runs the same trimming and checks, so the caller
- * can refuse junk on the update topic BEFORE it confirms a pending image,
- * sends fota_initiated, closes MQTT and waits out the fleet stagger for
- * nothing (as alds-sr). */
-const char *fota_url_refusal(const char *url);
+/* The URL exactly as fota_perform() will hand it to the modem — trimmed,
+ * https:// in lower case, spaces as %20 — into `out`, and NULL; or why
+ * fota_perform() would refuse it before downloading anything
+ * ("non_https_url", "url_too_long"). Lets the caller refuse junk on the update
+ * topic BEFORE it confirms a pending image, sends fota_initiated, closes MQTT
+ * and waits out the fleet stagger for nothing (as alds-sr), and keep its
+ * memory of URLs in this one form. Size `out` FOTA_URL_MAX + 1. */
+const char *fota_url_prepare(const char *url, char *out, size_t out_size);

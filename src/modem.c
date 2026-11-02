@@ -211,7 +211,7 @@ bool modem_at(const char *cmd, const char *expect, int timeout_ms,
      * (~1.7-1.9 KB) that lands while this command waits must fit beside its
      * reply, or it is cut, and a cut +QMTRECV is lost for good (the modem has
      * already acked it to the broker). */
-    static char buf[4096];
+    static char buf[MODEM_REPLY_MAX];
     memset(buf, 0, sizeof(buf));
     int  total = 0;
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
@@ -273,7 +273,7 @@ bool modem_read_until(const char *expect, int timeout_ms,
                       char *resp, size_t resp_size) {
     /* Like modem_at but sends nothing — just reads until pattern found.
      * 4 KB for the same reason as modem_at(). */
-    static char buf[4096];
+    static char buf[MODEM_REPLY_MAX];
     memset(buf, 0, sizeof(buf));
     int  total = 0;
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
@@ -355,22 +355,24 @@ bool modem_upload_file(const char *filename, const char *data, size_t len) {
      * runtime the way a FOTA download body does), so the only realistic
      * failure mode is "the write didn't happen at all," which the marker's
      * presence/absence already catches. */
-    char resp[128] = {0};
+    char resp[512] = {0};
     if (!modem_read_until("+QFUPL:", 15000, resp, sizeof(resp))) {
         ESP_LOGE(TAG, "QFUPL: no confirmation for %s", filename);
         return false;
     }
-    /* <size> is what the modem actually stored. The CA bundle grew to ~6.5 KB
-     * on 2026-09-28 (Root YE/YR appended last), and a cut-off upload would
-     * silently lose those roots first — so say so. Logged, not failed: the
-     * file exists either way, and the TLS handshake is the real verdict. */
+    /* <size> is what the modem actually stored. The CA bundle is ~18 KB with
+     * its last roots appended at the end, and a cut-off upload loses those
+     * first. A short file is a failed upload, so the caller can try again
+     * (tls_ca_ensure does, twice) instead of believing it worked; it is left
+     * in place, since the roots that did arrive serve better than none. */
     const char *p = strstr(resp, "+QFUPL:");
     int stored = p ? atoi(p + 7) : -1;
-    if (stored != (int)len)
-        ESP_LOGE(TAG, "QFUPL: %s — modem stored %d of %d bytes (upload cut short?)",
+    if (stored != (int)len) {
+        ESP_LOGE(TAG, "QFUPL: %s — modem stored %d of %d bytes (upload cut short)",
                  filename, stored, (int)len);
-    else
-        ESP_LOGI(TAG, "QFUPL: uploaded %s (%d bytes)", filename, (int)len);
+        return false;
+    }
+    ESP_LOGI(TAG, "QFUPL: uploaded %s (%d bytes)", filename, (int)len);
     return true;
 }
 

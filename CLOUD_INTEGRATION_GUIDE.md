@@ -453,8 +453,9 @@ only progress message.
 | `fota_failed` | `wrong_target` | `target` names another product |
 | `fota_failed` | `wrong_hw_id` | `HW_ID` names another unit |
 | `fota_failed` | `not_this_product` | the file is another product's firmware and the push did not say `"handover":true`; nothing changed |
-| `fota_failed` | `http_403_err_0` / `http_404_err_<n>` / `bad_length_<n>` / `ufs_full_<free>_of_<need>` | link expired or refused / no such file / not a firmware file / the image does not fit the modem's storage (about 555 KB on some units): answered after the first try, no retries |
-| `fota_failed` | e.g. `http_-1_err_<n>` (server never reached), `no_url`, `url_too_long`, `non_https_url`, `tls_setup_failed`, `readfile_timeout`, `budget_exhausted` | the download or install failed; up to 5 tries within 15 min |
+| `fota_failed` | `http_403_err_0` / `http_404_err_<n>` / `http_400_…` `http_401_…` `http_505_…` / `bad_length_<n>` / `bad_content_length` / `ufs_full_<free>_of_<need>` | link expired or refused / no such file / the server refused the request itself / not a firmware file / no size sent / the image does not fit the modem's storage (about 555 KB on some units): answered after the first try, no retries |
+| `fota_failed` | `no_url`, `url_too_long`, `non_https_url`, `bad_payload` (JSON that is not one complete object) | refused at once, nothing downloaded |
+| `fota_failed` | e.g. `http_-1_err_<n>` (server never reached), `tls_setup_failed`, `readfile_timeout`, `qfread_no_connect_<n>`, `budget_exhausted_<last reason>` | the download or install failed; up to 5 tries within 15 min |
 
 `"force":true` overrides the three `fota_skip_*` refusals. Give every build its
 own file name. No answer at all means the push never reached the unit

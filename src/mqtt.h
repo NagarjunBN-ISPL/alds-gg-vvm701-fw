@@ -25,6 +25,9 @@ bool mqtt_subscribe(const char *topic);
 bool mqtt_publish(const char *topic, const char *payload);
 bool mqtt_poll(char *topic_out, size_t topic_size,
                char *payload_out, size_t payload_size);
+/* When the message mqtt_poll() last returned was taken off the UART
+ * (esp_timer µs) — its arrival, which can be well before it is handled. */
+int64_t mqtt_last_rx_us(void);
 void mqtt_disconnect(void);
 bool mqtt_is_connected(void);
 

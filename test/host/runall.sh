@@ -55,7 +55,9 @@ python3 extract.py "$SRC/di.c" func:di_enqueue func:di_publish_buffer \
 python3 extract.py "$SRC/modem.c" func:days_from_civil func:parse_and_set_rtc \
     func:qntp_time > extracted_rtc.inc || rc=1
 python3 extract.py "$SRC/fota.c" func:sanitize_url func:url_normalize func:prepare_url \
-    > extracted_fota_url.inc || rc=1
+    func:fota_reason_is_final > extracted_fota_url.inc || rc=1
+python3 extract.py "$SRC/mqtt.c" func:qmtrecv_payload_start func:qmtrecv_payload_end \
+    > extracted_qmtrecv.inc || rc=1
 python3 extract.py "$SRC/main.c" func:hw_id_is_mine > extracted_hw_id.inc || rc=1
 
 # ── functional suites ───────────────────────────────────────────────────────
@@ -82,8 +84,9 @@ gcc $CFLAGS $SAN test_radar.c "$SRC/radar.c"                  -o trd || rc=1   #
 gcc $CFLAGS $SAN test_di.c                                    -o tdi || rc=1   # DI queue: change time kept, oldest dropped
 gcc $CFLAGS $SAN test_rtc.c                                   -o trtc || rc=1  # NTP result -> UTC clock, same guards
 gcc $CFLAGS $SAN test_fota_url.c                              -o tfu || rc=1   # FOTA link as the modem gets it + HW_ID match
+gcc $CFLAGS $SAN test_qmtrecv.c                               -o tqr || rc=1   # inbound MQTT message boundaries
 
-for f in t td tsc ty tg tn tp tcpu tl tfz tst tj tgps tkf tbf trt trd tdi trtc tfu; do
+for f in t td tsc ty tg tn tp tcpu tl tfz tst tj tgps tkf tbf trt trd tdi trtc tfu tqr; do
     out=$(./$f 2>/dev/null)
     echo "$f: $(echo "$out" | tail -1)"
     echo "$out" | grep -q "0 failures" || rc=1

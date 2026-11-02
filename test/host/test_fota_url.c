@@ -1,13 +1,14 @@
 /* The FOTA link and HW_ID checks, EXTRACTED from the real sources by
- * extract.py: sanitize_url(), url_normalize() and prepare_url() from
- * src/fota.c, hw_id_is_mine() from src/main.c.
+ * extract.py: sanitize_url(), url_normalize(), prepare_url() and
+ * fota_reason_is_final() from src/fota.c, hw_id_is_mine() from src/main.c.
  *
  * What it pins: the link the modem gets is trimmed, has no tab or line break,
  * carries every inner space as %20 and starts https:// in lower case; a link
- * that is not https://, or no longer fits once encoded, is refused with the
- * reason the cloud reads; a push's HW_ID matches this gateway's bare IMEI or
- * one of its equipment ids and nothing else. Expected strings are written out
- * by hand, not computed by the code under test. */
+ * that is not https://, or does not fit before or after encoding, is refused
+ * with the reason the cloud reads, never cut; a push's HW_ID matches this
+ * gateway's bare IMEI or one of its equipment ids and nothing else; only the
+ * failures that cannot change between tries stop the retries. Expected
+ * strings are written out by hand, not computed by the code under test. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
@@ -108,6 +109,27 @@ int main(void) {
     for (size_t i = 0; i < sizeof(IDS) / sizeof(IDS[0]); i++)
         CHECK(hw_id_is_mine(IDS[i].id) == IDS[i].mine, "[8] HW_ID [%s] read as %s",
               IDS[i].id, IDS[i].mine ? "another unit's" : "this unit's");
+
+    /* [9] A link longer than the buffer is refused, never cut into another. */
+    CHECK(prep("https://h/abcdefghij", 16, "url_too_long", NULL), "[9] over-long link cut and taken");
+
+    /* [10] Only a failure that cannot change between tries stops the retries. */
+    static const char *FINAL[] = {
+        "http_400_err_0", "http_401_err_0", "http_403_err_0", "http_404_err_0", "http_505_err_0",
+        "bad_content_length", "bad_length_100", "ufs_full_1000_of_2000", "not_this_product",
+        "not_a_vvm701_image", "no_ota_partition", "read_cmd_too_long",
+    };
+    static const char *RETRIED[] = {
+        "http_-1_err_716", "http_408_err_0", "http_429_err_0", "http_500_err_0", "http_503_err_0",
+        "http_4000_err_0", "tls_setup_failed", "readfile_timeout", "readfile_err_-1", "get_timeout",
+        "qfread_no_connect_2048", "qfread_error_0", "size_mismatch_4096", "image_verify_failed",
+        "ota_write_failed", "url_setup_no_connect", "",
+    };
+    for (size_t i = 0; i < sizeof(FINAL) / sizeof(FINAL[0]); i++)
+        CHECK(fota_reason_is_final(FINAL[i]), "[10] %s retried", FINAL[i]);
+    for (size_t i = 0; i < sizeof(RETRIED) / sizeof(RETRIED[0]); i++)
+        CHECK(!fota_reason_is_final(RETRIED[i]), "[10] %s not retried", RETRIED[i]);
+    CHECK(!fota_reason_is_final(NULL), "[10] NULL");
 
     printf("%d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;

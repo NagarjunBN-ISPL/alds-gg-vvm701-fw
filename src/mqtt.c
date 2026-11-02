@@ -35,8 +35,9 @@ static int64_t s_connected_since_us = 0;
 #define PAYLOAD_MAX  2048
 
 typedef struct {
-    char topic[TOPIC_MAX];
-    char payload[PAYLOAD_MAX];
+    char    topic[TOPIC_MAX];
+    char    payload[PAYLOAD_MAX];
+    int64_t rx_us;              /* when it was taken off the UART (esp_timer) */
 } MqttMsg_t;
 
 /* Inbound-command queue as a circular buffer: push at (head + cnt) % STASH_MAX,
@@ -152,10 +153,15 @@ static const char *qmtrecv_payload_end(const char *p) {
     bool quoted = (*p == '"');
     if (quoted) p++;
 
-    if (*p == '{') {
+    /* JSON typed or pasted with a space or line break before its '{' is still
+     * JSON: look past that, or the quoted branch below would end the payload
+     * at the first quote INSIDE the object and the command would be lost. */
+    const char *j = p;
+    while (*j == ' ' || *j == '\t' || *j == '\r' || *j == '\n') j++;
+    if (*j == '{') {
         int  depth  = 0;
         bool in_str = false;
-        const char *q = p;
+        const char *q = j;
         for (; *q; q++) {
             if (in_str) {
                 if (*q == '\\' && q[1]) { q++; continue; }
@@ -231,6 +237,7 @@ static void parse_qmtrecv(const char *buf) {
 
         MqttMsg_t *m = &g_stash[(g_stash_head + g_stash_cnt) % STASH_MAX];
         g_stash_cnt++;
+        m->rx_us = esp_timer_get_time();
         size_t tl = (topic_len < TOPIC_MAX - 1)   ? topic_len : TOPIC_MAX - 1;
         size_t pl = (pl_len   < PAYLOAD_MAX - 1)  ? pl_len   : PAYLOAD_MAX - 1;
         memcpy(m->topic,   topic_start,   tl); m->topic[tl]   = '\0';
@@ -316,6 +323,11 @@ static void drain_recv(int timeout_ms) {
          * dropped is worse than a slightly late one. */
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(10)) > 0) {
+            /* A NUL from line noise would end the string here, and strstr()
+             * would never see the "+QMTRECV:" behind it: that command would be
+             * lost for good (the modem has acked it). Dropped, as modem.c's
+             * readers drop them. */
+            if (ch == 0) continue;
             buf[s_recv_total++] = ch;
             buf[s_recv_total]   = '\0';
         }
@@ -555,6 +567,7 @@ bool mqtt_publish(const char *topic, const char *payload) {
         if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(20)) > 0) {
+            if (ch == 0) continue;               /* as drain_recv() */
             if (bi < (int)sizeof(buf) - 1) { buf[bi++] = (char)ch; buf[bi] = '\0'; }
             if (ch == '>') { got_prompt = true; break; }
             if (strstr(buf, "ERROR")) {
@@ -582,6 +595,7 @@ bool mqtt_publish(const char *topic, const char *payload) {
         if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         uint8_t ch;
         if (uart_read_bytes(MODEM_UART, &ch, 1, pdMS_TO_TICKS(20)) > 0) {
+            if (ch == 0) continue;               /* as drain_recv() */
             if (bi < (int)sizeof(buf) - 1) { buf[bi++] = (char)ch; buf[bi] = '\0'; }
             if (strstr(buf, "+QMTPUBEX:") && strchr(strstr(buf, "+QMTPUBEX:"), '\n')) {
                 char *p = strstr(buf, "+QMTPUBEX:");
@@ -632,6 +646,11 @@ bool mqtt_publish(const char *topic, const char *payload) {
     return pub_result(pub_ok, topic);
 }
 
+/* When the message mqtt_poll() last returned came off the UART. */
+static int64_t s_last_rx_us = 0;
+
+int64_t mqtt_last_rx_us(void) { return s_last_rx_us; }
+
 /* Pop the oldest queued message into the caller's buffers. O(1): advances the
  * ring-buffer head rather than shifting the array. Returns false if empty. */
 static bool stash_pop(char *topic_out, size_t topic_size,
@@ -642,6 +661,7 @@ static bool stash_pop(char *topic_out, size_t topic_size,
     topic_out[topic_size - 1] = '\0';
     strncpy(payload_out, m->payload, payload_size - 1);
     payload_out[payload_size - 1] = '\0';
+    s_last_rx_us = m->rx_us;
     g_stash_head = (g_stash_head + 1) % STASH_MAX;
     g_stash_cnt--;
     return true;

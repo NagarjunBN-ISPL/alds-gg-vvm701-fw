@@ -5,6 +5,11 @@
 void modem_uart_init(void);
 bool modem_power_on(void);
 void modem_hard_reset(void);
+/* The reply buffer inside modem_at() and modem_read_until(). Both copy the
+ * reply into `resp` from its START, so a caller whose resp is smaller loses
+ * whatever lies past its first resp_size - 1 bytes — the marker it waited for
+ * too, when a burst of URCs arrived ahead of it. A resp this big gets it all. */
+#define MODEM_REPLY_MAX 4096
 bool modem_at(const char *cmd, const char *expect, int timeout_ms,
               char *resp, size_t resp_size);
 void modem_flush(void);
@@ -48,5 +53,6 @@ bool modem_read_until(const char *expect, int timeout_ms,
 /* Uploads `len` bytes of `data` to a file on the modem's UFS filesystem via
  * AT+QFUPL (send command, wait for CONNECT, stream the raw bytes, wait for
  * the +QFUPL: confirmation). Overwrites any existing file of the same name.
- * Same CONNECT-prompt pattern fota.c already uses for AT+QHTTPURL. */
+ * Same CONNECT-prompt pattern fota.c already uses for AT+QHTTPURL. False
+ * unless the modem says it stored all `len` bytes. */
 bool modem_upload_file(const char *filename, const char *data, size_t len);
