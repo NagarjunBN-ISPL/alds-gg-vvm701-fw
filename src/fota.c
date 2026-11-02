@@ -219,10 +219,28 @@ static bool fota_download(const char *url, int *len_out, char *reason, size_t re
     modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ciphersuite\",%d,0XFFFF", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
+    /* cacert and seclevel are what make the modem CHECK the server's
+     * certificate at all; if either is not accepted the download would run on
+     * whatever the context last held — after a modem reset, seclevel 0, no
+     * check. This build has no secure boot, so that check is the only thing
+     * between a forged server and a flashed image. So those two must answer OK
+     * or this attempt stops here (the retry loop resets the modem before the
+     * later attempts). Both are the same commands every TLS broker connect
+     * already issues, so a modem that cannot take them could not be online
+     * either. The others stay best-effort: an option this modem firmware might
+     * not support must never be what blocks every update to the fleet. (As
+     * alds-sr.) */
+    bool tls_ok = true;
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"cacert\",%d,\"%s\"", FOTA_SSL_CTX, TLS_CA_FILE);
-    modem_at(cmd, "OK", 3000, NULL, 0);
+    tls_ok &= modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"seclevel\",%d,1", FOTA_SSL_CTX);
-    modem_at(cmd, "OK", 3000, NULL, 0);
+    tls_ok &= modem_at(cmd, "OK", 3000, NULL, 0);
+    if (!tls_ok) {
+        ESP_LOGE(TAG, "the modem did not accept cacert/seclevel for ctx %d — not downloading "
+                      "without certificate verification", FOTA_SSL_CTX);
+        fota_set_reason(reason, reason_size, "tls_setup_failed");
+        return false;
+    }
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignorelocaltime\",%d,1", FOTA_SSL_CTX);
     modem_at(cmd, "OK", 3000, NULL, 0);
     snprintf(cmd, sizeof(cmd), "AT+QSSLCFG=\"ignoreinvalidcertsign\",%d,0", FOTA_SSL_CTX);
@@ -751,6 +769,58 @@ static void sanitize_url(char *url) {
     }
 }
 
+/* What a browser does to a link before sending it (the WHATWG URL rules): a
+ * tab or line break anywhere in it is dropped, and a space becomes %20. The
+ * cloud names files with spaces ("alds-gg-vvm701-fw 7.bin"); a link that
+ * reaches the gateway decoded, or wrapped across lines, would otherwise go out
+ * as a broken request line, refused by the server on all five tries with MQTT
+ * down throughout. A presigned link still matches its signature, which is
+ * computed over the encoded form. Spaces at either end are sanitize_url()'s,
+ * run first. False when the result does not fit `size`. */
+static bool url_normalize(char *url, size_t size) {
+    size_t len = 0, spaces = 0;
+    for (const char *s = url; *s; s++) {
+        if (*s == '\t' || *s == '\r' || *s == '\n') continue;
+        if (*s == ' ') spaces++;
+        url[len++] = *s;
+    }
+    url[len] = '\0';
+    if (spaces == 0) return true;
+    if (len + 2 * spaces >= size) return false;
+    /* Back to front, so each byte moves once, onto one already read. */
+    url[len + 2 * spaces] = '\0';
+    for (size_t i = len; i-- > 0;) {
+        if (url[i] != ' ') {
+            url[i + 2 * spaces] = url[i];
+        } else {
+            spaces--;
+            memcpy(&url[i + 2 * spaces], "%20", 3);
+        }
+    }
+    return true;
+}
+
+/* The link exactly as the modem gets it: trimmed (sanitize_url), normalized
+ * (url_normalize), https:// in lower case. NULL when it can go, else why not.
+ * fota_perform() and fota_url_refusal() both run it, so the check made before
+ * MQTT closes is the one made after.
+ *
+ * HTTPS only. "http" (4 chars) would also match "http://" — accepting
+ * plaintext FOTA means the firmware binary itself travels unencrypted
+ * and unauthenticated, letting anyone on the network path (or a
+ * compromised/spoofed server) hand the device arbitrary code to flash
+ * and boot. We only ever generate/expect https:// URLs. The scheme is
+ * matched in any case ("HTTPS://" is the same link) and handed to the
+ * modem in lower case, the form its HTTP stack is proven with. */
+static const char *prepare_url(char *out, size_t size, const char *url) {
+    snprintf(out, size, "%s", url ? url : "");
+    sanitize_url(out);
+    if (!url_normalize(out, size)) return "url_too_long";
+    if (strncasecmp(out, "https://", 8) != 0) return "non_https_url";
+    memcpy(out, "https://", 8);
+    return NULL;
+}
+
 static void ufs_cleanup(int fh) {
     char cmd[128];
     if (fh >= 0) {
@@ -768,23 +838,12 @@ bool fota_perform(const char *url, const char *pub_topic,
     /* Sized from FOTA_URL_MAX so the cap the caller enforces and the buffer
      * that enforces it can never drift apart. */
     static char clean_url[FOTA_URL_MAX + 1];
-    strncpy(clean_url, url, sizeof(clean_url) - 1);
-    clean_url[sizeof(clean_url) - 1] = '\0';
-    sanitize_url(clean_url);
-
-    /* HTTPS only. "http" (4 chars) would also match "http://" — accepting
-     * plaintext FOTA means the firmware binary itself travels unencrypted
-     * and unauthenticated, letting anyone on the network path (or a
-     * compromised/spoofed server) hand the device arbitrary code to flash
-     * and boot. We only ever generate/expect https:// URLs. The scheme is
-     * matched in any case ("HTTPS://" is the same link) and handed to the
-     * modem in lower case, the form its HTTP stack is proven with. */
-    if (strncasecmp(clean_url, "https://", 8) != 0) {
-        ESP_LOGE(TAG, "FOTA: rejecting non-HTTPS URL [%s]", clean_url);
-        fota_set_reason(reason, reason_size, "non_https_url");
+    const char *refusal = prepare_url(clean_url, sizeof(clean_url), url);
+    if (refusal) {
+        ESP_LOGE(TAG, "FOTA: URL refused (%s): [%s]", refusal, clean_url);
+        fota_set_reason(reason, reason_size, "%s", refusal);
         return false;
     }
-    memcpy(clean_url, "https://", 8);
     ESP_LOGI(TAG, "FOTA start URL=[%s] topic=%s", clean_url, pub_topic);
 
     s_last_image_foreign = false;
@@ -847,9 +906,7 @@ bool fota_perform(const char *url, const char *pub_topic,
     return false;
 }
 
-bool fota_url_acceptable(const char *url) {
+const char *fota_url_refusal(const char *url) {
     static char u[FOTA_URL_MAX + 1];
-    snprintf(u, sizeof(u), "%s", url ? url : "");
-    sanitize_url(u);
-    return strncasecmp(u, "https://", 8) == 0;
+    return prepare_url(u, sizeof(u), url);
 }

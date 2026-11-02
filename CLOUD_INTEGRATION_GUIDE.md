@@ -420,12 +420,16 @@ HTTPS only (`https://` in any case), URL up to 1535 characters; units on
 firmware older than this guide take 511 at most, so keep links short until the
 fleet is updated (an S3 link presigned with an IAM-user key is ~360). S3
 (plain or presigned) and GitHub raw links work; the link must answer directly
-(no redirect) and send `Content-Length`. Other keys in the JSON (`HW_ID`,
-`file_name`, ...) are ignored, and `\u0026`-style escapes in the link are
-decoded. `target` is optional; anything other than `gg`, `alds-gg`,
-`alds-gg-vvm701` or `alds-gg-vvm701-fw` is refused, which keeps a GGY push off
-GG units (answered `wrong_target` on the unit's own topic, silently on the
-fleet topic). Fleet pushes are spread over 30 s.
+(no redirect) and send `Content-Length`. `HW_ID` is optional, but when present
+it must be that unit's IMEI (or IMEI + suffix): a push naming another unit is
+refused (`wrong_hw_id` on the unit's own topic, silently on the fleet topic),
+so leave it out of a push meant for the whole fleet. Other keys (`file_name`,
+...) are ignored. `\u0026`-style escapes in the link are
+decoded, and a space in it is sent as `%20` (send `%20` anyway). `target` is
+optional; anything other than `gg`, `alds-gg`, `alds-gg-vvm701` or
+`alds-gg-vvm701-fw` is refused, which keeps a GGY push off GG units (answered
+`wrong_target` on the unit's own topic, silently on the fleet topic). Fleet
+pushes are spread over 30 s.
 
 Another product's firmware (a deliberate swap to CNG, GGY, ...) is installed
 only when the push says `"handover":true` (`true`, `1` or `"true"`); without it
@@ -445,16 +449,18 @@ only progress message.
 | `fota_successful` | `handover` | another product's firmware was flashed (`"handover":true`); the unit comes up on that product's topics, `unconfigured` |
 | `fota_failed` | `fota_reverted` | the new image never confirmed itself and the bootloader went back to the old one (`image` = the one discarded) |
 | `fota_failed` | `fota_skip_reverted` / `fota_skip_known_bad` | this exact URL was rolled back before / already failed since the last reboot |
-| `fota_failed` | `fota_ignored_retained` | arrived within 15 s of subscribing, so treated as retained: push again, retain off |
+| `fota_failed` | `fota_ignored_retained` | arrived within 15 s of the unit (re)connecting, so treated as retained: push again, retain off. After a `ready`, wait 15 s before pushing |
 | `fota_failed` | `wrong_target` | `target` names another product |
+| `fota_failed` | `wrong_hw_id` | `HW_ID` names another unit |
 | `fota_failed` | `not_this_product` | the file is another product's firmware and the push did not say `"handover":true`; nothing changed |
-| `fota_failed` | `http_403_err_0` / `http_404_err_<n>` / `bad_length_<n>` / `ufs_full_<free>_of_<need>` | link expired or refused / no such file / not a firmware file / the image does not fit the modem's storage (about 580 KB at most): answered after the first try, no retries |
-| `fota_failed` | e.g. `http_-1_err_<n>` (server never reached), `no_url`, `url_too_long`, `non_https_url`, `readfile_timeout`, `budget_exhausted` | the download or install failed; up to 5 tries within 15 min |
+| `fota_failed` | `http_403_err_0` / `http_404_err_<n>` / `bad_length_<n>` / `ufs_full_<free>_of_<need>` | link expired or refused / no such file / not a firmware file / the image does not fit the modem's storage (about 555 KB on some units): answered after the first try, no retries |
+| `fota_failed` | e.g. `http_-1_err_<n>` (server never reached), `no_url`, `url_too_long`, `non_https_url`, `tls_setup_failed`, `readfile_timeout`, `budget_exhausted` | the download or install failed; up to 5 tries within 15 min |
 
 `"force":true` overrides the three `fota_skip_*` refusals. Give every build its
 own file name. No answer at all means the push never reached the unit
-(offline, or another product's `target` on the fleet topic): time out after
-about 2 min without `fota_initiated` and about 40 min without a final answer.
+(offline, or another product's `target` or another unit's `HW_ID` on the fleet
+topic): time out after about 2 min without `fota_initiated` and about 40 min
+without a final answer.
 FOTA never touches the configuration, except a handover to the CNG or GGY
 firmware (or back), which comes up as the other product, `unconfigured`.
 

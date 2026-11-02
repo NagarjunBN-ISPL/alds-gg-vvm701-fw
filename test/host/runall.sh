@@ -54,6 +54,9 @@ python3 extract.py "$SRC/di.c" func:di_enqueue func:di_publish_buffer \
     > extracted_di.inc || rc=1
 python3 extract.py "$SRC/modem.c" func:days_from_civil func:parse_and_set_rtc \
     func:qntp_time > extracted_rtc.inc || rc=1
+python3 extract.py "$SRC/fota.c" func:sanitize_url func:url_normalize func:prepare_url \
+    > extracted_fota_url.inc || rc=1
+python3 extract.py "$SRC/main.c" func:hw_id_is_mine > extracted_hw_id.inc || rc=1
 
 # ── functional suites ───────────────────────────────────────────────────────
 gcc $CFLAGS test_yenen.c "$SRC/yenen.c"     -o t  || rc=1   # Yenen poll path + noise
@@ -78,8 +81,9 @@ gcc $CFLAGS $SAN test_rsp_tunnel.c "$SRC/rsp_tunnel.c"        -o trt || rc=1   #
 gcc $CFLAGS $SAN test_radar.c "$SRC/radar.c"                  -o trd || rc=1   # radar reply timing vs a simulated radar
 gcc $CFLAGS $SAN test_di.c                                    -o tdi || rc=1   # DI queue: change time kept, oldest dropped
 gcc $CFLAGS $SAN test_rtc.c                                   -o trtc || rc=1  # NTP result -> UTC clock, same guards
+gcc $CFLAGS $SAN test_fota_url.c                              -o tfu || rc=1   # FOTA link as the modem gets it + HW_ID match
 
-for f in t td tsc ty tg tn tp tcpu tl tfz tst tj tgps tkf tbf trt trd tdi trtc; do
+for f in t td tsc ty tg tn tp tcpu tl tfz tst tj tgps tkf tbf trt trd tdi trtc tfu; do
     out=$(./$f 2>/dev/null)
     echo "$f: $(echo "$out" | tail -1)"
     echo "$out" | grep -q "0 failures" || rc=1

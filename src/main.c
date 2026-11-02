@@ -1681,6 +1681,16 @@ static void fota_refusal_publish(const char *json) {
     mqtt_publish(t_logs, json);
 }
 
+/* True when a push's HW_ID names this gateway: its bare IMEI, or one of its
+ * equipment ids (the IMEI and a 2-digit suffix, as on /data). */
+static bool hw_id_is_mine(const char *hw_id) {
+    const size_t n = strlen(g_imei);
+    if (strncmp(hw_id, g_imei, n) != 0) return false;
+    const char *rest = hw_id + n;
+    return rest[0] == '\0' ||
+           (isdigit((unsigned char)rest[0]) && isdigit((unsigned char)rest[1]) && rest[2] == '\0');
+}
+
 /* ── MQTT message router ──────────────────────────────────────────────── */
 static void handle_msg(const char *topic, const char *payload) {
     /* An OFF dispenser slot's command topics are "" (build_topics), so an empty
@@ -1742,6 +1752,24 @@ static void handle_msg(const char *topic, const char *payload) {
                     }
                     return;
                 }
+            }
+            /* HW_ID: a push that names a unit must name this one (hw_id_is_mine).
+             * The cloud puts it in every push, so a push meant for ONE unit
+             * that lands on the fleet topic would otherwise flash every GG unit
+             * there — a test build with the dev broker compiled in, say.
+             * Absent, empty or not a string: no check (bare URL, fleet-wide
+             * push). Answered like target. */
+            char hw_id[24] = "";
+            if (json_get_str(payload, "HW_ID", hw_id, sizeof(hw_id)) && hw_id[0] &&
+                !hw_id_is_mine(hw_id)) {
+                ESP_LOGW(TAG, "FOTA push names HW_ID %s, not this unit (%s) — ignored", hw_id, g_imei);
+                if (!fleet) {
+                    snprintf(fota_msg, sizeof(fota_msg),
+                             "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"wrong_hw_id\"}",
+                             g_imei);
+                    fota_refusal_publish(fota_msg);
+                }
+                return;
             }
             if (!json_get_str(payload, "url", url_buf, sizeof(url_buf))) {
                 ESP_LOGW(TAG, "FOTA JSON payload missing 'url'");
@@ -1808,16 +1836,18 @@ static void handle_msg(const char *topic, const char *payload) {
             fota_refusal_publish(fota_msg);
             return;
         }
-        /* Not an https:// link: refused HERE, as alds-sr does. fota_perform()
-         * checks the same, but only after the fleet stagger, the confirm of a
-         * pending image, fota_initiated and the MQTT teardown below — all of it,
-         * and a reconnect with every subscription after, spent on text that
-         * could never download. */
-        if (!fota_url_acceptable(url_to_use)) {
-            ESP_LOGE(TAG, "FOTA: not an https:// URL — rejected, MQTT left up");
+        /* A link fota_perform() would refuse (not https://, or too long once
+         * its spaces are encoded) is refused HERE, as alds-sr does.
+         * fota_perform() checks the same, but only after the fleet stagger, the
+         * confirm of a pending image, fota_initiated and the MQTT teardown
+         * below — all of it, and a reconnect with every subscription after,
+         * spent on text that could never download. */
+        const char *url_refusal = fota_url_refusal(url_to_use);
+        if (url_refusal) {
+            ESP_LOGE(TAG, "FOTA: URL refused (%s) — MQTT left up", url_refusal);
             snprintf(fota_msg, sizeof(fota_msg),
-                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"non_https_url\"}",
-                     g_imei);
+                     "{\"HW_ID\":\"%s\",\"status\":\"fota_failed\",\"reason\":\"%s\"}",
+                     g_imei, url_refusal);
             fota_refusal_publish(fota_msg);
             return;
         }
